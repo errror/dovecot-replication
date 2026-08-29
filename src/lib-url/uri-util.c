@@ -137,7 +137,7 @@ uri_parse_pct_encoded_data(struct uri_parser *parser,
 {
 	int value;
 
-	if (**p != '%' || (pend != NULL && *p >= pend))
+	if ((pend != NULL && *p >= pend) || **p != '%')
 		return 0;
 	*p += 1;
 
