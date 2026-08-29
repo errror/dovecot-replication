@@ -265,7 +265,7 @@ bool uri_data_decode(struct uri_parser *parser, const char *data,
 	while ((pend == NULL || p < pend) && *p != '\0') {
 		unsigned char ch;
 
-		ret = uri_parse_pct_encoded_data(parser, &p, NULL, &ch);
+		ret = uri_parse_pct_encoded_data(parser, &p, pend, &ch);
 		if (ret != 0) {
 			if (ret < 0)
 				return FALSE;

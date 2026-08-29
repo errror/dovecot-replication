@@ -87,6 +87,51 @@ static void test_uri_bounded_buffer(void)
 	test_end();
 }
 
+/* Regression tests for an out-of-bounds read past the 'until' boundary in
+   uri_data_decode(). A '%' at the end of the range must not cause the bytes
+   following the range to be read. These use an exact-size, non-terminated
+   heap buffer so that valgrind can catch a read past the end. */
+const char *bounded_buffer_decode_tests[] = {
+	/* '%' as the last byte of the range */
+	"hi%",
+	/* '%' followed by a single hex digit at the end of the range */
+	"hi%4",
+};
+
+unsigned int bounded_buffer_decode_test_count =
+	N_ELEMENTS(bounded_buffer_decode_tests);
+
+static void test_uri_bounded_buffer_decode(void)
+{
+	unsigned int i;
+
+	test_begin("uri bounded buffer decode");
+	for (i = 0; i < bounded_buffer_decode_test_count; i++) T_BEGIN {
+		struct uri_parser parser;
+		const char *str_in, *decoded = NULL;
+		unsigned char *data;
+		size_t len;
+		bool ret;
+
+		str_in = bounded_buffer_decode_tests[i];
+		len = strlen(str_in);
+		data = i_malloc(len);
+		memcpy(data, str_in, len);
+
+		uri_parser_init_data(&parser, pool_datastack_create(),
+				     data, len);
+		ret = uri_data_decode(&parser, (const char *)data,
+				      (const char *)data + len, &decoded);
+		test_out_quiet(
+			t_strdup_printf("decode [%u] <%s>", i,
+					str_sanitize(str_in, 64)),
+			!ret);
+
+		i_free(data);
+	} T_END;
+	test_end();
+}
+
 /* Invalid uri tests */
 const char *invalid_uri_tests[] = {
 	"http",
@@ -916,6 +961,7 @@ int main(void)
 	static void (*const test_functions[])(void) = {
 		test_uri_valid,
 		test_uri_bounded_buffer,
+		test_uri_bounded_buffer_decode,
 		test_uri_invalid,
 		test_uri_rfc,
 		test_uri_escape,
