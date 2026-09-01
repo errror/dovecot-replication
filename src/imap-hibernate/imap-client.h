@@ -9,6 +9,7 @@ struct imap_client_state {
 	const char *username, *mail_log_prefix;
 	/* optional: */
 	const char *session_id, *mailbox_vname, *userdb_fields, *stats;
+	const char *auth_token, *session_pid;
 	struct ip_addr local_ip, remote_ip;
 	in_port_t local_port, remote_port;
 	time_t session_created;
@@ -35,6 +36,9 @@ struct imap_client_state {
 
 struct imap_client *
 imap_client_create(int fd, const struct imap_client_state *state);
+/* Set pointer that is set to NULL when the client is destroyed. */
+void imap_client_set_destroy_ref(struct imap_client *client,
+				 struct imap_client **ref);
 void imap_client_add_notify_fd(struct imap_client *client, int fd);
 void imap_client_create_finish(struct imap_client *client);
 void imap_client_destroy(struct imap_client **_client, const char *reason);

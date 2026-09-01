@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "memarea.h"
@@ -11,6 +11,7 @@ struct test_istream {
 	unsigned int skip_diff;
 	size_t max_pos;
 	bool allow_eof;
+	bool set_input_pending;
 };
 
 static void test_buffer_free(unsigned char *buf)
@@ -21,6 +22,9 @@ static void test_buffer_free(unsigned char *buf)
 static ssize_t test_read(struct istream_private *stream)
 {
 	struct test_istream *tstream = (struct test_istream *)stream;
+
+	if (tstream->set_input_pending)
+		i_stream_set_input_pending(&stream->istream, TRUE);
 	unsigned int new_skip_diff;
 	size_t cur_max;
 	ssize_t ret;
@@ -119,7 +123,8 @@ struct istream *test_istream_create_data(const void *data, size_t size)
 
 	tstream->istream.istream.blocking = FALSE;
 	tstream->istream.istream.seekable = TRUE;
-	i_stream_create(&tstream->istream, NULL, -1, 0);
+	i_stream_create(&tstream->istream, NULL, -1,
+			ISTREAM_HIDDEN_INPUTS_NONE, 0);
 	tstream->istream.statbuf.st_size = tstream->max_pos = size;
 	tstream->allow_eof = TRUE;
 	tstream->istream.max_buffer_size = SIZE_MAX;
@@ -165,4 +170,11 @@ void test_istream_set_size(struct istream *input, uoff_t size)
 	if (size > (uoff_t)tstream->istream.statbuf.st_size)
 		size = (uoff_t)tstream->istream.statbuf.st_size;
 	tstream->max_pos = size + tstream->skip_diff;
+}
+
+void test_istream_set_input_pending(struct istream *input, bool set)
+{
+	struct test_istream *tstream = test_istream_find(input);
+
+	tstream->set_input_pending = set;
 }

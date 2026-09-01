@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "common.h"
 #include "array.h"
@@ -84,7 +84,6 @@ static const struct setting_define inet_listener_setting_defines[] = {
 	DEF(STR, type),
 	DEF(IN_PORT, port),
 	DEF(BOOL, ssl),
-	DEF(BOOL, reuse_port),
 	DEF(BOOL, haproxy),
 
 	SETTING_DEFINE_LIST_END
@@ -95,7 +94,6 @@ static const struct inet_listener_settings inet_listener_default_settings = {
 	.type = "",
 	.port = 0,
 	.ssl = FALSE,
-	.reuse_port = FALSE,
 	.haproxy = FALSE
 };
 
@@ -125,6 +123,7 @@ static const struct setting_define service_setting_defines[] = {
 	DEF(STR, chroot),
 
 	DEF(BOOL, drop_priv_before_exec),
+	DEF(BOOL, reuse_port),
 
 	DEF(UINT, process_min_avail),
 	DEF(UINT, process_limit),
@@ -158,6 +157,7 @@ static const struct service_settings service_default_settings = {
 	.chroot = "",
 
 	.drop_priv_before_exec = FALSE,
+	.reuse_port = FALSE,
 
 	.process_min_avail = 0,
 	.process_limit = 0,
@@ -236,15 +236,19 @@ static const struct master_settings master_default_settings = {
 	.version_ignore = FALSE,
 
 	.first_valid_uid = 500,
-	.last_valid_uid = 0,
+	.last_valid_uid = SET_UINT_UNLIMITED,
 	.first_valid_gid = 1,
-	.last_valid_gid = 0,
+	.last_valid_gid = SET_UINT_UNLIMITED,
 
 	.services = ARRAY_INIT
 };
 static const struct setting_keyvalue master_default_settings_keyvalue[] = {
 	{ "protocols", "" },
 	{ "listen", "* ::" },
+	{ "service_process_limit", "$SET:default_process_limit" },
+	{ "service_client_limit", "$SET:default_client_limit" },
+	{ "service_idle_kill_interval", "$SET:default_idle_kill_interval" },
+	{ "service_vsz_limit", "$SET:default_vsz_limit" },
 	{ NULL, NULL }
 };
 
@@ -601,7 +605,6 @@ master_settings_ext_check(struct event *event, void *_set,
 	struct service_settings *const *services;
 	const char *const *strings, *proto;
 	ARRAY_TYPE(const_string) all_listeners;
-	struct passwd pw;
 	unsigned int i, j, count, client_limit, process_limit;
 	unsigned int max_auth_client_processes, max_anvil_client_processes;
 	string_t *max_auth_client_processes_reason = t_str_new(64);
@@ -611,6 +614,7 @@ master_settings_ext_check(struct event *event, void *_set,
 #ifdef CONFIG_BINARY
 	const struct service_settings *default_service;
 #else
+	struct passwd pw;
 	rlim_t fd_limit;
 	const char *max_client_limit_source = "BUG";
 	unsigned int max_client_limit = 0;
@@ -623,17 +627,24 @@ master_settings_ext_check(struct event *event, void *_set,
 		set->base_dir = p_strndup(pool, set->base_dir, len - 1);
 	}
 
-	if (set->last_valid_uid != 0 &&
-	    set->first_valid_uid > set->last_valid_uid) {
+	if (set->last_valid_uid == 0) {
+		*error_r = "last_valid_uid must not be 0";
+		return FALSE;
+	}
+	if (set->first_valid_uid > set->last_valid_uid) {
 		*error_r = "first_valid_uid can't be larger than last_valid_uid";
 		return FALSE;
 	}
-	if (set->last_valid_gid != 0 &&
-	    set->first_valid_gid > set->last_valid_gid) {
+	if (set->last_valid_gid == 0) {
+		*error_r = "last_valid_gid must not be 0";
+		return FALSE;
+	}
+	if (set->first_valid_gid > set->last_valid_gid) {
 		*error_r = "first_valid_gid can't be larger than last_valid_gid";
 		return FALSE;
 	}
 
+#ifndef CONFIG_BINARY
 	if (i_getpwnam(set->default_login_user, &pw) == 0) {
 		*error_r = t_strdup_printf("default_login_user doesn't exist: %s",
 					   set->default_login_user);
@@ -644,6 +655,7 @@ master_settings_ext_check(struct event *event, void *_set,
 					   set->default_internal_user);
 		return FALSE;
 	}
+#endif
 
 	/* check that we have at least one service. the actual service
 	   structure validity is checked later while creating them. */
@@ -727,32 +739,32 @@ master_settings_ext_check(struct event *event, void *_set,
 		process_limit = service->process_limit;
 		if (process_limit == 0) {
 			*error_r = t_strdup_printf("service(%s): "
-				"process_limit must be higher than 0",
+				"process_limit must be greater than 0",
 				service->name);
 			return FALSE;
 		}
 		if (service->process_min_avail > process_limit) {
 			*error_r = t_strdup_printf("service(%s): "
-				"process_min_avail is higher than process_limit",
+				"process_min_avail is greater than process_limit",
 				service->name);
 			return FALSE;
 		}
 		if (service->client_limit == 0) {
 			*error_r = t_strdup_printf("service(%s): "
-				"client_limit must be higher than 0",
+				"client_limit must be greater than 0",
 				service->name);
 			return FALSE;
 		}
 		if (service->restart_request_count == 0) {
 			*error_r = t_strdup_printf("service(%s): "
-				"restart_request_count must be higher than 0 "
+				"restart_request_count must be greater than 0 "
 				"(did you mean \"unlimited\"?)",
 				service->name);
 			return FALSE;
 		}
 		if (service->idle_kill_interval == 0) {
 			*error_r = t_strdup_printf("service(%s): "
-				"idle_kill_interval must be higher than 0 "
+				"idle_kill_interval must be greater than 0 "
 				"(did you mean \"unlimited\"?)",
 				service->name);
 			return FALSE;
@@ -761,6 +773,14 @@ master_settings_ext_check(struct event *event, void *_set,
 			*error_r = t_strdup_printf("service(%s): "
 				"vsz_limit is too low "
 				"(did you mean \"unlimited\"?)", service->name);
+			return FALSE;
+		}
+
+		if (service->reuse_port &&
+		    service->process_min_avail != service->process_limit) {
+			*error_r = t_strdup_printf("service(%s): "
+				"process_min_avail must be equal to process_limit when using service_reuse_port=yes",
+				service->name);
 			return FALSE;
 		}
 

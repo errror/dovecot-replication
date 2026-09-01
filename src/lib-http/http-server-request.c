@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -238,6 +238,11 @@ http_server_request_get(struct http_server_request *req)
 	return &req->req;
 }
 
+struct event *http_server_request_get_event(struct http_server_request *req)
+{
+	return req->event;
+}
+
 pool_t http_server_request_get_pool(struct http_server_request *req)
 {
 	return req->pool;
@@ -421,17 +426,23 @@ void http_server_request_finished(struct http_server_request *req)
 {
 	struct http_server_connection *conn = req->conn;
 	struct http_server_response *resp = req->response;
+
+	i_assert(conn != NULL);
+	i_assert(resp != NULL);
+	i_assert(req->state < HTTP_SERVER_REQUEST_STATE_FINISHED);
+	req->state = HTTP_SERVER_REQUEST_STATE_FINISHED;
+
 	http_server_tunnel_callback_t tunnel_callback = resp->tunnel_callback;
 	void *tunnel_context = resp->tunnel_context;
 
-	i_assert(req->state < HTTP_SERVER_REQUEST_STATE_FINISHED);
-	req->state = HTTP_SERVER_REQUEST_STATE_FINISHED;
+	if (conn->callbacks != NULL &&
+	    conn->callbacks->request_finished != NULL)
+		conn->callbacks->request_finished(conn->context, req);
 
 	http_server_connection_remove_request(conn, req);
 	conn->stats.response_count++;
 
-	if (req->response != NULL)
-		http_server_response_request_finished(req->response);
+	http_server_response_request_finished(resp);
 
 	uoff_t bytes_in = req->conn->conn.input->v_offset -
 			  req->input_start_offset;
@@ -723,7 +734,8 @@ http_server_request_get_payload_input(struct http_server_request *req,
 	hsristream->istream.istream.seekable = FALSE;
 
 	req->payload_input = i_stream_create(&hsristream->istream, payload,
-					     i_stream_get_fd(payload), 0);
+					     i_stream_get_fd(payload),
+					     ISTREAM_HIDDEN_INPUTS_NONE, 0);
 	i_stream_unref(&req->req.payload);
 	return req->payload_input;
 }

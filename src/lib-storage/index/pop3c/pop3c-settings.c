@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "settings-parser.h"
@@ -21,7 +21,7 @@ static const struct setting_define pop3c_setting_defines[] = {
 	DEF(ENUM, pop3c_ssl),
 	DEF(BOOL, pop3c_ssl_verify),
 
-	DEF(STR, pop3c_rawlog_dir),
+	DEF(PATH_DIR, pop3c_rawlog_dir),
 	DEF(BOOL, pop3c_quick_received_date),
 
 	DEF(BOOLLIST, pop3c_features),

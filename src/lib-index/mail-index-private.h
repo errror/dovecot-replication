@@ -125,7 +125,7 @@ struct mail_index_record_map {
 	ARRAY(struct mail_index_map *) maps;
 
 	void *mmap_base;
-	size_t mmap_size, mmap_used_size;
+	size_t mmap_size;
 
 	buffer_t *buffer;
 
@@ -358,7 +358,8 @@ struct mail_index_map *mail_index_map_alloc(struct mail_index *index);
 
    If we mmap()ed the index file, the map is returned locked.
 
-   Returns 1 = ok, 0 = corrupted, -1 = error. */
+   Returns 1 = ok, 0 = unusably corrupted, -1 = error. Corrupted records inside
+   the transaction log file doesn't cause this function to fail. */
 int mail_index_map(struct mail_index *index,
 		   enum mail_index_sync_handler_type type);
 /* Unreference given mapping and unmap it if it's dropped to zero. */

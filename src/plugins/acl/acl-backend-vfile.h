@@ -26,6 +26,7 @@ struct acl_object_vfile {
 	struct acl_object aclobj;
 
 	char *local_path;
+	bool failed:1;
 };
 
 struct acl_backend_vfile_acllist {
@@ -35,7 +36,6 @@ struct acl_backend_vfile_acllist {
 
 struct acl_backend_vfile {
 	struct acl_backend backend;
-	const struct acl_vfile_settings *set;
 
 	pool_t acllist_pool;
 	ARRAY(struct acl_backend_vfile_acllist) acllist;

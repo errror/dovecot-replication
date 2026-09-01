@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "userdb.h"
@@ -8,7 +8,6 @@
 #include "ioloop.h"
 #include "array.h"
 #include "str.h"
-#include "auth-cache.h"
 #include "settings.h"
 #include "auth-settings.h"
 #include "db-ldap.h"
@@ -122,9 +121,12 @@ static void userdb_ldap_lookup(struct auth_request *auth_request,
 	struct userdb_ldap_request *request;
 	const char *error;
 
+	const struct settings_get_params params = {
+		.escape_func = ldap_escape,
+	};
 	const struct ldap_pre_settings *ldap_pre = NULL;
-	if (settings_get(event, &ldap_pre_setting_parser_info, 0,
-			 &ldap_pre, &error) < 0 ||
+	if (settings_get_params(event, &ldap_pre_setting_parser_info, &params,
+				&ldap_pre, &error) < 0 ||
 	    ldap_pre_settings_post_check(ldap_pre, DB_LDAP_LOOKUP_TYPE_USERDB,
 					 &error) < 0) {
 		e_error(event, "%s", error);
@@ -172,7 +174,7 @@ static void userdb_ldap_iterate_callback(struct ldap_connection *conn,
 		return;
 	}
 
-	if (ctx->deinitialized)
+	if (ctx->deinitialized || ctx->ctx.failed)
 		return;
 
 	/* the iteration can take a while. reset the request's create time so
@@ -187,6 +189,12 @@ static void userdb_ldap_iterate_callback(struct ldap_connection *conn,
 						&urequest->request, res, TRUE)
 	};
 
+	/* NOTE: No .escape_func here, unlike the other LDAP paths. Those
+	   escape because their expansion output is composed into an LDAP
+	   filter. Here the expansion result is the username that gets returned
+	   to the iteration caller, so escaping it would corrupt legitimate
+	   usernames. Any caller that feeds a returned username back into a
+	   query must escape it at that query-construction site. */
 	struct var_expand_params params = {
 		.providers = db_ldap_field_expand_fn_table,
 		.context = &fctx
@@ -201,8 +209,11 @@ static void userdb_ldap_iterate_callback(struct ldap_connection *conn,
 			 &set, &error) < 0) {
 		e_error(event, "%s", error);
 		ctx->ctx.failed = TRUE;
-	}
-	else {
+	} else if (!array_is_created(&set->iterate_fields)) {
+		e_error(event, "iterate: No userdb_ldap_iterate_fields specified");
+		ctx->ctx.failed = TRUE;
+		settings_free(set);
+	} else {
 		unsigned int count;
 		const char *const *items = array_get(&set->iterate_fields, &count);
 		for (unsigned int ndx = 0; ndx < count - 1;) {
@@ -255,9 +266,12 @@ userdb_ldap_iterate_init(struct auth_request *auth_request,
 	request = &ctx->request;
 	request->ctx = ctx;
 
+	const struct settings_get_params params = {
+		.escape_func = ldap_escape,
+	};
 	const struct ldap_pre_settings *ldap_pre = NULL;
-	if (settings_get(event, &ldap_pre_setting_parser_info, 0,
-			 &ldap_pre, &error) < 0 ||
+	if (settings_get_params(event, &ldap_pre_setting_parser_info, &params,
+				&ldap_pre, &error) < 0 ||
 	    ldap_pre_settings_post_check(ldap_pre, DB_LDAP_LOOKUP_TYPE_ITERATE,
 					 &error) < 0) {
 		e_error(event, "%s", error);
@@ -312,9 +326,11 @@ static int userdb_ldap_iterate_deinit(struct userdb_iterate_context *_ctx)
 	return ret;
 }
 
-static int userdb_ldap_preinit(pool_t pool, struct event *event,
-			       struct userdb_module **module_r,
-			       const char **error_r ATTR_UNUSED)
+static int
+userdb_ldap_preinit(pool_t pool, struct event *event,
+		    const struct userdb_parameters *userdb_params,
+		    struct userdb_module **module_r,
+		    const char **error_r ATTR_UNUSED)
 {
 	const struct auth_userdb_post_settings *auth_post = NULL;
 	const struct ldap_post_settings *ldap_post = NULL;
@@ -328,8 +344,13 @@ static int userdb_ldap_preinit(pool_t pool, struct event *event,
 	if (settings_get(event, &ldap_post_setting_parser_info,
 			 RAW_SETTINGS, &ldap_post, error_r) < 0)
 		goto failed;
-	if (settings_get(event, &ldap_pre_setting_parser_info,
-			 RAW_SETTINGS, &ldap_pre, error_r) < 0)
+
+	const struct settings_get_params params = {
+		.escape_func = ldap_escape,
+		.flags = RAW_SETTINGS,
+	};
+	if (settings_get_params(event, &ldap_pre_setting_parser_info,
+				&params, &ldap_pre, error_r) < 0)
 		goto failed;
 
 	module = p_new(pool, struct ldap_userdb_module, 1);
@@ -341,13 +362,12 @@ static int userdb_ldap_preinit(pool_t pool, struct event *event,
 	db_ldap_get_attribute_names(pool, &ldap_post->iterate_fields,
 				    &module->iterate_attributes, NULL, NULL);
 
-	module->module.default_cache_key = auth_cache_parse_key_and_fields(
-		pool, t_strconcat(ldap_pre->ldap_base,
-				  ldap_pre->userdb_ldap_filter, NULL),
-		&auth_post->fields, NULL);
+	const char *query = t_strconcat(ldap_pre->ldap_base,
+					ldap_pre->userdb_ldap_filter, NULL);
+	ret = userdb_set_cache_key(&module->module, userdb_params, pool,
+				   query, &auth_post->fields, NULL, error_r);
 
 	*module_r = &module->module;
-	ret = 0;
 
 failed:
 	settings_free(auth_post);
@@ -370,6 +390,7 @@ static void userdb_ldap_deinit(struct userdb_module *_module)
 	struct ldap_userdb_module *module =
 		container_of(_module, struct ldap_userdb_module, module);
 
+	db_ldap_abort_all_requests(module->conn);
 	db_ldap_unref(&module->conn);
 }
 

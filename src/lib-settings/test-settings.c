@@ -1,4 +1,4 @@
-/* Copyright (c) 2021 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -22,6 +22,7 @@ struct test2_settings {
 
 	const char *title;
 	ARRAY_TYPE(const_string) fruits;
+	ARRAY_TYPE(const_string) attrs;
 };
 
 #undef DEF
@@ -62,12 +63,14 @@ static struct setting_define test2_setting_defines[] = {
 	{ .type = SET_FILTER_ARRAY, .key = "test2_fruit",
 	   .offset = offsetof(struct test2_settings, fruits),
 	   .filter_array_field_name = "test2_fruit_name" },
+	DEF(STRLIST, attrs),
 	SETTING_DEFINE_LIST_END
 };
 
 static struct test2_settings test2_default_settings = {
 	.title = "",
 	.fruits = ARRAY_INIT,
+	.attrs = ARRAY_INIT,
 };
 
 static const struct setting_parser_info test2_setting_parser_info = {
@@ -340,11 +343,340 @@ static void test_var_expand_hierarchy(void)
 	test_end();
 }
 
+static void test_var_expand_strlist_key(void)
+{
+	test_begin("settings_get - strlist key expansion");
+
+	char *context1 = "context1";
+	struct var_expand_table tab1[] = {
+		{ .key = "key1", .func = test_var_expand_hierarchy_key1 },
+		{ .key = NULL }
+	};
+	struct var_expand_params params1 = {
+		.table = tab1,
+		.context = context1,
+	};
+
+	struct settings_root *set_root = settings_root_init();
+	/* key with a %variable - must be expanded, but its raw form is the
+	   list identity used for dedup/override */
+	settings_root_override(set_root, "test2_attrs/%{key1}", "v-%{key1}",
+			       SETTINGS_OVERRIDE_TYPE_DEFAULT);
+	/* a second, distinct raw key that must survive alongside the first */
+	settings_root_override(set_root, "test2_attrs/plain", "%{key1}",
+			       SETTINGS_OVERRIDE_TYPE_DEFAULT);
+
+	struct event *event = event_create(NULL);
+	event_set_ptr(event, SETTINGS_EVENT_ROOT, set_root);
+	event_set_ptr(event, SETTINGS_EVENT_VAR_EXPAND_PARAMS, &params1);
+
+	struct test2_settings *set;
+	const char *error;
+	test_assert(settings_get(event, &test2_setting_parser_info, 0,
+				 &set, &error) == 0);
+
+	unsigned int count;
+	const char *const *attrs = array_get(&set->attrs, &count);
+	/* both raw keys survived dedup (no collision on raw identity);
+	   overrides are filled in reverse order */
+	test_assert(count == 4);
+	if (count == 4) {
+		/* literal key kept, value expanded */
+		test_assert_strcmp(attrs[0], "plain");
+		test_assert_strcmp(attrs[1], "key1_value");
+		/* key and value both expanded */
+		test_assert_strcmp(attrs[2], "key1_value");
+		test_assert_strcmp(attrs[3], "v-key1_value");
+	}
+	settings_free(set);
+
+	event_unref(&event);
+	settings_root_deinit(&set_root);
+	test_end();
+}
+
+static void test_strlist_key_no_override_expand(void)
+{
+	test_begin("settings_get - strlist key not expanded for overrides");
+
+	char *context1 = "context1";
+	struct var_expand_table tab1[] = {
+		{ .key = "key1", .func = test_var_expand_hierarchy_key1 },
+		{ .key = NULL }
+	};
+	struct var_expand_params params1 = {
+		.table = tab1,
+		.context = context1,
+	};
+
+	struct settings_root *set_root = settings_root_init();
+	/* -o style and userdb overrides must NOT have their keys or values
+	   expanded, the same way override values are not expanded. */
+	settings_root_override(set_root, "test2_attrs/%{key1}", "%{key1}",
+			       SETTINGS_OVERRIDE_TYPE_CLI_PARAM);
+	settings_root_override(set_root, "test2_attrs/u-%{key1}", "%{key1}",
+			       SETTINGS_OVERRIDE_TYPE_USERDB);
+
+	struct event *event = event_create(NULL);
+	event_set_ptr(event, SETTINGS_EVENT_ROOT, set_root);
+	event_set_ptr(event, SETTINGS_EVENT_VAR_EXPAND_PARAMS, &params1);
+
+	struct test2_settings *set;
+	const char *error;
+	test_assert(settings_get(event, &test2_setting_parser_info, 0,
+				 &set, &error) == 0);
+
+	unsigned int count;
+	const char *const *attrs = array_get(&set->attrs, &count);
+	test_assert(count == 4);
+	if (count == 4) {
+		/* keys and values stay literal */
+		test_assert_strcmp(attrs[0], "%{key1}");    /* -o key   */
+		test_assert_strcmp(attrs[1], "%{key1}");    /* -o value */
+		test_assert_strcmp(attrs[2], "u-%{key1}");  /* userdb key   */
+		test_assert_strcmp(attrs[3], "%{key1}");    /* userdb value */
+	}
+	settings_free(set);
+
+	event_unref(&event);
+	settings_root_deinit(&set_root);
+	test_end();
+}
+
+struct test_empty_default_settings {
+	pool_t pool;
+
+	unsigned int num;
+	unsigned int interval;
+	const char *str;
+};
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type("test_empty_default_"#name, name, \
+				     struct test_empty_default_settings)
+
+static const struct setting_define test_empty_default_setting_defines[] = {
+	DEF(UINT, num),
+	DEF(TIME, interval),
+	DEF(STR, str),
+	SETTING_DEFINE_LIST_END
+};
+
+static const struct test_empty_default_settings
+test_empty_default_default_settings = {
+	.num = 42,
+	.interval = 30,
+	.str = "default",
+};
+
+/* An empty built-in default for a setting that can't be empty (num, interval)
+   must be treated as "no default" and inherited from the struct default,
+   rather than failing to parse. An empty default for an emptyable setting
+   (str) is applied normally. */
+static const struct setting_keyvalue
+test_empty_default_default_settings_keyvalue[] = {
+	{ "test_empty_default_num", "" },
+	{ "test_empty_default_interval", "" },
+	{ "test_empty_default_str", "" },
+	{ NULL, NULL }
+};
+
+static const struct setting_parser_info test_empty_default_setting_parser_info = {
+	.name = "test_empty_default",
+
+	.defines = test_empty_default_setting_defines,
+	.defaults = &test_empty_default_default_settings,
+	.default_settings = test_empty_default_default_settings_keyvalue,
+
+	.struct_size = sizeof(struct test_empty_default_settings),
+	.pool_offset1 = 1 + offsetof(struct test_empty_default_settings, pool),
+};
+
+static void test_settings_empty_default(void)
+{
+	test_begin("settings_get - empty built-in default means no default");
+
+	struct settings_root *set_root = settings_root_init();
+	struct event *event = event_create(NULL);
+	event_set_ptr(event, SETTINGS_EVENT_ROOT, set_root);
+
+	struct test_empty_default_settings *set;
+	const char *error = NULL;
+	int ret = settings_get(event, &test_empty_default_setting_parser_info,
+			       0, &set, &error);
+	test_assert(ret == 0);
+	test_assert(error == NULL);
+	if (error != NULL)
+		i_error("%s", error);
+	if (ret == 0) {
+		/* non-emptyable settings inherit their struct defaults */
+		test_assert(set->num == 42);
+		test_assert(set->interval == 30);
+		/* emptyable setting keeps the empty default */
+		test_assert_strcmp(set->str, "");
+		settings_free(set);
+	}
+
+	event_unref(&event);
+	settings_root_deinit(&set_root);
+	test_end();
+}
+
+struct test_path_settings {
+	pool_t pool;
+
+	const char *dir;
+	const char *file;
+	const char *str;
+};
+
+#undef DEF
+#define DEF(type, name) \
+	SETTING_DEFINE_STRUCT_##type("test_path_"#name, name, \
+				     struct test_path_settings)
+
+static const struct setting_define test_path_setting_defines[] = {
+	DEF(PATH_DIR, dir),
+	DEF(PATH_FILE, file),
+	DEF(STR, str),
+	SETTING_DEFINE_LIST_END
+};
+
+static const struct test_path_settings test_path_default_settings = {
+	.dir = "",
+	.file = "",
+	.str = "",
+};
+
+static const struct setting_parser_info test_path_setting_parser_info = {
+	.name = "test_path",
+
+	.defines = test_path_setting_defines,
+	.defaults = &test_path_default_settings,
+
+	.struct_size = sizeof(struct test_path_settings),
+	.pool_offset1 = 1 + offsetof(struct test_path_settings, pool),
+};
+
+static void
+test_settings_path_expand_scenario(const char *scenario_name,
+				   enum settings_override_type type,
+				   const char *value,
+				   const char *expected_dir,
+				   const char *expected_file,
+				   const char *expected_str)
+{
+	struct var_expand_table tab[] = {
+		{ .key = "home", .value = "/home/user" },
+		{ .key = "key1", .value = "key1_value" },
+		{ .key = NULL }
+	};
+	struct var_expand_params params = {
+		.table = tab,
+	};
+
+	test_begin(t_strdup_printf("settings_get - path expand %s",
+				   scenario_name));
+
+	struct settings_root *set_root = settings_root_init();
+	settings_root_override(set_root, "test_path_dir", value, type);
+	settings_root_override(set_root, "test_path_file", value, type);
+	settings_root_override(set_root, "test_path_str", value, type);
+
+	struct event *event = event_create(NULL);
+	event_set_ptr(event, SETTINGS_EVENT_ROOT, set_root);
+	event_set_ptr(event, SETTINGS_EVENT_VAR_EXPAND_PARAMS, &params);
+
+	struct test_path_settings *set;
+	const char *error = NULL;
+	int ret = settings_get(event, &test_path_setting_parser_info, 0,
+			       &set, &error);
+	test_assert(ret == 0);
+	test_assert(error == NULL);
+	if (error != NULL)
+		i_error("%s", error);
+	if (ret == 0) {
+		test_assert_strcmp(set->dir, expected_dir);
+		test_assert_strcmp(set->file, expected_file);
+		test_assert_strcmp(set->str, expected_str);
+		settings_free(set);
+	}
+
+	event_unref(&event);
+	settings_root_deinit(&set_root);
+	test_end();
+}
+
+static void test_settings_path_expand(void)
+{
+	/* default settings get full %variable expansion, ~/ included */
+	test_settings_path_expand_scenario("default",
+		SETTINGS_OVERRIDE_TYPE_DEFAULT, "~/mail/%{key1}",
+		"/home/user/mail/key1_value", "/home/user/mail/key1_value",
+		"~/mail/key1_value");
+	test_settings_path_expand_scenario("default trailing slash",
+		SETTINGS_OVERRIDE_TYPE_DEFAULT, "~/mail/",
+		"/home/user/mail", "/home/user/mail/", "~/mail/");
+	test_settings_path_expand_scenario("default bare tilde",
+		SETTINGS_OVERRIDE_TYPE_DEFAULT, "~",
+		"/home/user", "/home/user", "~");
+	test_settings_path_expand_scenario("default absolute path",
+		SETTINGS_OVERRIDE_TYPE_DEFAULT, "/abs/path/",
+		"/abs/path", "/abs/path/", "/abs/path/");
+	/* -o and userdb overrides expand only the ~/ prefix, the rest of the
+	   value stays literal */
+	test_settings_path_expand_scenario("cli",
+		SETTINGS_OVERRIDE_TYPE_CLI_PARAM, "~/mail/%{key1}",
+		"/home/user/mail/%{key1}", "/home/user/mail/%{key1}",
+		"~/mail/%{key1}");
+	test_settings_path_expand_scenario("userdb",
+		SETTINGS_OVERRIDE_TYPE_USERDB, "~/mail/",
+		"/home/user/mail", "/home/user/mail/", "~/mail/");
+	test_settings_path_expand_scenario("userdb bare tilde",
+		SETTINGS_OVERRIDE_TYPE_USERDB, "~",
+		"/home/user", "/home/user", "~");
+}
+
+static void test_settings_path_expand_no_home(void)
+{
+	/* no home variable available - using ~/ must fail */
+	static const enum settings_override_type types[] = {
+		SETTINGS_OVERRIDE_TYPE_DEFAULT,
+		SETTINGS_OVERRIDE_TYPE_USERDB,
+	};
+
+	test_begin("settings_get - path expand without home");
+	for (unsigned int i = 0; i < N_ELEMENTS(types); i++) {
+		struct settings_root *set_root = settings_root_init();
+		settings_root_override(set_root, "test_path_dir", "~/mail",
+				       types[i]);
+
+		struct event *event = event_create(NULL);
+		event_set_ptr(event, SETTINGS_EVENT_ROOT, set_root);
+
+		struct test_path_settings *set;
+		const char *error = NULL;
+		test_assert_idx(settings_get(event,
+			&test_path_setting_parser_info, 0, &set, &error) < 0, i);
+		test_assert_idx(error != NULL, i);
+
+		event_unref(&event);
+		settings_root_deinit(&set_root);
+	}
+	test_end();
+}
+
 int main(void)
 {
 	static void (*const test_functions[])(void) = {
 		test_settings_get,
 		test_var_expand_hierarchy,
+		test_var_expand_strlist_key,
+		test_strlist_key_no_override_expand,
+		test_settings_empty_default,
+		test_settings_path_expand,
+		test_settings_path_expand_no_home,
 		NULL
 	};
 	return test_run(test_functions);

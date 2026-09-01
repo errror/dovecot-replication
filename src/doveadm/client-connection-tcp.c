@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
@@ -8,9 +8,9 @@
 #include "istream.h"
 #include "ostream.h"
 #include "strescape.h"
+#include "version.h"
 #include "iostream-ssl.h"
 #include "ostream-multiplex.h"
-#include "master-service.h"
 #include "master-service-ssl.h"
 #include "mail-storage-service.h"
 #include "doveadm-util.h"
@@ -197,6 +197,7 @@ doveadm_cmd_server_run_ver2(struct client_connection_tcp *conn,
 	if (doveadm_cmdline_run(argc, argv, cctx) < 0)
 		doveadm_exit_code = EX_USAGE;
 	doveadm_cmd_server_post(conn, cctx);
+	doveadm_cmd_context_finished(cctx);
 }
 
 static int doveadm_cmd_handle(struct client_connection_tcp *conn,
@@ -290,6 +291,11 @@ static bool client_handle_command_ctx(struct client_connection_tcp *conn,
 			doveadm_verbose = TRUE;
 			break;
 		case DOVEADM_PROTOCOL_CMD_FLAG_EXTRA_FIELDS:
+			if (argc == 0) {
+				e_error(cctx->event, "doveadm client: "
+					"Missing extra fields argument");
+				return FALSE;
+			}
 			cctx->extra_fields = t_strsplit_tabescaped(args[0]);
 			args++; argc--;
 			break;
@@ -299,7 +305,12 @@ static bool client_handle_command_ctx(struct client_connection_tcp *conn,
 			return FALSE;
 		}
 	}
+	if (argc < 2) {
+		e_error(cctx->event, "doveadm client: No command given");
+		return FALSE;
+	}
 	cctx->username = args[0]; args++; argc--;
+	event_add_str(cctx->event, "user", cctx->username);
 	cmd_name = args[0];
 
 	if (strcmp(cmd_name, "OPTION") == 0) {
@@ -334,7 +345,8 @@ static bool client_handle_command(struct client_connection_tcp *conn,
 				  const char *const *args)
 {
 	struct doveadm_cmd_context *cctx = doveadm_cmd_context_create(
-		conn->conn.type, doveadm_verbose || doveadm_debug);
+		conn->conn.event, conn->conn.type,
+		doveadm_verbose || doveadm_debug);
 	cctx->input = conn->input;
 	cctx->output = conn->output;
 	cctx->local_ip = conn->conn.local_ip;
@@ -400,9 +412,7 @@ client_connection_tcp_authenticate(struct client_connection_tcp *conn)
 		return -1;
 	}
 	pass = t_strndup(data + 9, size - 9);
-	if (strlen(pass) != strlen(set->doveadm_password) ||
-	    !mem_equals_timing_safe(pass, set->doveadm_password,
-				    strlen(pass))) {
+	if (!str_equals_hash_timing_safe(pass, set->doveadm_password)) {
 		e_error(conn->conn.event,
 			"doveadm client authenticated with wrong password");
 		return -1;
@@ -472,8 +482,14 @@ client_connection_tcp_input(struct client_connection_tcp *conn)
 		conn->io_setup = TRUE;
 		if (conn->minor_version >= DOVEADM_PROTOCOL_MIN_VERSION_MULTIPLEX) {
                         struct ostream *os = conn->output;
+			/* PACKET is deprecated; use the STREAM format with
+			   clients new enough to understand it. */
+			enum ostream_multiplex_format format =
+				conn->minor_version >= DOVEADM_PROTOCOL_MIN_VERSION_MULTIPLEX_STREAM ?
+				OSTREAM_MULTIPLEX_FORMAT_STREAM :
+				OSTREAM_MULTIPLEX_FORMAT_PACKET;
 			conn->output = o_stream_create_multiplex(os, SIZE_MAX,
-				OSTREAM_MULTIPLEX_FORMAT_PACKET);
+				format);
                         o_stream_set_name(conn->output, o_stream_get_name(os));
                         o_stream_set_no_error_handling(conn->output, TRUE);
                         o_stream_unref(&os);
@@ -584,6 +600,7 @@ client_connection_tcp_create(int fd, int listen_fd, bool ssl)
 	conn->conn.event = event_create(NULL);
 	settings_event_add_filter_name(conn->conn.event, DOVEADM_SERVER_FILTER);
 	event_set_append_log_prefix(conn->conn.event, "tcp: ");
+	event_add_str(conn->conn.event, "origin", "tcp");
 	conn->fd = fd;
 
 	if (client_connection_init(&conn->conn,

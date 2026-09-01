@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lmtp-common.h"
 #include "istream.h"
@@ -44,6 +44,9 @@ struct lmtp_proxy_recipient {
 	ARRAY(struct lmtp_proxy_redirect) redirect_path;
 
 	struct smtp_address *address;
+
+	struct auth_master_request *auth_request;
+	struct lmtp_proxy_rcpt_settings *proxy_set;
 
 	const unsigned char *auth_forward_fields;
 	size_t auth_forward_fields_size;
@@ -122,6 +125,8 @@ lmtp_proxy_init(struct client *client,
 
 	smtp_server_connection_get_proxy_data(client->conn,
 					      &lmtp_set.proxy_data);
+	lmtp_set.proxy_data.dest_ip = client->local_ip;
+	lmtp_set.proxy_data.dest_port = client->local_port;
 	lmtp_set.proxy_data.source_ip = client->remote_ip;
 	lmtp_set.proxy_data.source_port = client->remote_port;
 	lmtp_set.proxy_data.local_name = client->local_name;
@@ -369,6 +374,7 @@ lmtp_proxy_rcpt_destroy(struct smtp_server_recipient *rcpt ATTR_UNUSED,
 			struct lmtp_proxy_recipient *lprcpt)
 {
 	array_free(&lprcpt->redirect_path);
+	auth_master_request_abort(&lprcpt->auth_request);
 }
 
 static int
@@ -650,49 +656,25 @@ lmtp_proxy_rcpt_init_auth_user_info(struct lmtp_recipient *lrcpt,
 }
 
 static void
-lmtp_proxy_rcpt_redirect_relookup(struct lmtp_proxy_recipient *lprcpt,
-				  struct lmtp_proxy_rcpt_settings *set,
-				  const char *destuser)
+lmtp_proxy_rcpt_redirect_relookup_cb(struct lmtp_proxy_recipient *lprcpt,
+				     int result, const char *const *fields)
 {
 	struct lmtp_recipient *lrcpt = lprcpt->rcpt;
 	struct smtp_server_recipient *rcpt = lrcpt->rcpt;
-	in_port_t port = set->set.port;
-	struct auth_master_connection *auth_conn;
-	struct auth_user_info info;
-	const char *const *fields, *errstr, *username;
-	pool_t auth_pool;
+	struct lmtp_proxy_rcpt_settings *set = lprcpt->proxy_set;
+	const char *errstr, *username;
 	int ret;
 
-	lmtp_proxy_rcpt_init_auth_user_info(lrcpt, &info);
+	lprcpt->auth_request = NULL;
 
-	string_t *hosts_attempted = t_str_new(64);
-	str_append(hosts_attempted, "proxy_redirect_host_attempts=");
-	lmtp_proxy_rcpt_get_redirect_path(lprcpt, hosts_attempted);
-	const char *const extra_fields[] = {
-		t_strdup_printf("proxy_redirect_host_next=%s:%u",
-				set->set.host, port),
-		str_c(hosts_attempted),
-		t_strdup_printf("destuser=%s", str_tabescape(destuser)),
-		t_strdup_printf("proxy_timeout=%u", lprcpt->conn->set.set.timeout_msecs),
-	};
-	t_array_init(&info.extra_fields, N_ELEMENTS(extra_fields));
-	array_append(&info.extra_fields, extra_fields,
-		     N_ELEMENTS(extra_fields));
-
-	// FIXME: make this async
-	auth_pool = pool_alloconly_create("auth lookup", 1024);
-	auth_conn = mail_storage_service_get_auth_conn(storage_service);
-	ret = auth_master_pass_lookup(auth_conn, lrcpt->username, &info,
-				      auth_pool, &fields);
-	if (ret <= 0) {
-		if (ret == 0 || fields[0] == NULL)
+	if (result <= 0) {
+		if (result == 0 || fields[0] == NULL)
 			errstr = "Redirect lookup unexpectedly failed";
 		else {
 			errstr = t_strdup_printf(
 				"Redirect lookup unexpectedly failed: %s",
 				fields[0]);
 		}
-		pool_unref(&auth_pool);
 		smtp_server_recipient_reply(rcpt, 451, "4.3.0", "%s", errstr);
 		return;
 	}
@@ -719,7 +701,43 @@ lmtp_proxy_rcpt_redirect_relookup(struct lmtp_proxy_recipient *lprcpt,
 	} else {
 		lmtp_proxy_rcpt_redirect_finish(lprcpt, set);
 	}
-	pool_unref(&auth_pool);
+}
+
+static void
+lmtp_proxy_rcpt_redirect_relookup(struct lmtp_proxy_recipient *lprcpt,
+				  struct lmtp_proxy_rcpt_settings *set,
+				  const char *destuser)
+{
+	struct lmtp_recipient *lrcpt = lprcpt->rcpt;
+	struct smtp_server_recipient *rcpt = lrcpt->rcpt;
+	in_port_t port = set->set.port;
+	struct auth_master_connection *auth_conn;
+	struct auth_user_info info;
+
+	lmtp_proxy_rcpt_init_auth_user_info(lrcpt, &info);
+
+	string_t *hosts_attempted = t_str_new(64);
+	str_append(hosts_attempted, "proxy_redirect_host_attempts=");
+	lmtp_proxy_rcpt_get_redirect_path(lprcpt, hosts_attempted);
+	const char *const extra_fields[] = {
+		t_strdup_printf("proxy_redirect_host_next=%s:%u",
+				set->set.host, port),
+		str_c(hosts_attempted),
+		t_strdup_printf("destuser=%s", str_tabescape(destuser)),
+		t_strdup_printf("proxy_timeout=%u", lprcpt->conn->set.set.timeout_msecs),
+	};
+	t_array_init(&info.extra_fields, N_ELEMENTS(extra_fields));
+	array_append(&info.extra_fields, extra_fields,
+		     N_ELEMENTS(extra_fields));
+
+	lprcpt->proxy_set = p_new(rcpt->pool, struct lmtp_proxy_rcpt_settings, 1);
+	*lprcpt->proxy_set = *set;
+	lprcpt->proxy_set->set.host = p_strdup(rcpt->pool, set->set.host);
+
+	auth_conn = mail_storage_service_get_auth_conn(storage_service);
+	lprcpt->auth_request = auth_master_pass_lookup_async(
+		auth_conn, lrcpt->username, &info,
+		lmtp_proxy_rcpt_redirect_relookup_cb, lprcpt);
 }
 
 static void
@@ -885,54 +903,35 @@ lmtp_proxy_rcpt_handle_not_proxied(struct lmtp_proxy_recipient *lprcpt,
 	return -1;
 }
 
-int lmtp_proxy_rcpt(struct client *client,
-		    struct smtp_server_cmd_ctx *cmd ATTR_UNUSED,
-		    struct lmtp_recipient *lrcpt)
+static void
+lmtp_proxy_rcpt_user_lookup_cb(struct lmtp_proxy_recipient *lprcpt, int result,
+			       const char *const *fields)
 {
-	struct auth_master_connection *auth_conn;
+	struct lmtp_recipient *lrcpt = lprcpt->rcpt;
+	struct client *client = lrcpt->client;
 	struct lmtp_proxy_rcpt_settings set;
 	struct lmtp_proxy_connection *conn;
 	struct smtp_server_recipient *rcpt = lrcpt->rcpt;
-	struct lmtp_proxy_recipient *lprcpt;
 	struct smtp_address *address = rcpt->path;
-	struct auth_user_info info;
-	struct mail_storage_service_input input;
-	const char *const *fields, *errstr, *username, *orig_username;
+	const char *username = lrcpt->username, *errstr;
 	struct smtp_address *user;
-	pool_t auth_pool;
 	int ret;
 
-	lprcpt = p_new(rcpt->pool, struct lmtp_proxy_recipient, 1);
-	lprcpt->rcpt = lrcpt;
+	lprcpt->auth_request = NULL;
 
-	lrcpt->type = LMTP_RECIPIENT_TYPE_PROXY;
-	lrcpt->backend_context = lprcpt;
-
-	i_zero(&input);
-	input.service = "lmtp";
-	mail_storage_service_init_settings(storage_service, &input);
-
-	lmtp_proxy_rcpt_init_auth_user_info(lrcpt, &info);
-
-	// FIXME: make this async
-	username = orig_username = lrcpt->username;
-	auth_pool = pool_alloconly_create("auth lookup", 1024);
-	auth_conn = mail_storage_service_get_auth_conn(storage_service);
-	ret = auth_master_pass_lookup(auth_conn, username, &info,
-				      auth_pool, &fields);
-	if (ret <= 0) {
-		errstr = (ret < 0 && fields[0] != NULL ?
+	if (result <= 0) {
+		errstr = (result < 0 && fields[0] != NULL ?
 			  t_strdup(fields[0]) :
 			  "Temporary user lookup failure");
-		pool_unref(&auth_pool);
-		if (ret < 0) {
+		if (result < 0) {
 			smtp_server_recipient_reply(rcpt, 451, "4.3.0", "%s",
 						    errstr);
-			return -1;
+			return;
 		} else {
-			/* User not found from passdb: revert to local delivery.
+			/* User not found from passdb. revert to local delivery
 			 */
-			return 0;
+			(void)lmtp_rcpt_continue(lrcpt);
+			return;
 		}
 	}
 
@@ -947,31 +946,34 @@ int lmtp_proxy_rcpt(struct client *client,
 		smtp_server_recipient_reply(
 			rcpt, 550, "5.3.5",
 			"Internal user lookup failure");
-		pool_unref(&auth_pool);
-		return -1;
+		return;
 	}
 	if (ret == 0) {
 		/* Not proxying this user */
 		ret = lmtp_proxy_rcpt_handle_not_proxied(lprcpt, &set, username);
-		pool_unref(&auth_pool);
-		return ret;
+		if (ret < 0)
+			return;
+		(void)lmtp_rcpt_continue(lrcpt);
+		return;
 	}
-	if (strcmp(username, orig_username) != 0) {
+
+	e_debug(rcpt->event, "Recipient maps to proxy user %s", username);
+
+	if (strcmp(username, lrcpt->username) != 0) {
 		/* The existing "user" event field is overridden with the new
 		   user name, while old username is available as "orig_user" */
 		event_add_str(rcpt->event, "user", username);
-		event_add_str(rcpt->event, "original_user", orig_username);
+		event_add_str(rcpt->event, "original_user", lrcpt->username);
 
 		if (smtp_address_parse_username(pool_datastack_create(),
 						username, &user, &errstr) < 0) {
 			e_error(rcpt->event, "%s: "
 				"Username `%s' returned by passdb lookup is not a valid SMTP address",
-				orig_username, username);
+				lrcpt->username, username);
 			smtp_server_recipient_reply(
 				rcpt, 550, "5.3.5",
 				"Internal user lookup failure");
-			pool_unref(&auth_pool);
-			return -1;
+			return;
 		}
 		/* Username changed. change the address as well */
 		if (*lrcpt->detail == '\0') {
@@ -985,29 +987,51 @@ int lmtp_proxy_rcpt(struct client *client,
 			username);
 		smtp_server_recipient_reply(rcpt, 554, "5.4.6",
 					    "Proxying loops to itself");
-		pool_unref(&auth_pool);
-		return -1;
+		return;
 	}
 
-	if (lmtp_proxy_rcpt_get_connection(lprcpt, &set, &conn) < 0) {
-		pool_unref(&auth_pool);
-		return -1;
-	}
+	if (lmtp_proxy_rcpt_get_connection(lprcpt, &set, &conn) < 0)
+		return;
 
 	lprcpt->address = smtp_address_clone(rcpt->pool, address);
 
 	smtp_server_recipient_add_hook(
-		rcpt, SMTP_SERVER_RECIPIENT_HOOK_DESTROY,
-		lmtp_proxy_rcpt_destroy, lprcpt);
-	smtp_server_recipient_add_hook(
 		rcpt, SMTP_SERVER_RECIPIENT_HOOK_APPROVED,
 		lmtp_proxy_rcpt_approved, lprcpt);
 
-	pool_unref(&auth_pool);
-
 	smtp_client_connection_connect(conn->lmtp_conn,
 				       lmtp_proxy_rcpt_login_cb, lprcpt);
-	return 1;
+}
+
+int lmtp_proxy_rcpt(struct lmtp_recipient *lrcpt)
+{
+	struct smtp_server_recipient *rcpt = lrcpt->rcpt;
+	struct lmtp_proxy_recipient *lprcpt;
+	struct auth_master_connection *auth_conn;
+	struct auth_user_info info;
+	struct mail_storage_service_input input;
+
+	lprcpt = p_new(rcpt->pool, struct lmtp_proxy_recipient, 1);
+	lprcpt->rcpt = lrcpt;
+
+	lrcpt->type = LMTP_RECIPIENT_TYPE_PROXY;
+	lrcpt->backend_context = lprcpt;
+
+	smtp_server_recipient_add_hook(
+		rcpt, SMTP_SERVER_RECIPIENT_HOOK_DESTROY,
+		lmtp_proxy_rcpt_destroy, lprcpt);
+
+	i_zero(&input);
+	input.service = "lmtp";
+	mail_storage_service_init_settings(storage_service, &input);
+
+	lmtp_proxy_rcpt_init_auth_user_info(lrcpt, &info);
+
+	auth_conn = mail_storage_service_get_auth_conn(storage_service);
+	lprcpt->auth_request = auth_master_pass_lookup_async(
+		auth_conn, lrcpt->username, &info,
+		lmtp_proxy_rcpt_user_lookup_cb, lprcpt);
+	return 0;
 }
 
 /*

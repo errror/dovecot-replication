@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -9,13 +9,6 @@
 #include "message-decoder.h"
 #include "message-part-data.h"
 #include "test-common.h"
-
-void message_header_decode_utf8(const unsigned char *data, size_t size,
-				buffer_t *dest,
-				normalizer_func_t *normalizer ATTR_UNUSED)
-{
-	buffer_append(dest, data, size);
-}
 
 static void test_message_decoder(void)
 {
@@ -78,6 +71,169 @@ static void test_message_decoder(void)
 	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
 	test_assert(output.size == 2);
 	test_assert(memcmp(output.data, "\xC3\xA4", 2) == 0);
+
+	message_decoder_deinit(&ctx);
+
+	test_end();
+}
+
+static void test_message_decoder_partial_illegal_sequence(void)
+{
+	struct message_decoder_context *ctx;
+	struct message_part part;
+	struct message_header_line hdr;
+	struct message_block input, output;
+
+	test_begin("message decoder partial illegal sequence");
+
+	i_zero(&part);
+	i_zero(&input);
+	memset(&output, 0xff, sizeof(output));
+	input.part = &part;
+
+	ctx = message_decoder_init(NULL, 0);
+
+	i_zero(&hdr);
+	hdr.name = "Content-Type";
+	hdr.name_len = strlen(hdr.name);
+	hdr.full_value = (const void *)"text/plain; charset=utf-32be";
+	hdr.full_value_len = strlen((const char *)hdr.full_value);
+	input.hdr = &hdr;
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert(output.size == 0);
+
+	input.hdr = NULL;
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+
+	input.data = (const void *)"M--";
+	input.size = strlen((const char *)input.data);
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert(output.size == 0);
+
+	/* This completes the 32bit character, making it illegal */
+	input.data = (const void *)"X";
+	input.size = 1;
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert_cmp(output.size, ==, UNICODE_REPLACEMENT_CHAR_UTF8_LEN);
+	test_assert(memcmp(output.data, UNICODE_REPLACEMENT_CHAR_UTF8,
+			   output.size) == 0);
+
+	/* Valid character followed by earlier invalid input. */
+	input.data = (const void *)"\000\000\000\x61";
+	input.size = 4;
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert_cmp(output.size, ==, 1);
+	test_assert(memcmp(output.data, "a", output.size) == 0);
+
+	/* Try also the code path where illegal input is followed by a valid
+	   character is followed by */
+	input.data = (const void *)"M--\000\000\000\x62";
+	input.size = 3 + 4;
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert_cmp(output.size, ==, UNICODE_REPLACEMENT_CHAR_UTF8_LEN + 1);
+	test_assert(memcmp(output.data, UNICODE_REPLACEMENT_CHAR_UTF8"b",
+			   output.size) == 0);
+
+	message_decoder_deinit(&ctx);
+
+	test_end();
+}
+
+static void test_message_decoder_partial_illegal_sequence2(void)
+{
+	struct message_decoder_context *ctx;
+	struct message_part part;
+	struct message_header_line hdr;
+	struct message_block input, output;
+
+	test_begin("message decoder partial illegal sequence 2");
+
+	i_zero(&part);
+	i_zero(&input);
+	memset(&output, 0xff, sizeof(output));
+	input.part = &part;
+
+	ctx = message_decoder_init(NULL, 0);
+
+	i_zero(&hdr);
+	hdr.name = "Content-Type";
+	hdr.name_len = strlen(hdr.name);
+	hdr.full_value = (const void *)"text/plain; charset=ISO-2022-JP";
+	hdr.full_value_len = strlen((const char *)hdr.full_value);
+	input.hdr = &hdr;
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert(output.size == 0);
+
+	input.hdr = NULL;
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+
+	/* Incomplete encoding state change */
+	input.data = (const void *)"\x1b$";
+	input.size = strlen((const char *)input.data);
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert(output.size == 0);
+
+	/* State sequence becomes invalid */
+	input.data = (const void *)"\x1b";
+	input.size = strlen((const char *)input.data);
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	/* The initial invalid sequences become passthrough output */
+	test_assert(output.size == 2);
+	test_assert(memcmp(output.data, "\x1b$", 2) == 0);
+
+	/* Finish a valid encoding state change */
+	input.data = (const void *)"$B";
+	input.size = strlen((const char *)input.data);
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert(output.size == 0);
+
+	message_decoder_deinit(&ctx);
+
+	test_end();
+}
+
+static void test_message_decoder_partial_illegal_sequence3(void)
+{
+	struct message_decoder_context *ctx;
+	struct message_part part;
+	struct message_header_line hdr;
+	struct message_block input, output;
+
+	test_begin("message decoder partial illegal sequence 3");
+
+	i_zero(&part);
+	i_zero(&input);
+	memset(&output, 0xff, sizeof(output));
+	input.part = &part;
+
+	ctx = message_decoder_init(NULL, 0);
+
+	i_zero(&hdr);
+	hdr.name = "Content-Type";
+	hdr.name_len = strlen(hdr.name);
+	hdr.full_value = (const void *)"text/plain; charset=ISO-2022-JP";
+	hdr.full_value_len = strlen((const char *)hdr.full_value);
+	input.hdr = &hdr;
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert(output.size == 0);
+
+	input.hdr = NULL;
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+
+	/* Incomplete encoding state change */
+	input.data = (const void *)"\x1b$";
+	input.size = strlen((const char *)input.data);
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	test_assert(output.size == 0);
+
+	/* Continue with an invalid state sequence, but which by itself
+	   becomes a valid state change sequence. */
+	input.data = (const void *)"\x1b$B";
+	input.size = strlen((const char *)input.data);
+	test_assert(message_decoder_decode_next_block(ctx, &input, &output));
+	/* The initial invalid sequences become passthrough output */
+	test_assert(output.size == 2);
+	test_assert(memcmp(output.data, "\x1b$", 2) == 0);
 
 	message_decoder_deinit(&ctx);
 
@@ -260,8 +416,10 @@ static void test_message_decoder_content_transfer_encoding(void)
 	parser = message_parser_init(pool, istream, &parser_set);
 	decoder = message_decoder_init(NULL, 0);
 
+	struct message_part_data_limits limits = MESSAGE_PART_DATA_LIMITS_INIT;
 	while ((ret = message_parser_parse_next_block(parser, &input)) > 0) {
-		message_part_data_parse_from_header(pool, input.part, input.hdr);
+		message_part_data_parse_from_header(pool, input.part, &limits,
+						    input.hdr);
 		if (message_decoder_decode_next_block(decoder, &input, &output) &&
 		    output.hdr == NULL && output.size > 0)
 			str_append_data(str_out, output.data, output.size);
@@ -349,8 +507,10 @@ static void test_message_decoder_invalid_content_transfer_encoding(void)
 	parser = message_parser_init(pool, istream, &parser_set);
 	decoder = message_decoder_init(NULL, 0);
 
+	struct message_part_data_limits limits = MESSAGE_PART_DATA_LIMITS_INIT;
 	while ((ret = message_parser_parse_next_block(parser, &input)) > 0) {
-		message_part_data_parse_from_header(pool, input.part, input.hdr);
+		message_part_data_parse_from_header(pool, input.part, &limits,
+						    input.hdr);
 		if (input.hdr != NULL &&
 		    strcasecmp(input.hdr->name, "content-transfer-encoding") == 0) {
 			enum message_cte cte = message_decoder_parse_cte(input.hdr);
@@ -480,8 +640,63 @@ UNICODE_REPLACEMENT_CHAR_UTF8;
 	parser = message_parser_init(pool, istream, &parser_set);
 	decoder = message_decoder_init(NULL, 0);
 
+	struct message_part_data_limits limits = MESSAGE_PART_DATA_LIMITS_INIT;
 	while ((ret = message_parser_parse_next_block(parser, &input)) > 0) {
-		message_part_data_parse_from_header(pool, input.part, input.hdr);
+		message_part_data_parse_from_header(pool, input.part, &limits,
+						    input.hdr);
+		if (message_decoder_decode_next_block(decoder, &input, &output) &&
+		    output.hdr == NULL && output.size > 0)
+			str_append_data(str_out, output.data, output.size);
+	}
+
+	test_assert(ret == -1);
+	test_assert_strcmp(test_message_output, str_c(str_out));
+	message_decoder_deinit(&decoder);
+	message_parser_deinit(&parser, &parts);
+	test_assert(istream->stream_errno == 0);
+
+	i_stream_unref(&istream);
+	pool_unref(&pool);
+	test_end();
+}
+
+static void test_message_decoder_charset_mime_part_change(void)
+{
+	static const unsigned char test_message_input[] =
+"Content-Type: multipart/mixed; boundary=\"1\"\n"
+"MIME-Version: 1.0\n\n"
+"--1\n"
+"Content-Type: text/plain; charset=utf-8\n\n"
+"\xc3\n"
+"--1\n"
+"Content-Type: text/plain; charset=utf-8\n\n"
+"\xa4\n"
+"--1--\n";
+
+	static const char *test_message_output =
+		UNICODE_REPLACEMENT_CHAR_UTF8;
+
+	test_begin("message decoder charset - mime part change");
+
+	const struct message_parser_settings parser_set = { .flags = 0, };
+	struct message_parser_ctx *parser;
+	struct message_decoder_context *decoder;
+	struct message_part *parts;
+	struct message_block input, output;
+	struct istream *istream;
+	string_t *str_out = t_str_new(20);
+	int ret;
+
+	pool_t pool = pool_alloconly_create("message parser", 10240);
+	istream = test_istream_create_data(test_message_input,
+					   sizeof(test_message_input)-1);
+	parser = message_parser_init(pool, istream, &parser_set);
+	decoder = message_decoder_init(NULL, 0);
+
+	struct message_part_data_limits limits = MESSAGE_PART_DATA_LIMITS_INIT;
+	while ((ret = message_parser_parse_next_block(parser, &input)) > 0) {
+		message_part_data_parse_from_header(pool, input.part, &limits,
+						    input.hdr);
 		if (message_decoder_decode_next_block(decoder, &input, &output) &&
 		    output.hdr == NULL && output.size > 0)
 			str_append_data(str_out, output.data, output.size);
@@ -502,11 +717,15 @@ int main(void)
 {
 	static void (*const test_functions[])(void) = {
 		test_message_decoder,
+		test_message_decoder_partial_illegal_sequence,
+		test_message_decoder_partial_illegal_sequence2,
+		test_message_decoder_partial_illegal_sequence3,
 		test_message_decoder_multipart,
 		test_message_decoder_current_content_type,
 		test_message_decoder_content_transfer_encoding,
 		test_message_decoder_invalid_content_transfer_encoding,
 		test_message_decoder_charset,
+		test_message_decoder_charset_mime_part_change,
 		NULL
 	};
 	return test_run(test_functions);

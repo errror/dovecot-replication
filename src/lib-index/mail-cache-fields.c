@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -422,7 +422,10 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 			return -1;
 		}
 
-		if (types[i] > MAIL_CACHE_FIELD_COUNT) {
+		/* MAIL_CACHE_FIELD_COUNT is a sentinel, not a valid type.
+		   Letting it through would end up in field_has_fixed_size()
+		   reaching i_unreached(). */
+		if (types[i] >= MAIL_CACHE_FIELD_COUNT) {
 			mail_cache_set_corrupted(cache, "field type corrupted");
 			return -1;
 		}

@@ -53,6 +53,7 @@ struct dlua_script {
 	lua_State *L; /* base lua context */
 
 	struct event *event;
+	struct event_passthrough *pending_event_passthrough;
 	const char *filename;
 	struct istream *in;
 	ssize_t last_read;
@@ -94,6 +95,8 @@ struct dlua_script *dlua_script_from_state(lua_State *L);
 /* register 'dovecot' global */
 void dlua_dovecot_register(struct dlua_script *script);
 
+void dlua_event_passthrough_abort(struct dlua_script *script);
+
 /* push 'dovecot' global on top of stack */
 void dlua_get_dovecot(lua_State *L);
 
@@ -116,8 +119,12 @@ struct event *dlua_check_event(lua_State *L, int arg);
 const char *dlua_push_vfstring(lua_State *L, const char *fmt, va_list argp) ATTR_FORMAT(2, 0);
 const char *dlua_push_fstring(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3);
 
+/* push timeval as a microseconds integer to top of the stack */
+void dlua_push_timeval(lua_State *L, const struct timeval *tv);
+
 /* improved luaL_error, can handle full C format support */
-int dluaL_error(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3);
+int dluaL_error(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3)
+	ATTR_NORETURN;
 #define luaL_error(...) dluaL_error(__VA_ARGS__)
 
 /*

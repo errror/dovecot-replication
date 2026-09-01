@@ -1,8 +1,11 @@
+include $(top_srcdir)/Makefile.test.include
+
 doveadm_moduledir = $(moduledir)/doveadm
 
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-dict \
 	-I$(top_srcdir)/src/lib-mail \
@@ -29,7 +32,6 @@ lib01_acl_plugin_la_SOURCES = \
 	acl-backend-vfile-acllist.c \
 	acl-backend-vfile-update.c \
 	acl-cache.c \
-	acl-global-file.c \
 	acl-lookup-dict.c \
 	acl-mailbox.c \
 	acl-mailbox-list.c \
@@ -41,14 +43,14 @@ lib01_acl_plugin_la_SOURCES = \
 
 noinst_HEADERS = \
 	acl-backend-vfile.h \
-	acl-shared-storage.h
+	acl-shared-storage.h \
+	test-acl-common.h
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = \
 	acl-api.h \
 	acl-api-private.h \
 	acl-cache.h \
-	acl-global-file.h \
 	acl-lookup-dict.h \
 	acl-plugin.h \
 	acl-rights.h \
@@ -62,7 +64,10 @@ lib10_doveadm_acl_plugin_la_SOURCES = \
 	doveadm-acl.c
 
 test_programs = \
-	test-acl
+	test-acl \
+	test-acl-cache \
+	test-acl-vfile \
+	test-acl-vfile-update
 
 test_libs = \
 	$(module_LTLIBRARIES) \
@@ -77,9 +82,14 @@ test_acl_SOURCES = test-acl.c
 test_acl_LDADD = $(test_libs)
 test_acl_DEPENDENCIES = $(test_deps)
 
-check-local:
-	for bin in $(test_programs); do \
-	  if ! env $(test_options) $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done
+test_acl_cache_SOURCES = test-acl-cache.c
+test_acl_cache_LDADD = $(test_libs)
+test_acl_cache_DEPENDENCIES = $(test_deps)
 
-noinst_PROGRAMS = $(test_programs)
+test_acl_vfile_SOURCES = test-acl-vfile.c test-acl-common.c
+test_acl_vfile_LDADD = $(test_libs)
+test_acl_vfile_DEPENDENCIES = $(test_deps)
+
+test_acl_vfile_update_SOURCES = test-acl-vfile-update.c test-acl-common.c
+test_acl_vfile_update_LDADD = $(test_libs)
+test_acl_vfile_update_DEPENDENCIES = $(test_deps)

@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "settings-parser.h"
@@ -46,10 +46,7 @@ const struct setting_keyvalue imap_service_settings_defaults[] = {
 	{ "unix_listener/imap-master/path", "imap-master" },
 	{ "unix_listener/imap-master/type", "master" },
 	{ "unix_listener/imap-master/mode", "0600" },
-#ifdef DOVECOT_PRO_EDITION
-	/* Potentially not safe in some setups, so keep it Pro-only */
 	{ "unix_listener/imap-master/user", "$SET:default_internal_user" },
-#endif
 
 	{ "unix_listener/login\\simap/path", "login/imap" },
 	{ "unix_listener/login\\simap/type", "login" },
@@ -59,7 +56,9 @@ const struct setting_keyvalue imap_service_settings_defaults[] = {
 	{ "unix_listener/srv.imap\\s%{pid}/type", "admin" },
 	{ "unix_listener/srv.imap\\s%{pid}/mode", "0600" },
 
-	{ "service_extra_groups", "$SET:default_internal_group" },
+	/* This needs to be here explicitly until the backwards compatibility
+	   is removed from settings-history-core.txt */
+	{ "service_extra_groups", "" },
 
 	{ NULL, NULL }
 };
@@ -71,7 +70,7 @@ const struct setting_keyvalue imap_service_settings_defaults[] = {
 static const struct setting_define imap_setting_defines[] = {
 	DEF(BOOL, verbose_proctitle),
 	DEF(BOOL, mailbox_list_index),
-	DEF(STR, rawlog_dir),
+	DEF(PATH_DIR, rawlog_dir),
 
 	DEF(SIZE_HIDDEN, imap_max_line_length),
 	DEF(TIME_HIDDEN, imap_idle_notify_interval),
@@ -117,7 +116,7 @@ static const struct imap_settings imap_default_settings = {
 	.imap_fetch_failure = "disconnect-immediately:disconnect-after:no-after",
 	.imap_metadata = FALSE,
 	.imap_literal_minus = FALSE,
-	.imap_compress_on_proxy = FALSE,
+	.imap_compress_on_proxy = TRUE,
 	.mail_utf8_extensions = FALSE,
 	.imap4rev2_enable = FALSE,
 #ifdef DOVECOT_PRO_EDITION
@@ -173,7 +172,6 @@ static const struct setting_keyvalue imap_default_settings_keyvalue[] = {
 	{ "service/imap/imap_capability/INPROGRESS", "yes" },
 	{ "service/imap/imap_capability/NOTIFY", "yes" },
 	{ "service/imap/imap_capability/METADATA", "yes" },
-	{ "service/imap/imap_capability/SPECIAL-USE", "yes" },
 	{ "service/imap/imap_capability/LITERAL+", "yes" },
 	{ "service/imap/imap_capability/LITERAL-", "yes" },
 	{ "service/imap/imap_capability/UTF8=ACCEPT", "yes" },
@@ -254,6 +252,11 @@ imap_settings_verify(void *_set, pool_t pool ATTR_UNUSED, const char **error_r)
 		return FALSE;
 	}
 #endif
+
+	if (set->imap4rev2_enable && !set->mail_utf8_extensions) {
+		*error_r = "imap4rev2_enable=yes requires mail_utf8_extensions=yes";
+		return FALSE;
+	}
 
 	if (imap_settings_parse_workarounds(set, error_r) < 0)
 		return FALSE;

@@ -8,10 +8,15 @@
 #  define ON_VALGRIND FALSE
 #endif
 
+extern struct event *test_event;
+
 struct istream *test_istream_create(const char *data);
 struct istream *test_istream_create_data(const void *data, size_t size);
 void test_istream_set_size(struct istream *input, uoff_t size);
 void test_istream_set_allow_eof(struct istream *input, bool allow);
+/* Make the istream call i_stream_set_input_pending() for itself on every
+   read(), like e.g. an SSL istream with buffered input does. */
+void test_istream_set_input_pending(struct istream *input, bool set);
 void test_istream_set_max_buffer_size(struct istream *input, size_t size);
 
 struct ostream *test_ostream_create(buffer_t *output);
@@ -40,7 +45,14 @@ void test_begin(const char *name);
 		test_assert_strcmp_idx(s1, s2, LLONG_MIN); \
 	} STMT_END
 
-/* Same as test_assert_strcmp expect that it takes an additional i as input.
+/* Additional parameters are m1 (source) and m2 (destination) memory and len
+ * in memcmp().
+ */
+#define test_assert_memcmp(m1, len1, m2, len2) STMT_START { \
+		test_assert_memcmp_idx(m1, len1, m2, len2, LLONG_MIN); \
+	} STMT_END
+
+/* Same as test_assert_strcmp except that it takes an additional i as input.
  * When i is greater than or equals 0 it is used to identify the barrage of
  * tests failed like in test_assert_idx.
 */
@@ -52,15 +64,32 @@ void test_begin(const char *name);
 						      __FILE__, __LINE__, _temp_s1, _temp_s2, i); \
 	} STMT_END
 
+/* Same as test_assert_memcmp except that it takes an additional i as input.
+ * When i is greater than or equals 0 it is used to identify the barrage of
+ * tests failed like in test_assert_idx.
+*/
+#define test_assert_memcmp_idx(_m1, _len1, _m2, _len2, i) STMT_START { \
+		const void *_temp_m1 = (_m1); \
+		const void *_temp_m2 = (_m2); \
+		const size_t _temp_len1 = (_len1); \
+		const size_t _temp_len2 = (_len2); \
+		const size_t _temp_len = I_MIN(_temp_len1, _temp_len2); \
+		if (_temp_len1 != _temp_len2) \
+			test_assert_failed_ucmp_intmax_idx(#_len1 " == " #_len2, __FILE__, __LINE__, _temp_len1, _temp_len2, "=", i); \
+		if ((memcmp(_temp_m1, _temp_m2, _temp_len) != 0)) \
+			test_assert_failed_memcmp_idx("memcmp(" #_m1 ","  #_m2 ","  #_len2 ")", \
+						      __FILE__, __LINE__, _temp_m1, _temp_m2, _temp_len, i); \
+	} STMT_END
+
 #define test_assert_cmp_bool(_bool_value1, _op, _value2) \
-	test_assert_cmp((unsigned int) _bool_value1, _op, (unsigned int _bool_value2))
+	test_assert_cmp((unsigned int)(_bool_value1), _op, (unsigned int)(_value2))
 
 #define test_assert_cmp(_value1, _op, _value2) \
 	test_assert_cmp_idx(_value1, _op, _value2, LLONG_MIN)
 #define test_assert_cmp_idx(_value1, _op, _value2, _idx) STMT_START { \
 		intmax_t _temp_value1 = (_value1); \
 		intmax_t _temp_value2 = (_value2); \
-		if (!(_value1 _op _value2)) \
+		if (!(_temp_value1 _op _temp_value2)) \
 			test_assert_failed_cmp_intmax_idx( \
 				#_value1 " " #_op " " #_value2, \
 				__FILE__, __LINE__, _temp_value1, _temp_value2, \
@@ -72,7 +101,7 @@ void test_begin(const char *name);
 #define test_assert_ucmp_idx(_value1, _op, _value2, _idx) STMT_START { \
 		uintmax_t _temp_value1 = (_value1); \
 		uintmax_t _temp_value2 = (_value2); \
-		if (!(_value1 _op _value2)) \
+		if (!(_temp_value1 _op _temp_value2)) \
 			test_assert_failed_ucmp_intmax_idx( \
 				#_value1 " " #_op " " #_value2, \
 				__FILE__, __LINE__, _temp_value1, _temp_value2, \
@@ -90,7 +119,10 @@ void test_assert_failed(const char *code, const char *file, unsigned int line)
 void test_assert_failed_idx(const char *code, const char *file, unsigned int line, long long i)
 	ATTR_STATIC_CHECKER_NORETURN;
 void test_assert_failed_strcmp_idx(const char *code, const char *file, unsigned int line,
-				   const char * src, const char * dst, long long i)
+				   const char *src, const char *dst, long long i)
+	ATTR_STATIC_CHECKER_NORETURN;
+void test_assert_failed_memcmp_idx(const char *code, const char *file, unsigned int line,
+				   const void *src, const void *dst, size_t len, long long i)
 	ATTR_STATIC_CHECKER_NORETURN;
 void test_assert_failed_cmp_intmax_idx(const char *code, const char *file,
 				       unsigned int line,
@@ -122,6 +154,10 @@ void test_out_reason(const char *name, bool success, const char *reason)
 void test_out_quiet(const char *name, bool success);
 void test_out_reason_quiet(const char *name, bool success, const char *reason)
 	ATTR_NULL(3);
+
+void test_init(void);
+void test_init_no_event(void);
+void test_forked_deinit(void);
 
 int test_run(void (*const test_functions[])(void)) ATTR_WARN_UNUSED_RESULT;
 struct named_test {
@@ -180,5 +216,9 @@ void test_exit(int status) ATTR_NORETURN;
 /* Create a temporary file, unlink it immediately and return the fd. The
    function handles failures by calling i_fatal(). */
 int test_create_temp_fd(void);
+
+/* Set a cleanup callback that is executed even when the test program crashes or
+   exit()s unexpectedly. Note that this may be run in signal context. */
+void test_set_cleanup_callback(void (*callback)(void));
 
 #endif

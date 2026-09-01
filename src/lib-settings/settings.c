@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -832,6 +832,40 @@ settings_var_expand(struct settings_apply_ctx *ctx, unsigned int key_idx,
 		orig_value = file.path;
 	}
 
+	enum setting_type set_type = ctx->info->defines[key_idx].type;
+	if (set_type == SET_PATH_FILE || set_type == SET_PATH_DIR) {
+		/* Note: for these types *value points to the raw value both
+		   with and without a config-exported template. */
+		const char *path = *value;
+		size_t path_len = strlen(path);
+		bool path_changed = FALSE;
+
+		if (set_type == SET_PATH_DIR &&
+		    path_len > 0 && path[path_len-1] == '/') {
+			/* drop trailing '/' */
+			path = t_strndup(path, path_len - 1);
+			path_changed = TRUE;
+		}
+		if (str_begins_with(path, "~/") || strcmp(path, "~") == 0) {
+			/* Convert the ~/ prefix to the %{home} variable and
+			   let it be expanded like the other %variables. */
+			path = t_strconcat("%{home}", path + 1, NULL);
+			path_changed = TRUE;
+		}
+		if (path_changed) {
+			/* This replaces any config-exported var_expand
+			   template, since the template was compiled from the
+			   original value. */
+			orig_value = path;
+			if (!want_expand && strchr(path, '%') == NULL) {
+				/* no %variables - only the path changed */
+				*value = p_strdup(&ctx->mpool->pool, path);
+				return 1;
+			}
+			want_expand = TRUE;
+		}
+	}
+
 	/* Ensure we don't potentially have %{ values that we missed,
 	   and since this will be quite often called, just check for
 	   % and run it through var-expand.
@@ -874,7 +908,7 @@ settings_var_expand(struct settings_apply_ctx *ctx, unsigned int key_idx,
 		file.path = str_c(ctx->str);
 		if (settings_parse_read_file(file.path, file.path,
 					     &ctx->mpool->pool, NULL,
-					     value, error_r) < 0)
+					     "", value, error_r) < 0)
 			return -1;
 	} else {
 		*value = p_strdup(&ctx->mpool->pool, str_c(ctx->str));
@@ -960,7 +994,7 @@ settings_mmap_apply_defaults(struct settings_apply_ctx *ctx,
 
 		void *set = PTR_OFFSET(ctx->info->defaults,
 				       ctx->info->defines[key_idx].offset);
-		if (ctx->info->defines[key_idx].type != SET_STR)
+		if (!setting_type_is_str_vars(ctx->info->defines[key_idx].type))
 			continue; /* not needed for now */
 		const char *key = ctx->info->defines[key_idx].key;
 		const char *const *valuep = set;
@@ -1051,6 +1085,18 @@ settings_mmap_apply_blob(struct settings_apply_ctx *ctx,
 		    ctx->info->defines[key_idx].type == SET_BOOLLIST) {
 			list_key = (const char *)mmap->mmap_base + offset;
 			offset += strlen(list_key)+1;
+			/* Keys from the config are trusted, so expand their
+			   %variables the same way the values are expanded. This
+			   is done before the has_key() check so deduplication
+			   operates on the final key. */
+			const char *error;
+			if (settings_var_expand(ctx, key_idx, &list_key,
+						&error) < 0) {
+				*error_r = t_strdup_printf(
+					"Failed to expand %s list key variables: %s",
+					ctx->info->defines[key_idx].key, error);
+				return -1;
+			}
 			set_apply = set_apply &&
 				!settings_parse_list_has_key(ctx->parser,
 					key_idx, settings_section_unescape(list_key));
@@ -1673,8 +1719,14 @@ settings_var_expand_init(struct settings_apply_ctx *ctx)
 	ctx->var_params.tables_arr = array_front(&init_ctx.tables);
 	ctx->var_params.providers_arr = array_front(&init_ctx.providers);
 	ctx->var_params.contexts = array_front(&init_ctx.contexts);
-	ctx->var_params.escape_func = init_ctx.escape_func;
-	ctx->var_params.escape_context = init_ctx.escape_context;
+	if (ctx->escape_func != NULL) {
+		/* settings_get_params()'s escape_func overrides all others */
+		ctx->var_params.escape_func = ctx->escape_func;
+		ctx->var_params.escape_context = ctx->escape_context;
+	} else {
+		ctx->var_params.escape_func = init_ctx.escape_func;
+		ctx->var_params.escape_context = init_ctx.escape_context;
+	}
 	ctx->var_params.event = ctx->event;
 }
 
@@ -1744,7 +1796,7 @@ settings_mmap_lookup_key(struct settings_mmap *mmap, const char *key,
 		return settings_mmap_registered_lookup_key(key, type_r);
 
 	/* Look it up from hash table */
-	uint32_t key_hash = (mmap->all_keys_hash_key_prefix ^ str_hash(key)) %
+	uint32_t key_hash = (mmap->all_keys_hash_key_prefix ^ str_stable_hash(key)) %
 		mmap->all_keys_hash_count;
 	uint32_t rel_offset = mmap->all_keys_hash[key_hash];
 	if (rel_offset == 0)
@@ -1862,7 +1914,7 @@ settings_override_set_blocks(struct settings_mmap *mmap,
 		return -1;
 	}
 
-	const char **block_names = p_new(mmap->pool, const char *, count + 1);
+	const char **block_names = p_new(set->pool, const char *, count + 1);
 	for (i = 0; i < count; i++) {
 		memcpy(&block_idx, blocks, sizeof(block_idx));
 		blocks = CONST_PTR_OFFSET(blocks, sizeof(block_idx));
@@ -2075,7 +2127,7 @@ settings_override_get_value(struct settings_apply_ctx *ctx,
 		key = t_strconcat(ctx->info->defines[key_idx].key, list, NULL);
 
 	if (!set->append ||
-	    ctx->info->defines[key_idx].type != SET_STR) {
+	    !setting_type_is_str_vars(ctx->info->defines[key_idx].type)) {
 		if (set->append && ctx->info->defines[key_idx].type != SET_FILTER_ARRAY)
 			*_key = t_strconcat(key, SETTINGS_APPEND_KEY_SUFFIX, NULL);
 		else
@@ -2169,7 +2221,7 @@ settings_instance_override_add_default(struct settings_apply_ctx *ctx,
 		pool_ref(set->pool);
 		if (event_filter_parse_case_sensitive(filter_string,
 						      set->filter, &error) < 0) {
-			i_panic("BUG: Failed to create event filter filter for %s: %s (%s)",
+			i_panic("BUG: Failed to create event filter for %s: %s (%s)",
 				set->orig_key, error, filter_string);
 		}
 		if (array_set->filter != EVENT_FILTER_MATCH_ALWAYS) {
@@ -2386,6 +2438,25 @@ settings_instance_override(struct settings_apply_ctx *ctx,
 			const char *suffix;
 			if (!str_begins(key, ctx->info->defines[key_idx].key, &suffix))
 				i_unreached();
+			if (suffix[0] == '/' &&
+			    set->type == SETTINGS_OVERRIDE_TYPE_DEFAULT) {
+				/* Expand %variables in the key, but only for
+				   default overrides - the same way the value is
+				   expanded below. -o and userdb overrides keep
+				   their keys (and values) literal. Done before
+				   has_key() so dedup uses the final key. */
+				const char *exp_key = suffix + 1, *error;
+				if (settings_var_expand(ctx, key_idx, &exp_key,
+							&error) < 0) {
+					*error_r = t_strdup_printf(
+						"Failed to expand default setting %s key variables: %s",
+						key, error);
+					return -1;
+				}
+				key = t_strconcat(ctx->info->defines[key_idx].key,
+						  "/", exp_key, NULL);
+				suffix = key + strlen(ctx->info->defines[key_idx].key);
+			}
 			if (suffix[0] != '/') {
 				/* replace full boollist setting
 				   (invalid for strlist) */
@@ -2439,6 +2510,38 @@ settings_instance_override(struct settings_apply_ctx *ctx,
 				/* value was already strdup()ed */
 				value_needs_dup = FALSE;
 			}
+		} else if ((ctx->info->defines[key_idx].type == SET_PATH_FILE ||
+			    ctx->info->defines[key_idx].type == SET_PATH_DIR) &&
+			   (ctx->flags & SETTINGS_GET_FLAG_NO_EXPAND) == 0) {
+			size_t value_len = strlen(value);
+			if (ctx->info->defines[key_idx].type == SET_PATH_DIR &&
+			    value_len > 0 && value[value_len-1] == '/') {
+				/* drop trailing '/' */
+				value = t_strndup(value, value_len - 1);
+				value_needs_dup = TRUE;
+			}
+			if (str_begins_with(value, "~/") ||
+			    strcmp(value, "~") == 0) {
+				/* Expand only the ~/ prefix to the %{home}
+				   variable's value. Unlike default settings,
+				   the rest of the override value is kept
+				   literal without %variable expansion. */
+				const char *error;
+				string_t *home = t_str_new(64);
+				if (var_expand(home, "%{home}", &ctx->var_params,
+					       &error) < 0) {
+					if ((ctx->flags & SETTINGS_GET_FLAG_FAKE_EXPAND) == 0) {
+						*error_r = t_strdup_printf(
+							"Failed to expand %s=%s home directory: %s",
+							key, value, error);
+						return -1;
+					}
+				} else {
+					str_append(home, value + 1);
+					value = str_c(home);
+					value_needs_dup = TRUE;
+				}
+			}
 		}
 		if (ctx->info->defines[key_idx].type == SET_FILTER_ARRAY &&
 		    set->type <= SETTINGS_OVERRIDE_TYPE_CLI_PARAM &&
@@ -2465,9 +2568,22 @@ settings_instance_override(struct settings_apply_ctx *ctx,
 			else if (ctx->instance->pool != NULL)
 				pool_add_external_ref(&ctx->mpool->pool, ctx->instance->pool);
 		}
+		/* An empty built-in default for a setting that can't be empty
+		   (e.g. a number or time) means "no default": leave the value
+		   to be inherited from a less specific filter instead of
+		   failing. This lets a named filter keep a default-settings
+		   entry - so settings-history can override the value for old
+		   config versions - without forcing that value for current
+		   versions. The config process handles this equivalently in
+		   config_apply_exact_line(). */
+		bool empty_default =
+			set->type == SETTINGS_OVERRIDE_TYPE_DEFAULT &&
+			value[0] == '\0';
 		if (ctx->info->setting_apply != NULL &&
 		    !ctx->info->setting_apply(ctx->event, ctx->set_struct, key,
 					      &value, apply_flags, error_r)) {
+			if (empty_default)
+				continue;
 			*error_r = t_strdup_printf(
 				"Failed to override configuration from %s: "
 				"Invalid %s=%s: %s",
@@ -2477,6 +2593,8 @@ settings_instance_override(struct settings_apply_ctx *ctx,
 		}
 		if (settings_parse_keyidx_value_nodup(ctx->parser, key_idx, key,
 						      value) < 0) {
+			if (empty_default)
+				continue;
 			*error_r = t_strdup_printf(
 				"Failed to override configuration from %s: "
 				"Invalid %s=%s: %s",
@@ -2804,6 +2922,8 @@ settings_sort_filter_array(struct event *event, const char *field_name,
 		break;
 	case SET_STR:
 	case SET_STR_NOVARS:
+	case SET_PATH_FILE:
+	case SET_PATH_DIR:
 		item_type = _ITEM_TYPE_STR;
 		break;
 	case SET_ALIAS:

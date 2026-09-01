@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /*
 The imap-urlauth service provides URLAUTH access between different accounts. If
@@ -237,7 +237,12 @@ int main(int argc, char *argv[])
 		return FATAL_DEFAULT;
 	master_service_init_log(master_service);
 
-	if (master_service_settings_read_simple(master_service, &error) < 0)
+	struct master_service_settings_input set_input = {
+		.preserve_user = TRUE,
+	};
+	struct master_service_settings_output set_output;
+	if (master_service_settings_read(master_service, &set_input,
+					 &set_output, &error) < 0)
 		i_fatal("%s", error);
 
 	imap_urlauth_settings = 

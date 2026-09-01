@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "ioloop.h"
@@ -12,6 +12,7 @@
 #include "istream-concat.h"
 #include "ostream.h"
 #include "ostream-multiplex.h"
+#include "ostream-zlib.h"
 #include "time-util.h"
 #include "settings.h"
 #include "master-service.h"
@@ -193,6 +194,12 @@ struct client *client_create(int fd_in, int fd_out,
 		imap_write_capability(client->capability_string,
 				      &modified_set->imap_capability);
 		settings_free(modified_set);
+		uoff_t max_size = mail_user_get_mail_max_size(client->user);
+		/* For safety reasons, we prohibit 0 */
+		if (max_size > 0 && max_size < UOFF_T_MAX) {
+			str_printfa(client->capability_string, " APPENDLIMIT=%"PRIuUOFF_T,
+				    max_size);
+		}
 	}
 
 	struct master_service_anvil_session anvil_session;
@@ -215,7 +222,8 @@ void client_create_finish_io(struct client *client)
 	if (client->set->rawlog_dir[0] != '\0') {
 		client->pre_rawlog_input = client->input;
 		client->pre_rawlog_output = client->output;
-		(void)iostream_rawlog_create(client->set->rawlog_dir,
+		(void)iostream_rawlog_create(client->event, "rawlog_dir",
+					     client->set->rawlog_dir,
 					     &client->input, &client->output);
 		if (client->input != client->pre_rawlog_input) {
 			/* rawlog enabled */
@@ -357,13 +365,12 @@ void client_destroy(struct client *client, const char *reason)
 static void
 client_command_stats_append(string_t *str,
 			    const struct client_command_stats *stats,
+			    uint64_t ioloop_wait_usecs,
 			    const char *wait_condition,
 			    size_t buffered_size)
 {
-	uint64_t ioloop_wait_usecs;
 	unsigned int msecs_in_ioloop;
 
-	ioloop_wait_usecs = io_loop_get_wait_usecs(current_ioloop);
 	msecs_in_ioloop = (ioloop_wait_usecs -
 		stats->start_ioloop_wait_usecs + 999) / 1000;
 	str_printfa(str, "running for %d.%03d + waiting ",
@@ -401,16 +408,19 @@ static const char *client_get_last_command_status(struct client *client)
 	const struct client_command_stats *stats = &client->last_cmd_stats;
 
 	string_t *str = t_str_new(128);
-	long long last_run_msecs = timeval_diff_msecs(&ioloop_timeval,
-						      &stats->last_run_timeval);
+	long long idle_msecs = timeval_diff_msecs(&ioloop_timeval,
+						  &stats->finish_timeval);
+	long long duration_msecs = timeval_diff_msecs(&stats->finish_timeval,
+						      &stats->start_time);
 	str_printfa(str, " (%s finished %lld.%03lld secs ago",
-		    client->last_cmd_name, last_run_msecs/1000,
-		    last_run_msecs%1000);
+		    client->last_cmd_name, idle_msecs/1000, idle_msecs%1000);
 
-	if (timeval_diff_msecs(&stats->last_run_timeval, &stats->start_time) >=
+	if (duration_msecs >=
 	    IMAP_CLIENT_DISCONNECT_LOG_STATS_CMD_MIN_RUNNING_MSECS) {
 		str_append(str, " - ");
-		client_command_stats_append(str, stats, "", 0);
+		client_command_stats_append(str, stats,
+					    stats->finish_ioloop_wait_usecs,
+					    "", 0);
 	}
 	str_append_c(str, ')');
 	return str_c(str);
@@ -461,7 +471,8 @@ static const char *client_get_commands_status(struct client *client)
 	all_stats.start_ioloop_wait_usecs =
 		last_cmd->stats.start_ioloop_wait_usecs;
 	str_append_c(str, ' ');
-	client_command_stats_append(str, &all_stats, cond_str,
+	client_command_stats_append(str, &all_stats,
+		io_loop_get_wait_usecs(current_ioloop), cond_str,
 		o_stream_get_buffer_used_size(client->output));
 	str_printfa(str, ", state=%s)",
 		    client_command_state_names[last_cmd->state]);
@@ -541,10 +552,19 @@ static void client_default_destroy(struct client *client, const char *reason)
 
 	   Don't autoexpunge if the client is hibernated - it shouldn't be any
 	   different from the non-hibernating IDLE case. For frequent
-	   hibernations it could also be doing unnecessarily much work. */
+	   hibernations it could also be doing unnecessarily much work.
+
+	   Don't perform autoexpunging if whole Dovecot is shutting down. This
+	   could lead to a load spike and unnecessarily slowing down the
+	   shutdown process. Also don't do this when processes are being
+	   killed, for similar reasoning. */
 	imap_refresh_proctitle();
 	if (!client->hibernated) {
-		client->logout_stats.autoexpunged_count = mail_user_autoexpunge(client->user);
+		if (!master_service_is_killed(master_service) &&
+		    !master_service_is_master_stopped(master_service)) {
+			client->logout_stats.autoexpunged_count =
+				mail_user_autoexpunge(client->user);
+		}
 		client_log_disconnect(client, reason);
 	}
 	mail_user_deinit(&client->user);
@@ -681,6 +701,45 @@ void client_send_tagline(struct client_command_context *cmd, const char *data)
 	cmd->client->v.send_tagline(cmd, data);
 }
 
+void client_create_side_channel_output(struct client *client)
+{
+	i_assert(client->multiplex_output != NULL);
+	i_assert(client->side_channel_output == NULL);
+	client->side_channel_output =
+		o_stream_multiplex_add_channel(client->multiplex_output, 1);
+	o_stream_set_no_error_handling(client->side_channel_output, TRUE);
+}
+
+static bool
+client_tagline_has_resp_code(const char *data)
+{
+	const char *space = strchr(data, ' ');
+	return space != NULL && space[1] == '[';
+}
+
+static const char *
+client_tagline_insert_throttled(const char *data)
+{
+	const char *space = strchr(data, ' ');
+	if (space == NULL)
+		return t_strconcat(data, " ["IMAP_RESP_CODE_THROTTLED"]", NULL);
+	return t_strdup_printf("%.*s ["IMAP_RESP_CODE_THROTTLED"]%s",
+			       (int)(space - data), data, space);
+}
+
+static intmax_t
+client_tagline_throttled_msecs(struct client_command_context *cmd)
+{
+	if (cmd->global_event == NULL)
+		return 0;
+	const struct event_field *f = event_find_field_nonrecursive(
+		cmd->global_event, IMAP_EVENT_FIELD_THROTTLED_ANY);
+	if (f == NULL || f->value_type != EVENT_FIELD_VALUE_TYPE_INTMAX ||
+	    f->value.intmax <= 0)
+		return 0;
+	return f->value.intmax;
+}
+
 static void
 client_default_send_tagline(struct client_command_context *cmd, const char *data)
 {
@@ -692,20 +751,47 @@ client_default_send_tagline(struct client_command_context *cmd, const char *data
 
 	i_assert(!cmd->tagline_sent);
 	cmd->tagline_sent = TRUE;
-	cmd->tagline_reply = p_strdup(cmd->pool, data);
 
 	if (tag == NULL || *tag == '\0')
 		tag = "*";
 
 	T_BEGIN {
+		intmax_t throttled_msecs =
+			client_tagline_throttled_msecs(cmd);
+		if (throttled_msecs > 0 &&
+		    !client_tagline_has_resp_code(data))
+			data = client_tagline_insert_throttled(data);
+		cmd->tagline_reply = p_strdup(cmd->pool, data);
+
 		string_t *str = t_str_new(256);
 		str_printfa(str, "%s %s", tag, data);
+		if (throttled_msecs > 0) {
+			str_printfa(str, " (throttled %jd.%03jd secs)",
+				    throttled_msecs / 1000,
+				    throttled_msecs % 1000);
+		}
 		client_cmd_append_timing_stats(cmd, str);
 		str_append(str, "\r\n");
 		o_stream_nsend(client->output, str_data(str), str_len(str));
 	} T_END;
 
 	client->last_output = ioloop_time;
+
+	/* Reset the DEFLATE compression dictionary after every tagged reply so
+	   that cross-command compression correlation attacks (CRIME-style) are
+	   not possible.  For proxy-mode compression the reset is forwarded to
+	   the imap-login process via the side channel; for direct compression
+	   it is applied to the local ostream immediately. */
+	if (client->compress_handler != NULL) {
+		if (client->multiplex_output != NULL &&
+		    client->set->imap_compress_on_proxy) {
+			i_assert(client->side_channel_output != NULL);
+			o_stream_nsend_str(client->side_channel_output,
+					   "dict_reset\n");
+		} else {
+			o_stream_deflate_reset_dict(client->output);
+		}
+	}
 }
 
 static int
@@ -948,6 +1034,7 @@ struct client_command_context *client_command_alloc(struct client *client)
 	cmd->stats.last_run_timeval = ioloop_timeval;
 	cmd->stats.start_ioloop_wait_usecs =
 		io_loop_get_wait_usecs(current_ioloop);
+	cmd->utf8 = client_has_enabled(client, imap_feature_utf8accept);
 	p_array_init(&cmd->module_contexts, cmd->pool, 5);
 
 	DLLIST_PREPEND(&client->command_queue, cmd);
@@ -978,7 +1065,8 @@ client_command_new(struct client *client)
 	} else {
 		cmd->parser =
 			imap_parser_create(client->input, client->output,
-					   client->set->imap_max_line_length);
+					   client->set->imap_max_line_length,
+					   NULL);
 		if (client->set->imap_literal_minus)
 			imap_parser_enable_literal_minus(cmd->parser);
 	}
@@ -1013,6 +1101,15 @@ void client_command_free(struct client_command_context **_cmd)
 	}
 
 	if (cmd->name != NULL) {
+		if (cmd->stats.finish_timeval.tv_sec == 0) {
+			/* cmd_sync() wasn't called, so the command's handling
+			   finished only now */
+			io_loop_time_refresh();
+			cmd->stats.finish_timeval = ioloop_timeval;
+			cmd->stats.finish_ioloop_wait_usecs =
+				io_loop_get_wait_usecs(current_ioloop);
+		}
+
 		i_free(client->last_cmd_name);
 		client->last_cmd_name = i_strdup(cmd->name);
 		client->last_cmd_stats = cmd->stats;
@@ -1216,7 +1313,7 @@ static bool client_skip_line(struct client *client)
 static void client_idle_output_timeout(struct client *client)
 {
 	client_destroy(client, t_strdup_printf(
-		"Client has not read server output for for %"PRIdTIME_T" secs",
+		"Client has not read server output for %"PRIdTIME_T" secs",
 		ioloop_time - client->last_output));
 }
 
@@ -1649,11 +1746,14 @@ static bool imap_client_enable_imap4rev2(struct client *client)
 		return FALSE;
 	}
 
-	if (client->mailbox != NULL)
+	if (client->mailbox != NULL) {
 		mailbox_enable(client->mailbox, MAILBOX_FEATURE_IMAP4REV2);
+		mailbox_enable(client->mailbox, MAILBOX_FEATURE_UTF8ACCEPT);
+	}
 
-	/* If IMAP4rev2 is enabled always enable QRESYNC */
+	/* If IMAP4rev2 is enabled also enable QRESYNC and UTF8=ACCEPT */
 	client_enable(client, imap_feature_qresync);
+	client_enable(client, imap_feature_utf8accept);
 	return TRUE;
 }
 #endif

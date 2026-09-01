@@ -1,4 +1,4 @@
-/* Copyright (c) 2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -43,10 +43,12 @@ i_stream_decompress_close(struct iostream_private *_stream, bool close_parent)
 	struct decompress_istream *zstream =
 		container_of(stream, struct decompress_istream, istream);
 
-	if (zstream->decompressed_input != NULL)
-		i_stream_close(zstream->decompressed_input);
-	if (close_parent)
-		i_stream_close(zstream->compressed_input);
+	if (close_parent) {
+		if (zstream->decompressed_input == NULL)
+			i_stream_close(zstream->compressed_input);
+		else
+			i_stream_close(zstream->decompressed_input);
+	}
 }
 
 static void
@@ -76,13 +78,14 @@ i_stream_decompress_not_compressed(struct decompress_istream *zstream)
 	}
 }
 
-static int i_stream_decompress_detect(struct decompress_istream *zstream)
+static int i_stream_decompress_detect_more(struct decompress_istream *zstream)
 {
 	const struct compression_handler *handler;
 	ssize_t ret;
 
-	ret = i_stream_read(zstream->compressed_input);
-	handler = compression_detect_handler(zstream->compressed_input);
+	i_assert(zstream->compressed_input != NULL);
+
+	ret = compression_detect_handler(zstream->compressed_input, &handler);
 	if (handler == NULL) {
 		switch (ret) {
 		case -1:
@@ -98,10 +101,9 @@ static int i_stream_decompress_detect(struct decompress_istream *zstream)
 		case 0:
 			return 0;
 		default:
-			if (!zstream->istream.istream.blocking)
-				return 0;
-			return i_stream_decompress_detect(zstream);
+			break;
 		}
+		return 1;
 	}
 	if (handler->create_istream == NULL) {
 		zstream->istream.istream.stream_errno = EINVAL;
@@ -112,6 +114,19 @@ static int i_stream_decompress_detect(struct decompress_istream *zstream)
 
 	zstream->decompressed_input =
 		handler->create_istream(zstream->compressed_input);
+	return 1;
+}
+
+static int i_stream_decompress_detect(struct decompress_istream *zstream)
+{
+	int ret;
+
+	do {
+		ret = i_stream_decompress_detect_more(zstream);
+		if (ret <= 0)
+			return ret;
+	} while (zstream->decompressed_input == NULL);
+
 	return 1;
 }
 
@@ -249,8 +264,14 @@ i_stream_create_decompress(struct istream *input,
 	zstream->istream.istream.blocking = input->blocking;
 	zstream->istream.istream.seekable = input->seekable;
 
+	/* We read the input without it being our istream-parent. It owns the
+	   ioloop IO, and so does the decompressing istream created on top of
+	   it later on. */
+	zstream->istream.io_parent = input;
+
 	struct istream *ret = i_stream_create(&zstream->istream, NULL,
-					      i_stream_get_fd(input), 0);
+					      i_stream_get_fd(input),
+					      ISTREAM_HIDDEN_INPUTS_DECLARED, 0);
 	/* input isn't used as our parent istream, so need to copy the stream
 	   name to preserve it. */
 	i_stream_set_name(ret, i_stream_get_name(input));

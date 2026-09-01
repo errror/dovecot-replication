@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "pop3-common.h"
 #include "array.h"
@@ -78,7 +78,7 @@ static void client_idle_timeout(struct client *client)
 {
 	if (client->cmd != NULL) {
 		client_destroy(client, t_strdup_printf(
-			"Client has not read server output for for %"PRIdTIME_T" secs",
+			"Client has not read server output for %"PRIdTIME_T" secs",
 			ioloop_time - client->last_output));
 	} else {
 		client_send_line(client, "-ERR Disconnected for inactivity.");
@@ -441,7 +441,8 @@ struct client *client_create(int fd_in, int fd_out,
 void client_create_finish(struct client *client)
 {
 	if (client->set->rawlog_dir[0] != '\0') {
-		(void)iostream_rawlog_create(client->set->rawlog_dir,
+		(void)iostream_rawlog_create(client->event, "rawlog_dir",
+					     client->set->rawlog_dir,
 					     &client->input, &client->output);
 	}
 	client->io = io_add_istream(client->input, client_input, client);
@@ -506,7 +507,7 @@ static const char *client_build_uidl_change_string(struct client *client)
 		old_hash ^= crc32_str(client->message_uidls[i]);
 
 	/* assume all except deleted messages were sent to POP3 client */
-	if (!client->deleted) {
+	if (client->deleted_bitmask == NULL) {
 		for (i = 0, new_hash = 0; i < client->messages_count; i++)
 			new_hash ^= crc32_str(client->message_uidls[i]);
 	} else {
@@ -659,9 +660,15 @@ static void client_default_destroy(struct client *client, const char *reason)
 	   before it starts, and refresh proctitle so it's clear that it's
 	   doing autoexpunging. We've also sent DISCONNECT to anvil already,
 	   because this is background work and shouldn't really be counted
-	   as an active POP3 session for the user. */
+	   as an active POP3 session for the user.
+
+	   Don't perform autoexpunging at shutdown to avoid load spikes. See
+	   imap code for more detailed reasoning. Although this is less of an
+	   issue with POP3 since the sessions are so short-lived. */
 	pop3_refresh_proctitle();
-	mail_user_autoexpunge(client->user);
+	if (!master_service_is_killed(master_service) &&
+	    !master_service_is_master_stopped(master_service))
+		mail_user_autoexpunge(client->user);
 	mail_user_deinit(&client->user);
 	settings_free(client->set);
 	settings_free(client->mail_set);

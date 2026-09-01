@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -90,6 +90,14 @@ virtual_storage_create(struct mail_storage *_storage,
 		       struct mail_namespace *ns ATTR_UNUSED,
 		       const char **error_r)
 {
+	const char *layout = ns->list->name;
+	if (strcasecmp(layout, "index") == 0) {
+		*error_r = t_strdup_printf(
+			"mailbox_list_layout: '%s' "
+			"cannot be used in virtual storages", layout);
+		return -1;
+	}
+
 	struct virtual_storage *storage =
 		container_of(_storage, struct virtual_storage, storage);
 	const struct virtual_settings *set;

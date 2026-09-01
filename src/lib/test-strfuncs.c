@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "array.h"
@@ -428,6 +428,27 @@ static void test_p_array_const_string_join(void)
 	test_end();
 }
 
+static void test_i_memrchr(void)
+{
+	const char *s = "hello world";
+
+	test_begin("i_memrchr()");
+	/* basic: find last 'l' */
+	test_assert(i_memrchr(s, 'l', strlen(s)) == s + 9);
+	/* first occurrence only */
+	test_assert(i_memrchr(s, 'h', strlen(s)) == s);
+	/* not present */
+	test_assert(i_memrchr(s, 'z', strlen(s)) == NULL);
+	/* size=0 returns NULL */
+	test_assert(i_memrchr(s, 'h', 0) == NULL);
+	/* size limits the search: 'l' at offset 2 and 3 are within size=4,
+	   but 'l' at offset 9 is past it */
+	test_assert(i_memrchr(s, 'l', 4) == s + 3);
+	/* char past size boundary must not be found */
+	test_assert(i_memrchr(s, 'o', 4) == NULL);
+	test_end();
+}
+
 static void test_mem_equals_timing_safe(void)
 {
 	const struct {
@@ -474,6 +495,32 @@ static void test_str_equals_timing_almost_safe(void)
 			    str_equals_timing_almost_safe(tests[i].a, tests[i].b));
 		test_assert((strcmp(tests[i].a, tests[i].b) == 0) ==
 			    str_equals_timing_almost_safe(tests[i].b, tests[i].a));
+	}
+	test_end();
+}
+
+static void test_str_equals_hash_timing_safe(void)
+{
+	const struct {
+		const char *a, *b;
+	} tests[] = {
+		{ "", "" },
+		{ "a", "a" },
+		{ "b", "a" },
+		{ "ab", "ab" },
+		{ "ab", "ba" },
+		{ "ab", "bc" },
+		{ "a", "" },
+		{ "a", "ab" },
+		{ "a", "abc" },
+		{ "ab", "abc" },
+	};
+	test_begin("str_equals_hash_timing_safe()");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		test_assert((strcmp(tests[i].a, tests[i].b) == 0) ==
+			    str_equals_hash_timing_safe(tests[i].a, tests[i].b));
+		test_assert((strcmp(tests[i].a, tests[i].b) == 0) ==
+			    str_equals_hash_timing_safe(tests[i].b, tests[i].a));
 	}
 	test_end();
 }
@@ -771,8 +818,10 @@ void test_strfuncs(void)
 	test_t_str_rtrim();
 	test_t_strarray_join();
 	test_p_array_const_string_join();
+	test_i_memrchr();
 	test_mem_equals_timing_safe();
 	test_str_equals_timing_almost_safe();
+	test_str_equals_hash_timing_safe();
 	test_dec2str_buf();
 	test_str_match();
 	test_str_match_icase();

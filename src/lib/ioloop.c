@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -432,7 +432,7 @@ timeout_reset_timeval(struct timeout *timeout, struct timeval *tv_now)
 	/* If we came here from io_loop_handle_timeouts_real(), next_run must
 	   be larger than tv_now or it can go to infinite loop. This would
 	   mainly happen with 0 ms timeouts. Avoid this by making sure
-	   next_run is at least 1 us higher than tv_now.
+	   next_run is at least 1 us greater than tv_now.
 
 	   Note that some callers (like master process's process_min_avail
 	   preforking timeout) really do want the 0 ms timeout to trigger
@@ -511,7 +511,7 @@ static int io_loop_get_wait_time(struct ioloop *ioloop, struct timeval *tv_r)
 		   return -1 for poll/epoll infinity. */
 		tv_r->tv_sec = INT_MAX / 1000;
 		tv_r->tv_usec = 0;
-		ioloop->next_max_time.tv_sec = (1ULL << (TIME_T_MAX_BITS-1)) - 1;
+		ioloop->next_max_time.tv_sec = time_max_safe_value();
 		ioloop->next_max_time.tv_usec = 0;
 		return -1;
 	}
@@ -604,6 +604,12 @@ static void io_loop_timeouts_update(struct ioloop *ioloop, long long diff_usecs)
 	for (i = 0; i < count; i++) {
 		struct timeout *to = (struct timeout *)items[i];
 
+		if (to->msecs == 0 && !to->one_shot) {
+			/* 0 msec timeout wants to run as soon as possible.
+			   Moving its next_run forwards would delay it and
+			   break io_loop_get_wait_time()'s assert. */
+			continue;
+		}
 		if (diff_usecs > 0)
 			timeval_add_usecs(&to->next_run, diff_usecs);
 		else
@@ -773,13 +779,15 @@ static void io_loop_call_pending(struct ioloop *ioloop)
 {
 	struct io_file *io;
 
-	while (ioloop->io_pending_count > 0) {
+	/* Don't call any more IOs after the ioloop was stopped. They stay
+	   pending and are called if the ioloop is run again. */
+	while (ioloop->io_pending_count > 0 && ioloop->running) {
 		io = ioloop->io_files;
 		do {
 			ioloop->next_io_file = io->next;
 			if (io->io.pending)
 				io_loop_call_io(&io->io);
-			if (ioloop->io_pending_count == 0)
+			if (ioloop->io_pending_count == 0 || !ioloop->running)
 				break;
 			io = ioloop->next_io_file;
 		} while (io != NULL);

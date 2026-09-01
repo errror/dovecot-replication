@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -8,6 +8,7 @@
 #include "istream-private.h"
 
 #include "json-syntax.h"
+#include "istream-json-string.h"
 #include "json-parser.h"
 
 #include <stdlib.h>
@@ -141,6 +142,11 @@ struct json_parser_level {
 	bool finished:1;
 };
 
+struct json_parser_location_state {
+	uoff_t line_number, value_line_number;
+	uoff_t column;
+};
+
 struct json_parser {
 	enum json_parser_flags flags;
 
@@ -156,16 +162,22 @@ struct json_parser {
 
 	struct istream *input;
 	uoff_t input_offset;
+	/* Absolute offset of parser->begin in parser->input, maintained
+	   independently of parser->input->v_offset. A lazily-issued range
+	   stream over parser->input (see json_parser_deliver_range_stream())
+	   can move parser->input->v_offset out from under the parser when
+	   it's read or destroyed after the parser has moved on - so all
+	   internal offset math uses this instead. Only json_parser_read()
+	   needs to reconcile the two, right before it actually reads from
+	   parser->input. */
+	uoff_t tracked_offset;
 
 	const unsigned char *begin, *cur, *end;
 
 	unichar_t current_char;
 	int current_char_len;
 
-	struct {
-		uoff_t line_number, value_line_number;
-		uoff_t column;
-	} loc;
+	struct json_parser_location_state loc;
 
 	string_t *buffer;
 	string_t *object_member;
@@ -175,11 +187,19 @@ struct json_parser {
 	size_t str_stream_threshold;
 	size_t str_stream_max_buffer_size;
 
+	/* Positional state of parser at beginning of string value */
+	struct {
+		uoff_t input_offset;
+		struct json_parser_location_state loc;
+	} string_start;
+
 	char *error;
 
 	bool parsed_nul_char:1;
 	bool parsed_control_char:1;
 	bool parsed_float:1;
+	bool str_has_escapes:1;      /* any \X escape seen in current string */
+	bool str_stream_use_range:1; /* use i_stream_create_range approach */
 	bool streaming_string:1;
 	bool callback_interrupted:1;
 	bool callback_running:1;
@@ -212,6 +232,7 @@ json_parser_init(struct istream *input, const struct json_limits *limits,
 	parser->input = input;
 	i_stream_ref(input);
 	parser->input_offset = input->v_offset;
+	parser->tracked_offset = input->v_offset;
 
 	if (limits != NULL)
 		parser->limits = *limits;
@@ -299,6 +320,9 @@ json_parser_callback_parse_list_open(struct json_parser *parser,
 {
 	const char *name;
 
+	i_assert(HAS_NO_BITS(parser->flags,
+			     JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT));
+
 	if (parser->callbacks == NULL ||
 	    parser->callbacks->parse_list_open == NULL)
 		return JSON_PARSE_OK;
@@ -316,6 +340,9 @@ static int
 json_parser_callback_parse_list_close(struct json_parser *parser,
 				      void *list_context, bool object)
 {
+	i_assert(HAS_NO_BITS(parser->flags,
+			     JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT));
+
 	if (parser->callbacks == NULL ||
 	    parser->callbacks->parse_list_close == NULL)
 		return JSON_PARSE_OK;
@@ -332,6 +359,8 @@ json_parser_callback_parse_object_member(struct json_parser *parser,
 {
 	const char *name;
 
+	i_assert(HAS_NO_BITS(parser->flags,
+			     JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT));
 	i_assert(parser->have_object_member);
 
 	if (parser->callbacks == NULL ||
@@ -352,6 +381,10 @@ json_parser_callback_parse_value(struct json_parser *parser,
 				 const struct json_value *value)
 {
 	const char *name;
+
+	i_assert(HAS_NO_BITS(parser->flags,
+			     JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT) ||
+		 type == JSON_TYPE_STRING);
 
 	if (parser->callbacks == NULL ||
 	    parser->callbacks->parse_value == NULL)
@@ -524,6 +557,51 @@ json_parser_callback_number_value(struct json_parser *parser,
 						JSON_TYPE_NUMBER, &value);
 }
 
+/* Zero-copy path: expose raw input bytes via a range stream.  The closing '"'
+   has already been shifted past, so cur is one byte beyond it. */
+static int
+json_parser_deliver_range_stream(struct json_parser *parser,
+				 void *list_context)
+{
+	uoff_t string_content_offset = parser->string_start.input_offset + 1;
+	struct json_value value;
+	uoff_t raw_end, raw_len;
+	struct istream *raw;
+	int ret;
+
+	/* The +1/-1 below strip the surrounding '"' pair.  Under
+	   JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT there is no such quote -
+	   string_start.input_offset already points at the first content
+	   byte - so combining that flag with range delivery would silently
+	   trim one real content byte at each end.  Nothing currently does
+	   so; assert it stays that way instead of miscomputing the range. */
+	i_assert(!HAS_ANY_BITS(parser->flags,
+			       JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT));
+
+	i_zero(&value);
+	raw_end = parser->tracked_offset +
+		  (uoff_t)(parser->cur - parser->begin) - 1;
+	raw_len = raw_end - string_content_offset;
+	raw = i_stream_create_range(parser->input,
+				    string_content_offset, raw_len);
+	if (parser->str_has_escapes) {
+		/* Forward the outer parser's string-content validation
+		   flags (e.g. STRINGS_ALLOW_NUL) so the nested parser that
+		   decodes this stream on demand doesn't re-validate its
+		   content more strictly than the outer parser already did. */
+		value.content.stream = i_stream_create_json_string_with_flags(
+			raw, parser->flags);
+		i_stream_unref(&raw);
+	} else {
+		value.content.stream = raw;
+	}
+	value.content_type = JSON_CONTENT_TYPE_STREAM;
+	ret = json_parser_callback_parse_value(parser, list_context,
+					       JSON_TYPE_STRING, &value);
+	i_stream_unref(&value.content.stream);
+	return ret;
+}
+
 static int
 json_parser_callback_string_value(struct json_parser *parser,
 				  void *list_context)
@@ -542,6 +620,16 @@ json_parser_callback_string_value(struct json_parser *parser,
 
 	if (parser->str_stream_max_buffer_size > 0) {
 		if (str_len(parser->buffer) >= parser->str_stream_threshold) {
+			if (parser->str_stream_use_range &&
+			    parser->input->seekable) {
+				ret = json_parser_deliver_range_stream(
+					parser, list_context);
+				if (ret < JSON_PARSE_OK)
+					return ret;
+				/* parser->str_stream stays NULL: parser can
+				   continue immediately without interlock */
+				return JSON_PARSE_OK;
+			}
 			value.content_type = JSON_CONTENT_TYPE_STREAM;
 			value.content.stream =
 				json_string_stream_create(parser, TRUE);
@@ -657,6 +745,14 @@ static int json_parser_read(struct json_parser *parser)
 	int ret;
 
 	i_assert(parser->end >= parser->begin);
+	/* A lazily-issued range stream over parser->input (see
+	   json_parser_deliver_range_stream()) may have moved
+	   parser->input->v_offset since we last read from it - reading or
+	   destroying such a stream seeks its parent on every operation (see
+	   i_stream_limit_read()/i_stream_limit_destroy()). Reconcile before
+	   reading, same as i_stream_limit_read() does for its own parent. */
+	if (parser->input->v_offset != parser->tracked_offset)
+		i_stream_seek(parser->input, parser->tracked_offset);
 	ret = i_stream_read_data(parser->input, &data, &size,
 				 (size_t)(parser->end - parser->begin));
 	if (ret <= 0) {
@@ -798,6 +894,33 @@ json_parser_parsed_size(struct json_parser *parser,
 /*
  * Parser core
  */
+
+static inline void
+json_parser_reset_state(struct json_parser *parser,
+			json_parser_func_t parse_func)
+{
+	struct json_parser_level *level;
+
+	if (parser->level_stack_pos < array_count(&parser->level_stack)) {
+		level = array_idx_get_space(&parser->level_stack,
+					    parser->level_stack_pos);
+		i_zero(level);
+	}
+	while (parser->level_stack_pos > 0) {
+		level = array_idx_get_space(&parser->level_stack,
+					    parser->level_stack_pos - 1);
+
+		if (level->func == parse_func) {
+			i_zero(&level->state);
+			return;
+		}
+
+		i_zero(level);
+		parser->level_stack_pos--;
+	}
+
+	i_unreached();
+}
 
 static inline int
 json_parser_call(struct json_parser *parser,
@@ -1012,6 +1135,10 @@ json_parser_append_buffer(struct json_parser *parser,
  * JSON syntax
  */
 
+static int
+json_parser_do_parse_value(struct json_parser *parser,
+			   struct json_parser_state *state);
+
 /* ws */
 
 static int json_parser_skip_ws(struct json_parser *parser)
@@ -1068,7 +1195,7 @@ json_parser_do_parse_literal(struct json_parser *parser,
 			if ((unichar_t)*p != ch) {
 				json_parser_error(
 					parser, "Expected value '%s', "
-					"but encounted '%s' + %s",
+					"but encountered '%s' + %s",
 					literal, t_strdup_until(literal, p),
 					json_parser_curchar_str(parser));
 				return JSON_PARSE_ERROR;
@@ -1313,6 +1440,11 @@ json_parser_parse_unicode_escape(struct json_parser *parser,
 			return JSON_PARSE_OVERFLOW;
 		}
 		uni_ucs4_to_utf8_c(ech, buf);
+		/* Clear the stale non-surrogate `ech' left in state->context,
+		   matching the normal completion path below - otherwise the
+		   next json_parser_parse_unicode_escape_close() call sees a
+		   stale nonzero context and mishandles it. */
+		state->context = NULL;
 		return JSON_PARSE_OK;
 	}
 
@@ -1345,7 +1477,7 @@ json_parser_parse_unicode_escape(struct json_parser *parser,
 			break;
 	}
 	if (ret == JSON_PARSE_NO_DATA) {
-		/* We already checked that 4 octets are available for for hex
+		/* We already checked that 4 octets are available for hex
 		   digits. The only thing that could have happened is that we
 		   encountered the beginnings of an UTF-8 character and no more
 		   input is available. Finish it at a deeper parse level that
@@ -1424,6 +1556,72 @@ json_parser_parse_unicode_escape_close(struct json_parser *parser,
 	return JSON_PARSE_OK;
 }
 
+static void json_parser_record_string_start(struct json_parser *parser)
+{
+	i_zero(&parser->string_start);
+	parser->string_start.input_offset =
+		parser->tracked_offset + (uoff_t)(parser->cur - parser->begin);
+	parser->string_start.loc = parser->loc;
+	/* By this point json_parser_curchar() has already decoded (but not
+	   shifted) the character at `cur' and counted it into parser->loc.
+	   input_offset above points at that same not-yet-shifted character,
+	   so undo the count here to match - otherwise a restart, which
+	   re-seeks to input_offset and restores this loc before re-decoding
+	   that same character, would count it a second time. */
+	i_assert(parser->current_char_len > 0);
+	if (parser->current_char == '\n')
+		parser->string_start.loc.line_number--;
+	else
+		parser->string_start.loc.column--;
+}
+
+/* Mutation-free lookup mirroring json_parser_reset_state()'s own search: is
+   `parse_func' anywhere on the level stack?  Used by
+   json_parser_restart_string() to check up front, before it mutates
+   anything, whether the json_parser_reset_state() call it is about to make
+   would find its target - reset_state() itself is void and runs after the
+   seek/buffer reset, so it can't fail gracefully if the level isn't there.
+   Uses array_idx_get_space() rather than array_idx() to match
+   reset_state()'s own access pattern (see its level_stack_pos <
+   array_count() guard). */
+static bool
+json_parser_level_stack_has(struct json_parser *parser,
+			    json_parser_func_t parse_func)
+{
+	unsigned int pos = parser->level_stack_pos;
+
+	while (pos > 0) {
+		const struct json_parser_level *level =
+			array_idx_get_space(&parser->level_stack, pos - 1);
+
+		if (level->func == parse_func)
+			return TRUE;
+		pos--;
+	}
+	return FALSE;
+}
+
+static bool json_parser_restart_string(struct json_parser *parser)
+{
+	if (parser->tracked_offset == parser->string_start.input_offset)
+		return FALSE;
+	if (!json_parser_level_stack_has(parser, json_parser_do_parse_value))
+		return FALSE;
+	json_parser_reset_buffer(parser);
+	i_stream_seek(parser->input, parser->string_start.input_offset);
+	parser->tracked_offset = parser->string_start.input_offset;
+	parser->current_char_len = 0;
+	parser->end_of_input = FALSE;
+	parser->loc = parser->string_start.loc;
+	/* Discard the pre-seek buffer span rather than leaving it for
+	   json_parser_read() to size its read threshold from - it has no
+	   bearing on how much the stream can supply at the new position. */
+	parser->begin = parser->cur = parser->end = NULL;
+	json_parser_read(parser);
+	json_parser_reset_state(parser, json_parser_do_parse_value);
+	return TRUE;
+}
+
 static int
 json_parser_do_parse_string(struct json_parser *parser,
 			    struct json_parser_state *state, size_t max_size)
@@ -1459,6 +1657,16 @@ json_parser_do_parse_string(struct json_parser *parser,
 		switch (state->state) {
 		/* quotation-mark */
 		case _STR_START:
+			parser->parsed_nul_char = FALSE;
+			parser->parsed_control_char = FALSE;
+			parser->str_has_escapes = FALSE;
+			json_parser_record_string_start(parser);
+			if (HAS_ANY_BITS(parser->flags,
+				JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT)) {
+				offset = parser->cur;
+				state->state = _STR_CHAR;
+				continue;
+			}
 			if (ch != '"') {
 				json_parser_error(parser,
 					"Expected string, but encountered %s",
@@ -1467,8 +1675,6 @@ json_parser_do_parse_string(struct json_parser *parser,
 			}
 			json_parser_shift(parser);
 			offset = parser->cur;
-			parser->parsed_nul_char = FALSE;
-			parser->parsed_control_char = FALSE;
 			state->state = _STR_CHAR;
 			continue;
 		/* char */
@@ -1479,6 +1685,7 @@ json_parser_do_parse_string(struct json_parser *parser,
 					  json_parser_shifted_size(parser, offset))
 					 <= max_size);
 				json_parser_append_buffer(parser, buf, offset);
+				parser->str_has_escapes = TRUE;
 				state->state = _STR_ESCAPE;
 				json_parser_shift(parser);
 				continue;
@@ -1488,6 +1695,12 @@ json_parser_do_parse_string(struct json_parser *parser,
 			if (ret < JSON_PARSE_OK)
 				return ret;
 			if (ch == '"') {
+				if (HAS_ANY_BITS(parser->flags,
+					JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT)) {
+					json_parser_error(parser,
+						"String ends before end of input");
+					return JSON_PARSE_ERROR;
+				}
 				i_assert((str_len(buf) +
 					  json_parser_shifted_size(parser, offset))
 					 <= max_size);
@@ -1588,6 +1801,27 @@ json_parser_do_parse_string(struct json_parser *parser,
 	}
 	if (ret == JSON_PARSE_NO_DATA) {
 		if (parser->end_of_input) {
+			if (state->state == _STR_CHAR &&
+			    HAS_ANY_BITS(parser->flags,
+					 JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT)) {
+				/* A lone high surrogate parsed by a preceding
+				   \uXXXX escape is parked in state->context,
+				   not yet written to buf - validate it here
+				   instead of silently dropping it, so this
+				   EOF short-circuit can't produce a truncated
+				   string where the equivalent non-EOF case
+				   (something follows the escape) would fail. */
+				ret = json_parser_parse_unicode_escape_close(
+					parser, state);
+				if (ret < JSON_PARSE_OK)
+					return ret;
+				i_assert((str_len(buf) +
+					  json_parser_shifted_size(parser, offset))
+					 <= max_size);
+				json_parser_append_buffer(parser, buf, offset);
+				state->state = _STR_END;
+				return JSON_PARSE_OK;
+			}
 			switch (state->state) {
 			case _STR_START:
 				json_parser_error(parser,
@@ -1595,10 +1829,13 @@ json_parser_do_parse_string(struct json_parser *parser,
 					"but encountered end of input");
 				return JSON_PARSE_UNEXPECTED_EOF;
 			case _STR_CHAR:
+				json_parser_error(parser,
+					"Encountered end of input inside string");
+				return JSON_PARSE_UNEXPECTED_EOF;
 			case _STR_ESCAPE:
 			case _STR_ESCAPE_U:
 				json_parser_error(parser,
-					"Encountered end of input inside string");
+					"Encountered end of input inside string escape sequence");
 				return JSON_PARSE_UNEXPECTED_EOF;
 			default:
 				break;
@@ -1628,6 +1865,7 @@ json_parser_do_parse_string_value(struct json_parser *parser,
 
 	if (parser->str_stream == NULL &&
 	    parser->str_stream_max_buffer_size > 0 &&
+	    !parser->str_stream_use_range &&
 	    max_size > parser->str_stream_threshold) {
 		/* Return string stream immediately once the threshold is
 		   crossed */
@@ -1640,8 +1878,7 @@ json_parser_do_parse_string_value(struct json_parser *parser,
 static int
 json_parser_parse_string_value(struct json_parser *parser, string_t *buf)
 {
-	return json_parser_call(parser, json_parser_do_parse_string_value,
-				(void *)buf);
+	return json_parser_call(parser, json_parser_do_parse_string_value, buf);
 }
 
 static int
@@ -1655,8 +1892,7 @@ json_parser_do_parse_object_member(struct json_parser *parser,
 static int
 json_parser_parse_object_member(struct json_parser *parser, string_t *buf)
 {
-	return json_parser_call(parser, json_parser_do_parse_object_member,
-				(void *)buf);
+	return json_parser_call(parser, json_parser_do_parse_object_member, buf);
 }
 
 /* value */
@@ -1708,6 +1944,12 @@ json_parser_do_parse_value(struct json_parser *parser,
 	while ((ret = json_parser_curchar(parser, &ch)) == JSON_PARSE_OK) {
 		switch (state->state) {
 		case _VALUE_START:
+			if (HAS_ANY_BITS(parser->flags,
+				JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT)) {
+				json_parser_reset_buffer(parser);
+				state->state = _VALUE_STRING;
+				continue;
+			}
 			switch (ch) {
 			/* array */
 			case '[':
@@ -1976,6 +2218,13 @@ json_parser_do_parse_value(struct json_parser *parser,
 						parser->limits.max_string_size);
 					return JSON_PARSE_ERROR;
 				}
+				if (parser->str_stream_use_range) {
+					json_parser_error(parser,
+						"Excessive string size for "
+						"range delivery (> %zu)",
+						parser->str_stream_max_buffer_size);
+					return JSON_PARSE_ERROR;
+				}
 				ret = json_parser_callback_string_stream(
 					parser,	parent_context);
 				if (ret < JSON_PARSE_OK)
@@ -2034,6 +2283,13 @@ json_parser_do_parse_value(struct json_parser *parser,
 		}
 	}
 	if (ret == JSON_PARSE_NO_DATA && parser->end_of_input) {
+		if (HAS_ANY_BITS(parser->flags,
+				 JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT)) {
+			if (parser->buffer == NULL)
+				json_parser_reset_buffer(parser);
+			state->state = _VALUE_END;
+			return json_parser_callback_string_value(parser, NULL);
+		}
 		switch (state->state) {
 		case _VALUE_START:
 			json_parser_error(parser,
@@ -2165,16 +2421,39 @@ static int json_parser_continue(struct json_parser *parser)
 
 	if (parser->error != NULL)
 		return JSON_PARSE_ERROR;
-	if (parser->started &&
+	/* json_parse_more() asserts end_of_input whenever this returns OK.
+	   started && !busy is not on its own sufficient to guarantee that:
+	   close the loophole defensively rather than relying on every
+	   current and future parse_func/completion path to keep the two in
+	   sync on its own. */
+	if (parser->started && parser->end_of_input &&
 		!json_parser_is_busy(parser)) {
 		return JSON_PARSE_OK;
 	}
 
+	if (parser->started &&
+	    parser->input->v_offset != parser->tracked_offset) {
+		/* A lazy range stream moved parser->input since the last run;
+		   the retained begin/cur/end pointers may reference stale
+		   buffer content, so re-read to re-fetch the current
+		   character's bytes before resuming (a halted parser can
+		   have a decoded but not-yet-shifted character cached, and
+		   merely inspecting the buffer without reading can find it
+		   empty right after such a seek). */
+		json_parser_read(parser);
+	}
+
+	json_parser_func_t parse_func;
+
+	if (HAS_ANY_BITS(parser->flags,
+			 JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT))
+		parse_func = json_parser_do_parse_value;
+	else
+		parse_func = json_parser_parse_text;
 	do {
 		if (!json_parser_have_data(parser))
 			continue;
-		status = json_parser_run(parser,
-			json_parser_parse_text);
+		status = json_parser_run(parser, parse_func);
 		parser->started = TRUE;
 
 		switch (status) {
@@ -2187,6 +2466,8 @@ static int json_parser_continue(struct json_parser *parser)
 
 		i_stream_skip(parser->input,
 			      (size_t)(parser->cur - parser->begin));
+		parser->tracked_offset +=
+			(uoff_t)(parser->cur - parser->begin);
 		parser->begin = parser->cur;
 
 		switch (status) {
@@ -2221,7 +2502,7 @@ static int json_parser_continue(struct json_parser *parser)
 
 		parser->end_of_input = TRUE;
 
-		status = json_parser_run(parser, json_parser_parse_text);
+		status = json_parser_run(parser, parse_func);
 		switch (status) {
 		case JSON_PARSE_ERROR:
 		case JSON_PARSE_UNEXPECTED_EOF:
@@ -2240,25 +2521,33 @@ static int json_parser_continue(struct json_parser *parser)
 	return JSON_PARSE_NO_DATA;
 }
 
-int json_parse_more(struct json_parser *parser, const char **error_r)
+int json_parse_more(struct json_parser *parser, bool *at_end_r,
+		    const char **error_r)
 {
 	int ret;
 
 	i_assert(parser->str_stream == NULL);
 
+	if (at_end_r != NULL)
+		*at_end_r = FALSE;
 	*error_r = NULL;
 
 	ret = json_parser_continue(parser);
 	switch (ret) {
 	case JSON_PARSE_ERROR:
+		*error_r = parser->error;
+		return -1;
 	case JSON_PARSE_UNEXPECTED_EOF:
+		if (at_end_r != NULL)
+			*at_end_r = TRUE;
 		*error_r = parser->error;
 		return -1;
 	case JSON_PARSE_OK:
+		i_assert(parser->end_of_input);
 		break;
 	case JSON_PARSE_INTERRUPTED:
 		if (parser->end_of_input)
-			return 1;
+			break;
 		return 0;
 	case JSON_PARSE_OVERFLOW:
 	case JSON_PARSE_NO_DATA:
@@ -2267,6 +2556,8 @@ int json_parse_more(struct json_parser *parser, const char **error_r)
 		i_unreached();
 	}
 
+	if (at_end_r != NULL)
+		*at_end_r = TRUE;
 	return 1;
 }
 
@@ -2274,8 +2565,8 @@ void json_parser_get_location(struct json_parser *parser,
 			      struct json_parser_location *loc_r)
 {
 	i_zero(loc_r);
-	i_assert(parser->input->v_offset >= parser->input_offset);
-	loc_r->offset = parser->input->v_offset - parser->input_offset +
+	i_assert(parser->tracked_offset >= parser->input_offset);
+	loc_r->offset = parser->tracked_offset - parser->input_offset +
 			(parser->cur - parser->begin);
 	loc_r->line = parser->loc.line_number;
 	loc_r->value_line = parser->loc.value_line_number;
@@ -2291,57 +2582,76 @@ struct json_string_istream {
 
 	struct json_parser *parser;
 
-	bool buffer_overflowed:1;
 	bool ended:1;
 };
+
+/* Move the string data decoded so far from the parser buffer into the buffer
+   of this stream. The parser buffer is reallocated as it grows, so its data
+   can't be exposed directly to the stream's users: it would be left dangling
+   once more of the string is decoded. Returns the number of bytes moved. */
+static size_t json_string_istream_copy(struct json_string_istream *jstream)
+{
+	struct istream_private *stream = &jstream->istream;
+	struct json_parser *parser = jstream->parser;
+	size_t avail, size;
+
+	i_assert(parser != NULL);
+
+	if (str_len(parser->buffer) == 0)
+		return 0;
+	if (!i_stream_try_alloc(stream, str_len(parser->buffer), &avail))
+		return 0;
+
+	size = I_MIN(avail, str_len(parser->buffer));
+	memcpy(stream->w_buffer + stream->pos, str_data(parser->buffer), size);
+	stream->pos += size;
+	str_delete(parser->buffer, 0, size);
+	return size;
+}
 
 static ssize_t json_string_istream_read(struct istream_private *stream)
 {
 	struct json_string_istream *jstream =
-		(struct json_string_istream *)stream;
+		container_of(stream, struct json_string_istream, istream);
 	struct json_parser *parser = jstream->parser;
 	bool stop_loop;
-	size_t old_pos, read_size, read_total;
+	size_t read_total;
 	int ret;
 
-	if (jstream->ended) {
-		stream->istream.eof = TRUE;
-		return -1;
-	}
 	i_assert(jstream->parser != NULL);
-
-	i_assert(stream->pos == str_len(parser->buffer));
 	i_assert(stream->skip <= stream->pos);
 
-	read_total = 0;
+	/* Return the data that was decoded earlier, but didn't fit into this
+	   stream's buffer yet. */
+	read_total = json_string_istream_copy(jstream);
+
+	if (jstream->ended) {
+		if (read_total == 0) {
+			stream->istream.eof = TRUE;
+			return -1;
+		}
+		return (ssize_t)read_total;
+	}
+
 	do {
-		if (jstream->buffer_overflowed) {
-			if (stream->skip == str_len(parser->buffer))
-				str_truncate(parser->buffer, 0);
-			else if (stream->skip > 0)
-				str_delete(parser->buffer, 0, stream->skip);
-			else
+		if (str_len(parser->buffer) > 0) {
+			/* This stream's buffer is full */
+			if (read_total == 0)
 				return -2;
-			stream->pos = str_len(parser->buffer);
-			stream->skip = 0;
-			jstream->buffer_overflowed = FALSE;
+			break;
 		}
 
-		old_pos = str_len(parser->buffer);
 		ret = json_parser_continue(parser);
-		i_assert(str_len(parser->buffer) >= old_pos);
-		read_size = str_len(parser->buffer) - old_pos;
-		stop_loop = (read_size > 0);
-		read_total += read_size;
+		read_total += json_string_istream_copy(jstream);
+		stop_loop = (read_total > 0);
 		switch (ret) {
 		case JSON_PARSE_INTERRUPTED:
-			i_assert(stream->skip == 0 ||
-				 !jstream->buffer_overflowed);
-			jstream->buffer_overflowed = TRUE;
+			/* The parser buffer became full. It was just emptied
+			   above, so parsing can continue. */
 			break;
 		case JSON_PARSE_BOUNDARY:
 			jstream->ended = TRUE;
-			if (str_len(parser->buffer) == old_pos) {
+			if (read_total == 0) {
 				stream->istream.eof = TRUE;
 				return -1;
 			}
@@ -2363,11 +2673,49 @@ static ssize_t json_string_istream_read(struct istream_private *stream)
 		default:
 			i_unreached();
 		}
-	} while (jstream->buffer_overflowed && !stop_loop);
+	} while (!stop_loop);
 
-	stream->pos = str_len(parser->buffer);
-	stream->buffer = str_data(parser->buffer);
 	return (ssize_t)read_total;
+}
+
+static bool
+json_string_istream_restart(struct json_string_istream *jstream)
+{
+	struct istream_private *stream = &jstream->istream;
+
+	if (!json_parser_restart_string(jstream->parser))
+		return FALSE;
+	jstream->ended = FALSE;
+
+	stream->skip = stream->pos = 0;
+	stream->istream.v_offset = 0;
+	return TRUE;
+}
+
+static void
+json_string_istream_seek(struct istream_private *stream, uoff_t v_offset,
+			 bool mark)
+{
+	struct json_string_istream *jstream =
+		container_of(stream, struct json_string_istream, istream);
+
+	/* The string is decoded on the fly and the already consumed part of
+	   it is dropped from this stream's buffer, so seeking backwards is
+	   only possible by decoding the string again from its beginning.
+	   Forward seeking is read-and-discard, as usual for a nonseekable
+	   stream. */
+	if (v_offset == stream->istream.v_offset)
+		return;
+	if (v_offset < stream->istream.v_offset) {
+		if (!json_string_istream_restart(jstream)) {
+			io_stream_set_error(
+				&stream->iostream,
+				"Can't seek backwards: string decoder restart failed");
+			stream->istream.stream_errno = ESPIPE;
+			return;
+		}
+	}
+	i_stream_default_seek_nonseekable(stream, v_offset, mark);
 }
 
 static void
@@ -2375,10 +2723,13 @@ json_string_istream_set_max_buffer_size(struct iostream_private *stream,
 					size_t max_size)
 {
 	struct json_string_istream *jstream =
-		(struct json_string_istream *)stream;
+		container_of(stream, struct json_string_istream,
+			     istream.iostream);
 
 	i_assert(max_size > 0);
-	jstream->parser->str_stream_max_buffer_size = max_size;
+	jstream->istream.max_buffer_size = max_size;
+	if (jstream->parser != NULL)
+		jstream->parser->str_stream_max_buffer_size = max_size;
 }
 
 static void
@@ -2386,10 +2737,18 @@ json_string_istream_close(struct iostream_private *stream,
 			  bool close_parent ATTR_UNUSED)
 {
 	struct json_string_istream *jstream =
-		(struct json_string_istream *)stream;
+		container_of(stream, struct json_string_istream,
+			     istream.iostream);
 
-	if (jstream->parser != NULL)
+	/* Neither the parser nor its input istream survives
+	   json_parser_deinit(), but a closed string istream may - and
+	   io_stream_unref() runs this close() again when the last reference
+	   goes away. Drop both pointers before they become dangling. */
+	if (jstream->parser != NULL) {
 		jstream->parser->str_stream = NULL;
+		jstream->parser = NULL;
+	}
+	jstream->istream.io_parent = NULL;
 }
 
 static struct istream *
@@ -2405,8 +2764,6 @@ json_string_stream_create(struct json_parser *parser, bool complete)
 	jstream->parser = parser;
 
 	jstream->ended = complete;
-	jstream->istream.pos = str_len(parser->buffer);
-	jstream->istream.buffer = str_data(parser->buffer);
 
 	jstream->istream.max_buffer_size = parser->str_stream_max_buffer_size;
 	jstream->istream.iostream.set_max_buffer_size =
@@ -2414,15 +2771,24 @@ json_string_stream_create(struct json_parser *parser, bool complete)
 	jstream->istream.iostream.close =
 		json_string_istream_close;
 	jstream->istream.read = json_string_istream_read;
+	jstream->istream.seek = json_string_istream_seek;
 
 	jstream->istream.istream.readable_fd = FALSE;
 	jstream->istream.istream.blocking = parser->input->blocking;
-	jstream->istream.istream.seekable = FALSE;
+	jstream->istream.istream.seekable =
+		(parser->input->seekable &&
+		 HAS_ANY_BITS(parser->flags,
+			      JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT));
 
 	parser->str_stream = jstream;
 
+	/* We read the parser's input, which isn't our istream-parent. It also
+	   owns the ioloop IO, since it's the istream the caller is reading. */
+	jstream->istream.io_parent = parser->input;
+
 	stream = i_stream_create(&jstream->istream, NULL,
-				 i_stream_get_fd(parser->input), 0);
+				 i_stream_get_fd(parser->input),
+				 ISTREAM_HIDDEN_INPUTS_DECLARED, 0);
 
 	name = i_stream_get_name(parser->input);
 	if (name == NULL || *name == '\0') {
@@ -2431,6 +2797,12 @@ json_string_stream_create(struct json_parser *parser, bool complete)
 		i_stream_set_name(stream, t_strdup_printf(
 			"(JSON string parsed from %s)", name));
 	}
+
+	/* Move the part of the string that is already decoded into the buffer
+	   of this stream. This can only be done once the stream is created,
+	   since the buffer allocation needs the stream to be fully
+	   initialized. */
+	(void)json_string_istream_copy(jstream);
 	return stream;
 }
 
@@ -2442,9 +2814,23 @@ void json_parser_enable_string_stream(struct json_parser *parser,
 		threshold = max_buffer_size;
 	parser->str_stream_threshold = threshold;
 	parser->str_stream_max_buffer_size = max_buffer_size;
+	parser->str_stream_use_range = FALSE;
+}
+
+void json_parser_enable_lazy_string_stream(struct json_parser *parser,
+					   size_t threshold,
+					   size_t max_buffer_size)
+{
+	i_assert(max_buffer_size > 0);
+	if (threshold > max_buffer_size)
+		threshold = max_buffer_size;
+	parser->str_stream_threshold = threshold;
+	parser->str_stream_max_buffer_size = max_buffer_size;
+	parser->str_stream_use_range = TRUE;
 }
 
 void json_parser_disable_string_stream(struct json_parser *parser)
 {
 	parser->str_stream_max_buffer_size = 0;
+	parser->str_stream_use_range = FALSE;
 }

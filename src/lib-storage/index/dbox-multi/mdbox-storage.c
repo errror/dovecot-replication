@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -21,7 +21,7 @@
 extern struct mail_storage mdbox_storage;
 extern struct mailbox mdbox_mailbox;
 
-static struct event_category event_category_mdbox = {
+struct event_category event_category_mdbox = {
 	.name = "mdbox",
 	.parent = &event_category_storage,
 };

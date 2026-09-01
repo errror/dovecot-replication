@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "buffer.h"
@@ -59,6 +59,24 @@ void test_numpack(void)
 		num = magic;
 		test_assert_idx(numpack_decode(&p, end, &num) == -1, i);
 		test_assert_idx(p == dec_fails[i].input && num == magic, i);
+	}
+	test_end();
+
+	test_begin("numpack (decode does not read past end)");
+	{
+		/* Ten continuation-flagged bytes exhaust the 64-bit value
+		   (bits reaches 64) without ever hitting the `*c < 0x80'
+		   break, so the loop exits with `c' one past the last byte
+		   supplied.  A heap allocation sized to exactly `end' (no
+		   trailing padding, unlike a fixed-size struct array field)
+		   is required for a reader running past it to be an actual
+		   out-of-bounds access. */
+		uint8_t *heap_buf = i_malloc(10);
+
+		memset(heap_buf, 0xff, 10);
+		p = heap_buf; end = p + 10;
+		test_assert(numpack_decode(&p, end, &num) == -1);
+		i_free(heap_buf);
 	}
 	test_end();
 }

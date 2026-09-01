@@ -8,9 +8,9 @@
 #include "array.h"
 #include "net.h"
 #include "var-expand.h"
-#include "mech.h"
 #include "userdb.h"
 #include "passdb.h"
+#include "auth-sasl.h"
 #include "auth-request-var-expand.h"
 #include "password-scheme.h"
 
@@ -123,7 +123,6 @@ struct auth_request {
 	pool_t pool;
 
 	struct event *event;
-	struct event *mech_event;
 	ARRAY(struct event *) authdb_event;
 
         enum auth_request_state state;
@@ -134,7 +133,11 @@ struct auth_request {
 	   proxy DNS lookups) */
 	enum passdb_result passdb_result;
 
-	const struct mech_module *mech;
+	struct {
+		struct sasl_server_req_ctx req;
+		sasl_server_passdb_callback_t *passdb_callback;
+	} sasl;
+
 	/* Protocol-specific settings */
 	const struct auth_settings *protocol_set;
 	/* Currently active settings. May be the same as protocol_set, but
@@ -169,7 +172,6 @@ struct auth_request {
 	union {
 		verify_plain_callback_t *verify_plain;
 		lookup_credentials_callback_t *lookup_credentials;
-		set_credentials_callback_t *set_credentials;
                 userdb_callback_t *userdb;
 	} private_callback;
 	/* Used by passdb's credentials lookup to determine which scheme is
@@ -199,6 +201,11 @@ struct auth_request {
 	bool domain_is_realm:1;
 
 	bool request_auth_token:1;
+	/* A trusted (unrestricted) master connection vouches that session_pid
+	   is correct, even though the connecting peer's pid doesn't match it.
+	   Used by auth proxies (e.g. cluster) that connect to auth on behalf
+	   of the actual session process. */
+	bool session_pid_trusted:1;
 
 	/* success/failure states: */
 	bool failed:1; /* overrides any other success */
@@ -238,9 +245,6 @@ struct auth_request {
 	   needs to be tracked outside regular extra fields, because they get
 	   rolled back on passdb failure. */
 	bool failure_nodelay:1;
-	/* Sent final response (challenge). Waiting for dummy client response.
-	 */
-	bool final_resp_sent:1;
 
 	bool event_finished_sent:1;
 
@@ -251,10 +255,13 @@ typedef void auth_request_proxy_cb_t(bool success, struct auth_request *);
 
 extern unsigned int auth_request_state_count[AUTH_REQUEST_STATE_MAX];
 
-struct auth_request *
-auth_request_new(const struct mech_module *mech, struct event *parent_event);
+struct auth_request *auth_request_new(struct event *parent_event);
 struct auth_request *auth_request_new_dummy(struct event *parent_event);
+
 void auth_request_init(struct auth_request *request);
+void auth_request_init_sasl(struct auth_request *request,
+			    const struct sasl_server_mech *mech);
+
 struct auth *auth_request_get_auth(struct auth_request *request);
 
 void auth_request_set_state(struct auth_request *request,
@@ -390,6 +397,7 @@ auth_request_db_password_verify_log(struct auth_request *request,
 				    bool log_password_mismatch)
 				    ATTR_WARN_UNUSED_RESULT;
 enum passdb_result auth_request_password_missing(struct auth_request *request);
+enum passdb_result auth_request_password_empty(struct auth_request *request);
 
 void auth_request_log_password_mismatch(struct auth_request *request,
 					struct event *event);
@@ -405,15 +413,12 @@ void auth_request_db_log_login_failure(struct auth_request *request,
 void
 auth_request_verify_plain_callback_finish(enum passdb_result result,
                                           struct auth_request *request);
-void auth_request_verify_plain_callback(enum passdb_result result,
+void auth_request_verify_plain_passdb_callback(enum passdb_result result,
 					struct auth_request *request);
 void auth_request_lookup_credentials_callback(enum passdb_result result,
 					      const unsigned char *credentials,
-					      size_t size,
+					      size_t size, const char *scheme,
 					      struct auth_request *request);
-void auth_request_set_credentials(struct auth_request *request,
-				  const char *scheme, const char *data,
-				  set_credentials_callback_t *callback);
 void auth_request_userdb_callback(enum userdb_result result,
 				  struct auth_request *request);
 void auth_request_default_verify_plain_continue(
@@ -427,7 +432,12 @@ struct event_passthrough *
 auth_request_finished_event(struct auth_request *request, struct event *event);
 void auth_request_log_finished(struct auth_request *request);
 void auth_request_master_user_login_finish(struct auth_request *request);
+
+void auth_request_fields_alloc(struct auth_request *request);
 void auth_request_fields_init(struct auth_request *request);
+
+void auth_request_passdb_event_begin(struct auth_request *request);
+void auth_request_passdb_event_end(struct auth_request *request);
 
 void auth_request_passdb_lookup_begin(struct auth_request *request);
 void auth_request_passdb_lookup_end(struct auth_request *request,

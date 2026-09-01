@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -100,8 +100,7 @@ int imapc_mailbox_commit_delayed_trans(struct imapc_mailbox *mbox,
 
 	*changes_r = FALSE;
 
-	if (mbox->delayed_sync_view != NULL)
-		mail_index_view_close(&mbox->delayed_sync_view);
+	mail_index_view_close(&mbox->delayed_sync_view);
 	if (mbox->delayed_sync_trans == NULL)
 		;
 	else if (!mbox->selected && !force) {
@@ -122,14 +121,12 @@ int imapc_mailbox_commit_delayed_trans(struct imapc_mailbox *mbox,
 		/* delayed expunges - commit them now in a separate
 		   transaction. Reopen mbox->sync_view to see changes
 		   committed in delayed_sync_trans. */
-		if (mbox->sync_view != NULL)
-			mail_index_view_close(&mbox->sync_view);
+		mail_index_view_close(&mbox->sync_view);
 		if (imapc_mailbox_commit_delayed_expunges(mbox) < 0)
 			ret = -1;
 	}
 
-	if (mbox->sync_view != NULL)
-		mail_index_view_close(&mbox->sync_view);
+	mail_index_view_close(&mbox->sync_view);
 	i_assert(mbox->delayed_sync_trans == NULL);
 	i_assert(mbox->delayed_sync_view == NULL);
 	i_assert(mbox->delayed_sync_cache_trans == NULL);
@@ -840,6 +837,19 @@ static void imapc_untagged_search(const struct imapc_untagged_reply *reply,
 	imapc_search_reply_search(reply->args, mbox);
 }
 
+static void imapc_untagged_sort(const struct imapc_untagged_reply *reply,
+				struct imapc_mailbox *mbox)
+{
+	if (mbox == NULL)
+		return;
+	if (!IMAPC_MAILBOX_IS_FULLY_SELECTED(mbox)) {
+		/* SELECTing another mailbox - this SORT is still for the
+		   previous selected mailbox. */
+		return;
+	}
+	imapc_search_reply_sort(reply->args, mbox);
+}
+
 static void imapc_untagged_esearch(const struct imapc_untagged_reply *reply,
 				   struct imapc_mailbox *mbox)
 {
@@ -1003,6 +1013,8 @@ void imapc_mailbox_register_callbacks(struct imapc_mailbox *mbox)
 					imapc_untagged_expunge);
 	imapc_mailbox_register_untagged(mbox, "SEARCH",
 					imapc_untagged_search);
+	imapc_mailbox_register_untagged(mbox, "SORT",
+					imapc_untagged_sort);
 	imapc_mailbox_register_untagged(mbox, "ESEARCH",
 					imapc_untagged_esearch);
 	imapc_mailbox_register_resp_text(mbox, "UIDVALIDITY",

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "test-lib.h"
@@ -97,6 +97,7 @@ static void test_program_client_destroy(struct test_client **_client)
 static int
 test_program_input_handle(struct test_client *client, const char *line)
 {
+	const char *tmp_prefix = test_dir_prepend("program-client-unix.");
 	int cmp = -1;
 	const char *arg;
 
@@ -131,7 +132,7 @@ test_program_input_handle(struct test_client *client, const char *line)
 	case CLIENT_STATE_BODY:
 		if (client->os_body == NULL) {
 			client->os_body = iostream_temp_create_named(
-				".dovecot.test.", 0, "test_program_input body");
+				tmp_prefix, 0, "test_program_input body");
 		}
 		if (client->is_body == NULL)
 			client->is_body = i_stream_create_dot(client->in,
@@ -350,7 +351,7 @@ static void test_program_success(void)
 		test_program_io_loop_run();
 
 	test_assert(ret == 1);
-	test_assert(strcmp(str_c(output), "hello world") == 0);
+	test_assert_strcmp(str_c(output), "hello world");
 
 	program_client_destroy(&pc);
 
@@ -384,7 +385,7 @@ static void test_program_io_common(const char *const *args)
 		test_program_io_loop_run();
 
 	test_assert(ret == 1);
-	test_assert(strcmp(str_c(output), pclient_test_io_string) == 0);
+	test_assert_strcmp(str_c(output), pclient_test_io_string);
 
 	program_client_destroy(&pc);
 
@@ -546,6 +547,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	test_dir_init("program-client-net");
 	ret = test_run(tests);
 
 	event_unref(&event);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -739,7 +739,7 @@ static void http_client_peer_drop(struct http_client_peer **_peer)
 
 	if (http_client_peer_shared_start_backoff_timer(pshared)) {
 		e_debug(peer->event,
-			"Dropping peer (waiting for backof timeout)");
+			"Dropping peer (waiting for backoff timeout)");
 
 		/* Will disconnect any pending connections */
 		http_client_peer_trigger_request_handler(peer);

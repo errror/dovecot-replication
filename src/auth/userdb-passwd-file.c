@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "userdb.h"
@@ -59,9 +59,10 @@ passwd_file_add_extra_fields(struct auth_request *request,
 			value = "";
 		}
 		if (request->userdb->set->fields_import_all &&
-		    str_begins(key, "userdb_", &key))
+		    str_begins(key, "userdb_", &key) && key[0] != '\0')
 			auth_request_set_userdb_field(request, key, value);
-		auth_fields_add(pwd_fields, key, value, 0);
+		if (key[0] != '\0')
+			auth_fields_add(pwd_fields, key, value, 0);
 	}
 	if (ret == 0 && auth_request_set_userdb_fields_ex(request, pwd_fields,
 							  db_passwd_file_var_expand_fn) < 0)
@@ -143,16 +144,10 @@ passwd_file_iterate_init(struct auth_request *auth_request,
 	ctx->ctx.context = context;
 	ctx->skip_passdb_entries = !module->pwf->userdb_warn_missing;
 	if (module->pwf->default_file == NULL) {
-		const struct var_expand_params params = {
-			.table = auth_request_get_var_expand_table(auth_request),
-			.providers = auth_request_var_expand_providers,
-			.context = auth_request,
-			.event = authdb_event(auth_request),
-		};
 		const char *error;
 		string_t *dest = t_str_new(32);
-		if (var_expand_program_execute(dest, module->pwf->prog, &params,
-					       &error) < 0) {
+		if (auth_request_var_expand_program_execute(dest,
+				module->pwf->prog, auth_request, &error) < 0) {
 			e_error(authdb_event(auth_request),
 				"passwd-file: User iteration failed: "
 				"Cannot expand '%s': %s", module->pwf->path, error);
@@ -232,6 +227,7 @@ static int passwd_file_iterate_deinit(struct userdb_iterate_context *_ctx)
 
 static int
 passwd_file_preinit(pool_t pool, struct event *event,
+		    const struct userdb_parameters *userdb_params ATTR_UNUSED,
 		    struct userdb_module **module_r, const char **error_r)
 {
 	struct passwd_file_userdb_module *module;

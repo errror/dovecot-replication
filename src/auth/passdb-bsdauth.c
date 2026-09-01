@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
@@ -6,15 +6,12 @@
 #ifdef PASSDB_BSDAUTH
 
 #include "safe-memset.h"
-#include "auth-cache.h"
 #include "ipwd.h"
 #include "mycrypt.h"
 #include "settings.h"
 
 #include <login_cap.h>
 #include <bsd_auth.h>
-
-#define BSDAUTH_CACHE_KEY "%u"
 
 struct passdb_bsdauth_settings {
 	pool_t pool;
@@ -26,7 +23,7 @@ static const struct setting_define passdb_bsdauth_setting_defines[] = {
 	SETTING_DEFINE_LIST_END,
 };
 
-static const struct setting_keyvalue passdb_bsdauth_settings_keyvalue[] = {
+static const struct setting_keyvalue passdb_bsdauth_default_settings_keyvalue[] = {
 	{ "passdb_bsdauth/passdb_use_worker", "yes"},
 	{ NULL, NULL }
 };
@@ -35,7 +32,7 @@ const struct setting_parser_info passdb_bsdauth_setting_parser_info = {
 	.name = "auth_bsdauth",
 
 	.defines = passdb_bsdauth_setting_defines,
-	.default_settings = passdb_bsdauth_settings_keyvalue,
+	.default_settings = passdb_bsdauth_default_settings_keyvalue,
 
 	.struct_size = sizeof(struct passdb_bsdauth_settings),
 	.pool_offset1 = 1 + offsetof(struct passdb_bsdauth_settings, pool),
@@ -91,6 +88,7 @@ bsdauth_verify_plain(struct auth_request *request, const char *password,
 
 static int
 bsdauth_preinit(pool_t pool, struct event *event,
+		const struct passdb_parameters *passdb_params,
 		struct passdb_module **module_r,
 		const char **error_r)
 {
@@ -103,12 +101,13 @@ bsdauth_preinit(pool_t pool, struct event *event,
 			 SETTINGS_GET_FLAG_NO_EXPAND,
 			 &post_set, error_r) < 0)
 		return -1;
-	module->default_cache_key = auth_cache_parse_key_and_fields(
-		pool, BSDAUTH_CACHE_KEY, &post_set->fields, "bsdauth");
+	int ret = passdb_set_cache_key(module, passdb_params, pool,
+				       AUTH_CACHE_KEY_USER, &post_set->fields,
+				       "bsdauth", error_r);
 
 	settings_free(post_set);
 	*module_r = module;
-	return 0;
+	return ret;
 }
 
 static void bsdauth_deinit(struct passdb_module *module ATTR_UNUSED)

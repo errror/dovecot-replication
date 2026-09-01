@@ -16,6 +16,7 @@ struct mail_user;
 struct dict_op_settings;
 
 struct mail_user_vfuncs {
+	uoff_t (*get_mail_max_size)(struct mail_user *user);
 	void (*deinit)(struct mail_user *user);
 	void (*deinit_pre)(struct mail_user *user);
 };
@@ -50,6 +51,7 @@ struct mail_user {
 	const char *session_id;
 	struct mail_user_connection_data conn;
 	const char *auth_mech, *auth_token, *auth_user;
+	pid_t auth_token_session_pid;
 	const char *master_user;
 	const char *const *userdb_fields;
 	const char *const *_alt_usernames;
@@ -234,5 +236,7 @@ mail_user_get_postmaster_smtp(struct mail_user *user,
 	return mail_user_set_get_postmaster_smtp(user->set, address_r,
 						 error_r);
 }
+
+uoff_t mail_user_get_mail_max_size(struct mail_user *user);
 
 #endif

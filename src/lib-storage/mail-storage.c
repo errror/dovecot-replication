@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -8,6 +8,7 @@
 #include "str.h"
 #include "str-parse.h"
 #include "sha1.h"
+#include "unicode-data.h"
 #include "unichar.h"
 #include "hex-binary.h"
 #include "fs-api.h"
@@ -359,7 +360,10 @@ mail_storage_create_list(struct mail_namespace *ns,
 	struct event *set_event = event_create(parent_set_event);
 	/* Lookup storage-specific settings, especially to get
 	   storage-specific defaults for mailbox list settings. */
-	settings_event_add_filter_name(set_event, storage_class->name);
+	settings_event_add_filter_name(set_event,
+				       storage_class->set_filter_name != NULL ?
+				       storage_class->set_filter_name :
+				       storage_class->name);
 	/* Set namespace, but don't overwrite if it already is set.
 	   Shared storage uses the same shared namespace here also for the
 	   user's root prefix="" namespace. */
@@ -1101,13 +1105,14 @@ int mailbox_name_try_get_settings(struct mailbox_list *list, const char *vname,
 struct mailbox *mailbox_alloc(struct mailbox_list *list, const char *vname,
 			      enum mailbox_flags flags)
 {
+	const struct mail_storage_settings *mail_set = list->mail_set;
+	bool nfc = mail_set->mailbox_list_normalize_names_to_nfc;
 	struct mailbox_list *new_list = list;
 	struct mail_storage *storage;
 	struct mailbox *box;
 	enum mail_error open_error = 0;
 	const char *suffix, *errstr = NULL;
-
-	i_assert(uni_utf8_str_is_valid(vname));
+	int ret;
 
 	if (str_begins_icase(vname, "INBOX", &suffix) &&
 	    !str_begins_with(vname, "INBOX")) {
@@ -1132,8 +1137,19 @@ struct mailbox *mailbox_alloc(struct mailbox_list *list, const char *vname,
 	}
 
 	T_BEGIN {
+		const char *vname_raw = vname;
+		bool mailbox_name_changed_by_nfc = FALSE;
+
+		if (nfc && HAS_NO_BITS(flags, MAILBOX_FLAG_RAW_NAME)) {
+			ret = uni_utf8_to_nfc(vname, strlen(vname), &vname);
+			i_assert(ret >= 0);
+			mailbox_name_changed_by_nfc =
+				(strcmp(vname_raw, vname) != 0);
+		}
+
 		const char *error, *orig_vname = vname;
 		enum mailbox_list_get_storage_flags storage_flags = 0;
+		bool mailbox_not_original = FALSE;
 		int ret;
 
 		if ((flags & MAILBOX_FLAG_SAVEONLY) != 0)
@@ -1144,6 +1160,32 @@ struct mailbox *mailbox_alloc(struct mailbox_list *list, const char *vname,
 			storage = mail_namespace_get_default_storage(list->ns);
 			errstr = mailbox_list_get_last_error(new_list, &open_error);
 			errstr = t_strdup(errstr);
+		} else if (strcmp(orig_vname, vname) != 0) {
+			mailbox_not_original = TRUE;
+
+			vname_raw = orig_vname;
+			if (nfc && HAS_NO_BITS(flags, MAILBOX_FLAG_RAW_NAME)) {
+				ret = uni_utf8_to_nfc(vname, strlen(vname), &vname);
+				i_assert(ret >= 0);
+				mailbox_name_changed_by_nfc =
+					(strcmp(vname_raw, vname) != 0);
+			}
+		}
+
+		if ((new_list->ns->flags & NAMESPACE_FLAG_INBOX_ANY) != 0 &&
+		    new_list->ns->type == MAIL_NAMESPACE_TYPE_SHARED &&
+		    str_begins(vname, new_list->ns->prefix, &suffix) &&
+		    strcasecmp(suffix, "INBOX") == 0 &&
+		    strcmp(suffix, "INBOX") != 0) {
+			/* Accessing INBOX explicitly in a shared namespace -
+			   convert to uppercase. This is done regardless of the
+			   mail_shared_explicit_inbox setting, since even with
+			   "no" adding INBOX to the namespace prefix accesses
+			   the same INBOX. When accessing the shared INBOX
+			   as the namespace prefix, the uppercase INBOX is
+			   appended when getting the storage_name in mailbox
+			   list code. */
+			vname = t_strconcat(new_list->ns->prefix, "INBOX", NULL);
 		}
 
 		box = storage->v.mailbox_alloc(storage, new_list, vname, flags);
@@ -1162,8 +1204,12 @@ struct mailbox *mailbox_alloc(struct mailbox_list *list, const char *vname,
 				box->open_error = box->storage->error;
 			}
 		}
-		if (strcmp(orig_vname, vname) != 0)
-			box->mailbox_not_original = TRUE;
+		if (vname_raw == vname || strcmp(vname_raw, vname) == 0)
+			box->vname_raw = box->vname;
+		else
+			box->vname_raw = p_strdup(box->pool, vname_raw);
+		box->mailbox_not_original = mailbox_not_original;
+		box->mailbox_name_changed_by_nfc = mailbox_name_changed_by_nfc;
 		hook_mailbox_allocated(box);
 	} T_END;
 
@@ -1376,16 +1422,12 @@ bool mailbox_is_autocreated(struct mailbox *box)
 {
 	if (box->inbox_user)
 		return TRUE;
-	if ((box->flags & MAILBOX_FLAG_AUTO_CREATE) != 0)
-		return TRUE;
 	return box->set != NULL &&
 		strcmp(box->set->autocreate, MAILBOX_SET_AUTO_NO) != 0;
 }
 
 bool mailbox_is_autosubscribed(struct mailbox *box)
 {
-	if ((box->flags & MAILBOX_FLAG_AUTO_SUBSCRIBE) != 0)
-		return TRUE;
 	return box->set != NULL &&
 		strcmp(box->set->autocreate, MAILBOX_SET_AUTO_SUBSCRIBE) == 0;
 }
@@ -1435,6 +1477,133 @@ static int mailbox_autocreate_and_reopen(struct mailbox *box)
 			mailbox_get_last_internal_error(box, NULL));
 	}
 	return ret;
+}
+
+static void
+mailbox_vname_normalize_ns_prefix_nfc(struct mailbox_list *list,
+				      const char **vname)
+{
+	struct mail_namespace *ns = list->ns;
+
+	if (*ns->prefix == '\0')
+		return;
+
+	/* Find the prefix in the raw name by splitting it at the expected
+	   separator. */
+
+	char sep = mail_namespace_get_sep(ns);
+	int seps_in_ns_prefix = 0;
+	const char *p = ns->prefix, *p_sep;
+
+	while ((p = strchr(p, sep)) != NULL) {
+		seps_in_ns_prefix++;
+		p++;
+	}
+
+	p = *vname;
+	while ((p_sep = strchr(p, sep)) != NULL && seps_in_ns_prefix > 0) {
+		seps_in_ns_prefix--;
+		p = p_sep + 1;
+	}
+	i_assert(seps_in_ns_prefix == 0);
+
+	/* Normalize the prefix */
+
+	string_t *str = t_str_new(128);
+	int ret;
+
+	ret = uni_utf8_write_nfc(*vname, p - *vname, str);
+	i_assert(ret >= 0);
+	str_append(str, p);
+
+	*vname = str_c(str);
+}
+
+bool mailbox_was_vname_changed_by_nfc(struct mailbox *box,
+				      const char **orig_vname_r)
+{
+	if (!box->mailbox_name_changed_by_nfc)
+		return FALSE;
+	if (orig_vname_r != NULL)
+		*orig_vname_r = box->vname_raw;
+	return TRUE;
+}
+
+void mailbox_suppress_nfc_name_change_notification(struct mailbox *box)
+{
+	box->notifying_nfc_name_change = TRUE;
+}
+
+int mailbox_rename_nfc_forced(struct mailbox_list *list, const char *vname_raw,
+			      const char *vname_nfc, const char **vname_new_r,
+			      const char **error_r)
+{
+	struct mailbox *box_old, *box_new;
+	int ret;
+
+	mailbox_vname_normalize_ns_prefix_nfc(list, &vname_raw);
+	*vname_new_r = vname_nfc;
+	if (strcmp(vname_raw, vname_nfc) == 0) {
+		/* Only namespace prefix was not NFC */
+		return 0;
+	}
+	box_old = mailbox_alloc(list, vname_raw, (MAILBOX_FLAG_RAW_NAME |
+						  MAILBOX_FLAG_IGNORE_ACLS));
+	box_old->notifying_nfc_name_change = TRUE;
+	box_new = mailbox_alloc(list, vname_nfc, MAILBOX_FLAG_RAW_NAME);
+	box_new->skip_create_name_restrictions = TRUE;
+	box_new->notifying_nfc_name_change = TRUE;
+
+	ret = mailbox_rename(box_old, box_new);
+	if (ret < 0 &&
+	    mailbox_get_last_mail_error(box_old) == MAIL_ERROR_NOTFOUND) {
+		/* ignore */
+		ret = 0;
+	} else if (ret < 0 &&
+		   mailbox_get_last_mail_error(box_old) == MAIL_ERROR_EXISTS) {
+		/* generate a new unique name */
+		guid_128_t guid;
+		guid_128_generate(guid);
+
+		*vname_new_r = t_strdup_printf("%s-%s", vname_nfc,
+					       guid_128_to_string(guid));
+		mailbox_free(&box_new);
+		box_new = mailbox_alloc(list, *vname_new_r, 0);
+		ret = mailbox_rename(box_old, box_new);
+	}
+	if (ret < 0)
+		*error_r = mailbox_get_last_error(box_old, NULL);
+	mailbox_free(&box_old);
+	mailbox_free(&box_new);
+
+	return (ret == 0 ? 1 : ret);
+}
+
+static int mailbox_nfc_normalize(struct mailbox *box)
+{
+	const char *vname, *error;
+	int ret;
+
+	ret = mailbox_rename_nfc_forced(box->list, box->vname_raw, box->vname,
+					&vname, &error);
+	if (ret < 0) {
+		mailbox_set_critical(box,
+			"Failed to rename mailbox for NFC normalization: %s",
+			error);
+		return -1;
+	}
+	if (ret == 0)
+		return 0;
+	if (strcmp(box->vname, vname) == 0) {
+		e_debug(box->event, "Mailbox renamed for NFC normalization");
+	} else {
+		box->vname = p_strdup(box->pool, vname);
+		e_debug(box->event,
+			"Mailbox renamed to %s for NFC normalization "
+			"(mailbox with NFC normalized name existed already)",
+			box->vname);
+	}
+	return 1;
 }
 
 static bool
@@ -1586,8 +1755,22 @@ static int mailbox_verify_existing_name_int(struct mailbox *box)
 	/* Make sure box->_path is set, so mailbox_get_path() works from
 	   now on. Note that this may also fail with some backends if the
 	   mailbox doesn't exist. */
-	if (mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_MAILBOX, &path) < 0) {
+	int ret = mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_MAILBOX, &path);
+	if (ret < 0 && box->storage->error == MAIL_ERROR_NOTFOUND &&
+	    box->mailbox_name_changed_by_nfc) {
+		ret = mailbox_nfc_normalize(box);
+		if (ret == 0) {
+			i_assert(box->storage->error == MAIL_ERROR_NOTFOUND);
+			ret = -1;
+		} else {
+			ret = mailbox_get_path_to(box,
+				MAILBOX_LIST_PATH_TYPE_MAILBOX, &path);
+		}
+	}
+
+	if (ret < 0) {
 		if (box->storage->error != MAIL_ERROR_NOTFOUND ||
+		    HAS_ANY_BITS(box->flags, MAILBOX_FLAG_NO_AUTOCREATE) ||
 		    !mailbox_is_autocreated(box))
 			return -1;
 		/* if this is an autocreated mailbox, create it now */
@@ -1610,15 +1793,53 @@ static int mailbox_verify_existing_name(struct mailbox *box)
 	return ret;
 }
 
-static bool mailbox_name_has_control_chars(const char *name)
+static int
+mailbox_name_check_forbidden_chars(const char *name, const char **error_r)
 {
-	const char *p;
+	const unsigned char *input = (const unsigned char *)name;
+	size_t size = strlen(name);
 
-	for (p = name; *p != '\0'; p++) {
-		if ((unsigned char)*p < ' ')
-			return TRUE;
+	/* RFC 9755, Section 3:
+
+	   Mailbox names MUST comply with the Net-Unicode Definition ([RFC5198],
+	   Section 2) with the specific exception that they MUST NOT contain
+	   control characters (U+0000 - U+001F and U+0080 - U+009F), a delete
+	   character (U+007F), a line separator (U+2028), or a paragraph
+	   separator (U+2029).
+
+	   RFC 5198, Section 2:
+
+	   5.  As suggested in Section 6 of RFC 3629, the Byte Order Mark
+	       ("BOM") signature MUST NOT appear at the beginning of these text
+	       strings.
+
+	   6.  Systems conforming to this specification MUST NOT transmit any
+	       string containing any code point that is unassigned in the
+	       version of Unicode on which they are dependent.  The version of
+	       NFC and the version of Unicode used by that system MUST be
+	       consistent.
+	 */
+
+	while (size > 0) {
+		unichar_t chr;
+		int bytes;
+
+		bytes = uni_utf8_get_char_n(input, size, &chr);
+		i_assert(bytes > 0); /* UTF8 already checked */
+		input += bytes;
+		size -= bytes;
+
+		if (chr <= 0x1f || chr == 0x7f ||
+		    (chr >= 0x0080 && chr <= 0x009f) ||
+		    chr == 0x2028 || chr == 0x2029 || chr == 0xFEFF ||
+		    !unicode_code_point_is_assigned(chr)) {
+			*error_r = t_strdup_printf(
+				"New mailbox name contains forbidden character "
+				"(U+%04X)", chr);
+			return -1;
+		}
 	}
-	return FALSE;
+	return 0;
 }
 
 void mailbox_skip_create_name_restrictions(struct mailbox *box, bool set)
@@ -1628,6 +1849,8 @@ void mailbox_skip_create_name_restrictions(struct mailbox *box, bool set)
 
 int mailbox_verify_create_name(struct mailbox *box)
 {
+	const char *error;
+
 	/* mailbox_alloc() already checks that vname is valid UTF8,
 	   so we don't need to verify that.
 
@@ -1637,9 +1860,8 @@ int mailbox_verify_create_name(struct mailbox *box)
 		return -1;
 	if (box->skip_create_name_restrictions)
 		return 0;
-	if (mailbox_name_has_control_chars(box->vname)) {
-		mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS,
-			"Control characters not allowed in new mailbox names");
+	if (mailbox_name_check_forbidden_chars(box->vname, &error) < 0) {
+		mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS, error);
 		return -1;
 	}
 	if (strlen(box->vname) > MAILBOX_LIST_NAME_MAX_LENGTH) {
@@ -1715,6 +1937,15 @@ int mailbox_exists(struct mailbox *box, bool auto_boxes,
 	T_BEGIN {
 		ret = box->v.exists(box, auto_boxes, existence_r);
 	} T_END;
+	if (ret == 0 && *existence_r == MAILBOX_EXISTENCE_NONE &&
+	    box->mailbox_name_changed_by_nfc) {
+		const char *nfc_vname = box->vname;
+		box->vname = box->vname_raw;
+		T_BEGIN {
+			ret = box->v.exists(box, auto_boxes, existence_r);
+		} T_END;
+		box->vname = nfc_vname;
+	}
 	if (ret < 0)
 		return -1;
 
@@ -1736,6 +1967,8 @@ int mailbox_exists(struct mailbox *box, bool auto_boxes,
 static int ATTR_NULL(2)
 mailbox_open_full(struct mailbox *box, struct istream *input)
 {
+	struct mail_storage *storage = box->storage;
+	bool notifying_nfc_name_change = box->notifying_nfc_name_change;
 	int ret;
 
 	if (box->opened)
@@ -1746,20 +1979,29 @@ mailbox_open_full(struct mailbox *box, struct istream *input)
 		e_debug(box->event, "Mailbox opened");
 		break;
 	case MAIL_ERROR_NOTFOUND:
-		mail_storage_set_error(box->storage, MAIL_ERROR_NOTFOUND,
+		mail_storage_set_error(storage, MAIL_ERROR_NOTFOUND,
 			T_MAIL_ERR_MAILBOX_NOT_FOUND(box->vname));
 		return -1;
 	default:
-		mail_storage_set_internal_error(box->storage);
-		box->storage->error = box->open_error;
+		mail_storage_set_internal_error(storage);
+		storage->error = box->open_error;
 		return -1;
 	}
 
-	if (mailbox_verify_existing_name(box) < 0)
+	ret = mailbox_verify_existing_name(box);
+	if (ret < 0 && storage->error == MAIL_ERROR_NOTFOUND &&
+	    box->mailbox_name_changed_by_nfc) {
+		ret = mailbox_nfc_normalize(box);
+		if (ret == 0) {
+			i_assert(storage->error == MAIL_ERROR_NOTFOUND);
+			ret = -1;
+		}
+	}
+	if (ret < 0)
 		return -1;
 
 	if (input != NULL) {
-		if ((box->storage->class_flags &
+		if ((storage->class_flags &
 		     MAIL_STORAGE_CLASS_FLAG_OPEN_STREAMS) == 0) {
 			mailbox_set_critical(box,
 				"Storage doesn't support streamed mailboxes");
@@ -1770,9 +2012,23 @@ mailbox_open_full(struct mailbox *box, struct istream *input)
 		i_stream_ref(box->input);
 	}
 
+	box->notifying_nfc_name_change = TRUE;
 	ret = box->v.open(box);
-	if (ret < 0 && box->storage->error == MAIL_ERROR_NOTFOUND &&
+	if (ret < 0 && storage->error == MAIL_ERROR_NOTFOUND &&
+	    box->mailbox_name_changed_by_nfc) {
+		ret = mailbox_nfc_normalize(box);
+		if (ret == 0) {
+			i_assert(storage->error == MAIL_ERROR_NOTFOUND);
+			ret = -1;
+		}
+		if (ret > 0) {
+			mailbox_close(box);
+			ret = box->v.open(box);
+		}
+	}
+	if (ret < 0 && storage->error == MAIL_ERROR_NOTFOUND &&
 	    !box->deleting && !box->creating &&
+	    HAS_NO_BITS(box->flags, MAILBOX_FLAG_NO_AUTOCREATE) &&
 	    box->input == NULL && mailbox_is_autocreated(box)) T_BEGIN {
 		ret = mailbox_autocreate_and_reopen(box);
 	} T_END;
@@ -1780,9 +2036,19 @@ mailbox_open_full(struct mailbox *box, struct istream *input)
 	if (ret < 0) {
 		if (box->input != NULL)
 			i_stream_unref(&box->input);
+		box->notifying_nfc_name_change = notifying_nfc_name_change;
 		return -1;
 	}
 
+	/* Always notify an NFC normalization rename, even when the physical
+	   rename happened in the past. */
+	if (!notifying_nfc_name_change && box->mailbox_name_changed_by_nfc &&
+	    storage->callbacks.notify_mailbox_implicit_rename != NULL) {
+		storage->callbacks.notify_mailbox_implicit_rename(
+			box, box->vname_raw, storage->callback_context);
+	}
+
+	box->notifying_nfc_name_change = notifying_nfc_name_change;
 	box->list->ns->flags |= NAMESPACE_FLAG_USABLE;
 	return 0;
 }
@@ -1798,6 +2064,12 @@ static bool mailbox_try_undelete(struct mailbox *box)
 		   a loop: mdbox storage rebuild -> mailbox_open() ->
 		   mailbox_mark_index_deleted() -> mailbox_sync() ->
 		   mdbox storage rebuild. */
+		return FALSE;
+	}
+	if (box->index == NULL) {
+		/* mailbox_open() failed before the index was opened (e.g. the
+		   backend's delete failed and we're reverting the deletion).
+		   There's nothing to undelete. */
 		return FALSE;
 	}
 	if (mail_index_get_modification_time(box->index, &mtime) < 0)
@@ -2025,6 +2297,8 @@ static void mailbox_copy_cache_decisions_from_inbox(struct mailbox *box)
 int mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 		   bool directory)
 {
+	struct mail_storage *storage = box->storage;
+	bool notifying_nfc_name_change = box->notifying_nfc_name_change;
 	int ret;
 
 	if (mailbox_verify_create_name(box) < 0)
@@ -2044,6 +2318,7 @@ int mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 		return -1;
 	}
 	box->creating = TRUE;
+	box->notifying_nfc_name_change = TRUE;
 	if ((box->list->props & MAILBOX_LIST_PROP_NO_NOSELECT) != 0) {
 		/* Layout doesn't support creating \NoSelect mailboxes.
 		   Switch to creating a selectable mailbox */
@@ -2060,6 +2335,12 @@ int mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 		if (!box->inbox_any) T_BEGIN {
 			mailbox_copy_cache_decisions_from_inbox(box);
 		} T_END;
+		/* Notify NFC normalization */
+		if (!notifying_nfc_name_change && box->mailbox_name_changed_by_nfc &&
+		    storage->callbacks.notify_mailbox_implicit_rename != NULL) {
+			storage->callbacks.notify_mailbox_implicit_rename(
+				box, box->vname_raw, storage->callback_context);
+		}
 	} else if (box->opened) {
 		/* Creation failed after (partially) opening the mailbox.
 		   It may not be in a valid state, so close it. */
@@ -2067,6 +2348,7 @@ int mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 		mailbox_close(box);
 		mail_storage_last_error_pop(box->storage);
 	}
+	box->notifying_nfc_name_change = notifying_nfc_name_change;
 	event_reason_end(&reason);
 	return ret;
 }
@@ -2323,6 +2605,8 @@ int mailbox_rename_check_children(struct mailbox *src, struct mailbox *dest)
 static int mailbox_rename_real(struct mailbox *src, struct mailbox *dest)
 {
 	const char *error = NULL;
+	bool src_notifying_nfc_name_change = src->notifying_nfc_name_change;
+	bool dest_notifying_nfc_name_change = dest->notifying_nfc_name_change;
 
 	/* Check only name validity, \Noselect don't necessarily exist. */
 	if (mailbox_verify_name(src) < 0)
@@ -2371,10 +2655,45 @@ static int mailbox_rename_real(struct mailbox *src, struct mailbox *dest)
 		mail_storage_copy_list_error(src->storage, dest->list);
 		return -1;
 	}
+
+	/* Make sure nested calls don't repeat notification of NFC
+	   normalization. */
+	src->notifying_nfc_name_change = TRUE;
+	dest->notifying_nfc_name_change = TRUE;
+
 	int ret = src->v.rename_box(src, dest);
+	if (ret < 0 && src->storage->error == MAIL_ERROR_NOTFOUND &&
+	    src->mailbox_name_changed_by_nfc) {
+		ret = mailbox_nfc_normalize(src);
+		if (ret >= 0)
+			ret = src->v.rename_box(src, dest);
+	}
 	mailbox_list_unlock(dest->list);
-	if (ret < 0)
+	if (ret < 0) {
+		src->notifying_nfc_name_change = src_notifying_nfc_name_change;
+		dest->notifying_nfc_name_change = dest_notifying_nfc_name_change;
 		return -1;
+	}
+
+	/* Always notify an NFC normalization rename, even when the physical
+	   rename happened in the past. However, don't send the notification
+	   here when this is a nested call. */
+	if (!src_notifying_nfc_name_change &&
+	    src->mailbox_name_changed_by_nfc &&
+	    src->storage->callbacks.notify_mailbox_implicit_rename != NULL) {
+		src->storage->callbacks.notify_mailbox_implicit_rename(
+			src, src->vname_raw, src->storage->callback_context);
+	}
+	if (!dest_notifying_nfc_name_change &&
+	    dest->mailbox_name_changed_by_nfc &&
+	    dest->storage->callbacks.notify_mailbox_implicit_rename != NULL) {
+		dest->storage->callbacks.notify_mailbox_implicit_rename(
+			dest, dest->vname_raw, dest->storage->callback_context);
+	}
+
+	src->notifying_nfc_name_change = src_notifying_nfc_name_change;
+	dest->notifying_nfc_name_change = dest_notifying_nfc_name_change;
+
 	src->list->guid_cache_invalidated = TRUE;
 	dest->list->guid_cache_invalidated = TRUE;
 	return 0;
@@ -3442,12 +3761,10 @@ int mailbox_mkdir(struct mailbox *box, const char *path,
 		  enum mailbox_list_path_type type)
 {
 	const struct mailbox_permissions *perm = mailbox_get_permissions(box);
-	const char *root_dir;
 
 	if (!perm->gid_origin_is_mailbox_path) {
 		/* mailbox root directory doesn't exist, create it */
-		root_dir = mailbox_list_get_root_forced(box->list, type);
-		if (mailbox_list_mkdir_root(box->list, root_dir, type) < 0) {
+		if (mailbox_list_mkdir_root(box->list, NULL, type) < 0) {
 			mail_storage_copy_list_error(box->storage, box->list);
 			return -1;
 		}
@@ -3718,10 +4035,18 @@ int mailbox_lock_file_create(struct mailbox *box, const char *lock_fname,
 		   be too large as a filename and creating the full directory
 		   structure would be pretty troublesome. It would also make
 		   it more difficult to perform the automated deletion of empty
-		   lock directories. */
+		   lock directories.
+		   The SHA1 is calculated from the namespace prefix concatenated
+		   with the mailbox name (prefix first, then name) to avoid
+		   collisions when multiple namespaces share the same
+		   mail_volatile_path. */
 		str_printfa(str, "%s/%s.", box->list->mail_set->mail_volatile_path,
 			    lock_fname);
-		sha1_get_digest(box->name, strlen(box->name), box_name_sha1);
+		struct sha1_ctxt ctx;
+		sha1_init(&ctx);
+		sha1_loop(&ctx, box->list->ns->prefix, box->list->ns->prefix_len);
+		sha1_loop(&ctx, box->name, strlen(box->name));
+		sha1_result(&ctx, box_name_sha1);
 		binary_to_hex_append(str, box_name_sha1, sizeof(box_name_sha1));
 		lock_path = str_c(str);
 		set.mkdir_mode = 0700;

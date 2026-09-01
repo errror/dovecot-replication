@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "mailbox-list-fs.h"
@@ -80,6 +80,7 @@ list_is_maildir_mailbox(struct mailbox_list *list, const char *dir,
 		if (mailbox_files) {
 			*flags_r |= st.st_nlink == 2 ?
 				MAILBOX_NOCHILDREN : MAILBOX_CHILDREN;
+			*flags_r |= MAILBOX_SELECT;
 		} else {
 			*flags_r |= MAILBOX_NOSELECT | MAILBOX_CHILDREN;
 		}
@@ -89,8 +90,8 @@ list_is_maildir_mailbox(struct mailbox_list *list, const char *dir,
 			*flags_r |= MAILBOX_NOCHILDREN;
 		else
 			*flags_r |= MAILBOX_CHILDREN;
+		*flags_r |= MAILBOX_SELECT;
 	}
-	*flags_r |= MAILBOX_SELECT;
 	return 1;
 }
 

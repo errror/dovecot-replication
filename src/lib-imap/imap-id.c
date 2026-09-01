@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -12,7 +12,9 @@
 /* Limit the allowed characters that an IMAP ID parameter might have. */
 #define IMAP_ID_KEY_ACCEPT_CHARS "abcdefghijklmnopqrstuvwxyz0123456789_-"
 
-const char *imap_id_reply_generate(const ARRAY_TYPE(const_string) *args)
+const char *
+imap_id_reply_generate(const ARRAY_TYPE(const_string) *args,
+		       enum imap_quote_flags qflags)
 {
 	if (array_is_empty(args))
 		return "NIL";
@@ -24,7 +26,7 @@ const char *imap_id_reply_generate(const ARRAY_TYPE(const_string) *args)
 	for (unsigned int i = 0; i < count; i += 2) {
 		if (i > 0)
 			str_append_c(str, ' ');
-		imap_append_quoted(str, kv[i]);
+		imap_append_quoted(str, kv[i], 0);
 		str_append_c(str, ' ');
 		const char *value = kv[i + 1];
 #if defined(DOVECOT_EDITION)
@@ -32,7 +34,7 @@ const char *imap_id_reply_generate(const ARRAY_TYPE(const_string) *args)
 		    strcmp(DOVECOT_EDITION, "Pro") == 0)
 			value = DOVECOT_NAME;
 #endif
-		imap_append_nstring(str, value);
+		imap_append_nstring(str, value, qflags);
 	}
 	str_append_c(str, ')');
 	return str_c(str);

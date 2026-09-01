@@ -5,6 +5,8 @@ struct db_oauth2;
 struct oauth2_request;
 struct db_oauth2_request;
 
+#include "passdb.h"
+
 struct auth_oauth2_settings {
 	pool_t pool;
 	/* tokeninfo endpoint, format https://endpoint/somewhere?token= */
@@ -15,6 +17,8 @@ struct auth_oauth2_settings {
 	const char *introspection_url;
 	/* expected scope(s), optional */
 	ARRAY_TYPE(const_string) scope;
+	/* expected audience(s) (aud claim), optional */
+	ARRAY_TYPE(const_string) audience;
 	/* mode of introspection, one of auth, get, post, local
 	   - auth: send token with header Authorization: Bearer token
 	   - get: append token to url
@@ -42,6 +46,10 @@ struct auth_oauth2_settings {
 	   https://datatracker.ietf.org/doc/html/rfc7628#section-3.2.2
 	*/
 	const char *openid_configuration_url;
+
+	/* How many seconds after token expiration is it still allowed to
+	   succeed the authentication. */
+	unsigned int token_expire_grace_secs;
 
 	/* Should introspection be done even if not necessary */
 	bool force_introspection;
@@ -86,6 +94,7 @@ int db_oauth2_init(struct event *event, bool use_grant_password, struct db_oauth
 bool db_oauth2_use_worker(const struct db_oauth2 *db);
 
 const char *db_oauth2_get_openid_configuration_url(const struct db_oauth2 *db);
+const char *db_oauth2_get_scope(const struct db_oauth2 *db);
 
 void db_oauth2_lookup(struct db_oauth2 *db, struct db_oauth2_request *req, const char *token, struct auth_request *request, db_oauth2_lookup_callback_t *callback, void *context);
 #define db_oauth2_lookup(db, req, token, request, callback, context) \

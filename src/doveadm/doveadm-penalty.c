@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,7 +7,7 @@
 #include "hash.h"
 #include "strescape.h"
 #include "time-util.h"
-#include "master-service.h"
+#include "version.h"
 #include "doveadm.h"
 #include "doveadm-print.h"
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "common.h"
 #include "array.h"
@@ -11,6 +11,7 @@
 #include "connection.h"
 #include "str.h"
 #include "strescape.h"
+#include "version.h"
 #include "master-service.h"
 #include "master-interface.h"
 #include "connect-limit.h"
@@ -49,8 +50,8 @@ struct anvil_connection {
 	struct ostream *cmd_output;
 	struct io *cmd_io;
 
+	enum anvil_connection_type conn_type;
 	char *service;
-	bool master:1;
 	bool fifo:1;
 	bool added_to_hash:1;
 };
@@ -381,181 +382,297 @@ kick_alt_user(struct anvil_connection *conn,
 }
 
 static int
+anvil_cmd_connect(struct anvil_connection *conn ATTR_UNUSED,
+		  const char *const *args, const char **error_r)
+{
+	guid_128_t conn_guid;
+	struct connect_limit_key key;
+	pid_t pid;
+
+	if (args[0] == NULL || args[1] == NULL) {
+		*error_r = "CONNECT: Not enough parameters";
+		return -1;
+	}
+	if (guid_128_from_string(args[0], conn_guid) < 0) {
+		*error_r = "CONNECT: Invalid conn-guid";
+		return -1;
+	}
+	args++;
+	if (str_to_pid(args[0], &pid) < 0) {
+		*error_r = "CONNECT: Invalid pid";
+		return -1;
+	}
+	args++;
+	if (!connect_limit_key_parse(&args, &key)) {
+		*error_r = "CONNECT: Invalid ident string";
+		return -1;
+	}
+	/* extra parameters: */
+	enum kick_type kick_type = KICK_TYPE_NONE;
+	if (args[0] != NULL) {
+		if (str_to_kick_type(args[0], &kick_type) < 0) {
+			*error_r = "CONNECT: Invalid kick_type";
+			return -1;
+		}
+		args++;
+	}
+	struct ip_addr dest_ip;
+	i_zero(&dest_ip);
+	if (args[0] != NULL) {
+		if (args[0][0] != '\0' &&
+		    net_addr2ip(args[0], &dest_ip) < 0) {
+			*error_r = "CONNECT: Invalid dest_ip";
+			return -1;
+		}
+		args++;
+	}
+	const char *const *alt_usernames = NULL;
+	if (args[0] != NULL) {
+		alt_usernames = t_strsplit_tabescaped(args[0]);
+		args++;
+	}
+	connect_limit_connect(connect_limit, pid, &key,
+			      conn_guid, kick_type, &dest_ip,
+			      alt_usernames);
+	return 0;
+}
+
+static int
+anvil_cmd_disconnect(struct anvil_connection *conn ATTR_UNUSED,
+		     const char *const *args, const char **error_r)
+{
+	guid_128_t conn_guid;
+	struct connect_limit_key key;
+	pid_t pid;
+
+	if (args[0] == NULL || args[1] == NULL) {
+		*error_r = "DISCONNECT: Not enough parameters";
+		return -1;
+	}
+	if (guid_128_from_string(args[0], conn_guid) < 0) {
+		*error_r = "DISCONNECT: Invalid conn-guid";
+		return -1;
+	}
+	args++;
+	if (str_to_pid(args[0], &pid) < 0) {
+		*error_r = "DISCONNECT: Invalid pid";
+		return -1;
+	}
+	args++;
+	if (!connect_limit_key_parse(&args, &key)) {
+		*error_r = "DISCONNECT: Invalid ident string";
+		return -1;
+	}
+	connect_limit_disconnect(connect_limit, pid, &key, conn_guid);
+	return 0;
+}
+
+static int
+anvil_cmd_connect_dump(struct anvil_connection *conn,
+		       const char *const *args ATTR_UNUSED,
+		       const char **error_r ATTR_UNUSED)
+{
+	anvil_global_connect_dump_count++;
+	connect_limit_dump(connect_limit, conn->conn.output);
+	return 0;
+}
+
+static int
+anvil_cmd_kick_user(struct anvil_connection *conn,
+		    const char *const *args, const char **error_r)
+{
+	guid_128_t conn_guid;
+
+	if (args[0] == NULL) {
+		*error_r = "KICK-USER: Not enough parameters";
+		return -1;
+	}
+	if (args[1] == NULL)
+		guid_128_empty(conn_guid);
+	else if (guid_128_from_string(args[1], conn_guid) < 0) {
+		*error_r = "KICK-USER: Invalid conn-guid";
+		return -1;
+	}
+	kick_user(conn, args[0], conn_guid);
+	return 0;
+}
+
+static int
+anvil_cmd_kick_alt_user(struct anvil_connection *conn,
+			const char *const *args, const char **error_r)
+{
+	struct ip_addr except_ip;
+
+	if (args[0] == NULL || args[1] == NULL) {
+		*error_r = "KICK-ALT-USER: Not enough parameters";
+		return -1;
+	}
+	if (args[2] == NULL)
+		i_zero(&except_ip);
+	else if (net_addr2ip(args[2], &except_ip) < 0) {
+		*error_r = "KICK-ALT-USER: Invalid except_ip parameter";
+		return -1;
+	}
+	kick_alt_user(conn, args[0], args[1],
+		      except_ip.family == 0 ? NULL : &except_ip);
+	return 0;
+}
+
+static int
+anvil_cmd_kill(struct anvil_connection *conn ATTR_UNUSED,
+	       const char *const *args, const char **error_r)
+{
+	pid_t pid;
+
+	if (args[0] == NULL) {
+		*error_r = "KILL: Not enough parameters";
+		return -1;
+	}
+	if (str_to_pid(args[0], &pid) < 0) {
+		*error_r = "KILL: Invalid pid";
+		return -1;
+	}
+	connect_limit_disconnect_pid(connect_limit, pid);
+	return 0;
+}
+
+static int
+anvil_cmd_lookup(struct anvil_connection *conn,
+		 const char *const *args, const char **error_r)
+{
+	struct connect_limit_key key;
+	unsigned int value;
+
+	if (args[0] == NULL) {
+		*error_r = "LOOKUP: Not enough parameters";
+		return -1;
+	}
+	if (!connect_limit_key_parse(&args, &key)) {
+		*error_r = "LOOKUP: Invalid ident string";
+		return -1;
+	}
+	if (conn->conn.output == NULL) {
+		*error_r = "LOOKUP on a FIFO, can't send reply";
+		return -1;
+	}
+	value = connect_limit_lookup(connect_limit, &key);
+	o_stream_nsend_str(conn->conn.output,
+			   t_strdup_printf("%u\n", value));
+	return 0;
+}
+
+static int
+anvil_cmd_penalty_get(struct anvil_connection *conn,
+		      const char *const *args, const char **error_r)
+{
+	unsigned int value;
+	time_t stamp;
+
+	if (args[0] == NULL) {
+		*error_r = "PENALTY-GET: Not enough parameters";
+		return -1;
+	}
+	value = penalty_get(penalty, args[0], &stamp);
+	o_stream_nsend_str(conn->conn.output,
+		t_strdup_printf("%u %s\n", value, dec2str(stamp)));
+	return 0;
+}
+
+static int
+anvil_cmd_penalty_inc(struct anvil_connection *conn ATTR_UNUSED,
+		      const char *const *args, const char **error_r)
+{
+	unsigned int value, checksum;
+
+	if (args[0] == NULL || args[1] == NULL || args[2] == NULL) {
+		*error_r = "PENALTY-INC: Not enough parameters";
+		return -1;
+	}
+	if (str_to_uint(args[1], &checksum) < 0 ||
+	    str_to_uint(args[2], &value) < 0 ||
+	    value > PENALTY_MAX_VALUE ||
+	    (value == 0 && checksum != 0)) {
+		*error_r = "PENALTY-INC: Invalid parameters";
+		return -1;
+	}
+	penalty_inc(penalty, args[0], checksum, value);
+	return 0;
+}
+
+static int
+anvil_cmd_penalty_set_expire_secs(struct anvil_connection *conn ATTR_UNUSED,
+				  const char *const *args,
+				  const char **error_r)
+{
+	unsigned int value;
+
+	if (args[0] == NULL || str_to_uint(args[0], &value) < 0) {
+		*error_r = "PENALTY-SET-EXPIRE-SECS: Invalid parameters";
+		return -1;
+	}
+	penalty_set_expire_secs(penalty, value);
+	return 0;
+}
+
+static int
+anvil_cmd_penalty_dump(struct anvil_connection *conn,
+		       const char *const *args ATTR_UNUSED,
+		       const char **error_r ATTR_UNUSED)
+{
+	penalty_dump(penalty, conn->conn.output);
+	return 0;
+}
+
+struct anvil_command {
+	const char *name;
+	enum anvil_connection_type allowed_type;
+	int (*handler)(struct anvil_connection *conn,
+		       const char *const *args, const char **error_r);
+};
+
+static const struct anvil_command anvil_commands[] = {
+	{ "CONNECT", ANVIL_CONNECTION_TYPE_SHARED_FIFO, anvil_cmd_connect },
+	{ "DISCONNECT", ANVIL_CONNECTION_TYPE_SHARED_FIFO, anvil_cmd_disconnect },
+	{ "KILL", ANVIL_CONNECTION_TYPE_SHARED_FIFO, anvil_cmd_kill },
+	{ "CONNECT-DUMP", ANVIL_CONNECTION_TYPE_ADMIN, anvil_cmd_connect_dump },
+	{ "KICK-USER", ANVIL_CONNECTION_TYPE_ADMIN, anvil_cmd_kick_user },
+	{ "KICK-ALT-USER", ANVIL_CONNECTION_TYPE_ADMIN, anvil_cmd_kick_alt_user },
+	{ "PENALTY-DUMP", ANVIL_CONNECTION_TYPE_ADMIN, anvil_cmd_penalty_dump },
+	{ "LOOKUP", ANVIL_CONNECTION_TYPE_CONNECT_LIMIT, anvil_cmd_lookup },
+	{ "PENALTY-GET", ANVIL_CONNECTION_TYPE_AUTH_PENALTY,
+	  anvil_cmd_penalty_get },
+	{ "PENALTY-INC", ANVIL_CONNECTION_TYPE_AUTH_PENALTY,
+	  anvil_cmd_penalty_inc },
+	{ "PENALTY-SET-EXPIRE-SECS", ANVIL_CONNECTION_TYPE_AUTH_PENALTY,
+	  anvil_cmd_penalty_set_expire_secs },
+};
+
+static int
 anvil_connection_request(struct anvil_connection *conn,
 			 const char *const *args, const char **error_r)
 {
 	const char *cmd = args[0];
-	guid_128_t conn_guid;
-	struct connect_limit_key key;
-	unsigned int value, checksum;
-	time_t stamp;
-	pid_t pid;
+	const struct anvil_command *cmd_def = NULL;
 
 	anvil_global_cmd_counter++;
 	anvil_refresh_proctitle_delayed();
 
-	args++;
-	if (strcmp(cmd, "CONNECT") == 0) {
-		if (args[0] == NULL || args[1] == NULL) {
-			*error_r = "CONNECT: Not enough parameters";
-			return -1;
+	for (unsigned int i = 0; i < N_ELEMENTS(anvil_commands); i++) {
+		if (strcmp(cmd, anvil_commands[i].name) == 0) {
+			cmd_def = &anvil_commands[i];
+			break;
 		}
-		if (guid_128_from_string(args[0], conn_guid) < 0) {
-			*error_r = "CONNECT: Invalid conn-guid";
-			return -1;
-		}
-		args++;
-		if (str_to_pid(args[0], &pid) < 0) {
-			*error_r = "CONNECT: Invalid pid";
-			return -1;
-		}
-		args++;
-		if (!connect_limit_key_parse(&args, &key)) {
-			*error_r = "CONNECT: Invalid ident string";
-			return -1;
-		}
-		/* extra parameters: */
-		enum kick_type kick_type = KICK_TYPE_NONE;
-		if (args[0] != NULL) {
-			if (str_to_kick_type(args[0], &kick_type) < 0) {
-				*error_r = "CONNECT: Invalid kick_type";
-				return -1;
-			}
-			args++;
-		}
-		struct ip_addr dest_ip;
-		i_zero(&dest_ip);
-		if (args[0] != NULL) {
-			if (args[0][0] != '\0' &&
-			    net_addr2ip(args[0], &dest_ip) < 0) {
-				*error_r = "CONNECT: Invalid dest_ip";
-				return -1;
-			}
-			args++;
-		}
-		const char *const *alt_usernames = NULL;
-		if (args[0] != NULL) {
-			alt_usernames = t_strsplit_tabescaped(args[0]);
-			args++;
-		}
-		connect_limit_connect(connect_limit, pid, &key,
-				      conn_guid, kick_type, &dest_ip,
-				      alt_usernames);
-	} else if (strcmp(cmd, "DISCONNECT") == 0) {
-		if (args[0] == NULL || args[1] == NULL) {
-			*error_r = "DISCONNECT: Not enough parameters";
-			return -1;
-		}
-		if (guid_128_from_string(args[0], conn_guid) < 0) {
-			*error_r = "DISCONNECT: Invalid conn-guid";
-			return -1;
-		}
-		args++;
-		if (str_to_pid(args[0], &pid) < 0) {
-			*error_r = "DISCONNECT: Invalid pid";
-			return -1;
-		}
-		args++;
-		if (!connect_limit_key_parse(&args, &key)) {
-			*error_r = "DISCONNECT: Invalid ident string";
-			return -1;
-		}
-		connect_limit_disconnect(connect_limit, pid, &key, conn_guid);
-	} else if (strcmp(cmd, "CONNECT-DUMP") == 0) {
-		anvil_global_connect_dump_count++;
-		connect_limit_dump(connect_limit, conn->conn.output);
-	} else if (strcmp(cmd, "KICK-USER") == 0) {
-		if (args[0] == NULL) {
-			*error_r = "KICK-USER: Not enough parameters";
-			return -1;
-		}
-		guid_128_t conn_guid;
-		if (args[1] == NULL)
-			guid_128_empty(conn_guid);
-		else if (guid_128_from_string(args[1], conn_guid) < 0) {
-			*error_r = "KICK-USER: Invalid conn-guid";
-			return -1;
-		}
-		kick_user(conn, args[0], conn_guid);
-	} else if (strcmp(cmd, "KICK-ALT-USER") == 0) {
-		if (args[0] == NULL || args[1] == NULL) {
-			*error_r = "KICK-ALT-USER: Not enough parameters";
-			return -1;
-		}
-		struct ip_addr except_ip;
-		if (args[2] == NULL)
-			i_zero(&except_ip);
-		else if (net_addr2ip(args[2], &except_ip) < 0) {
-			*error_r = "KICK-ALT-USER: Invalid except_ip parameter";
-			return -1;
-		}
-		kick_alt_user(conn, args[0], args[1],
-			      except_ip.family == 0 ? NULL : &except_ip);
-	} else if (strcmp(cmd, "KILL") == 0) {
-		if (args[0] == NULL) {
-			*error_r = "KILL: Not enough parameters";
-			return -1;
-		}
-		if (!conn->master) {
-			*error_r = "KILL sent by a non-master connection";
-			return -1;
-		}
-		if (str_to_pid(args[0], &pid) < 0) {
-			*error_r = "KILL: Invalid pid";
-			return -1;
-		}
-		connect_limit_disconnect_pid(connect_limit, pid);
-	} else if (strcmp(cmd, "LOOKUP") == 0) {
-		if (args[0] == NULL) {
-			*error_r = "LOOKUP: Not enough parameters";
-			return -1;
-		}
-		if (!connect_limit_key_parse(&args, &key)) {
-			*error_r = "LOOKUP: Invalid ident string";
-			return -1;
-		}
-		if (conn->conn.output == NULL) {
-			*error_r = "LOOKUP on a FIFO, can't send reply";
-			return -1;
-		}
-		value = connect_limit_lookup(connect_limit, &key);
-		o_stream_nsend_str(conn->conn.output,
-				   t_strdup_printf("%u\n", value));
-	} else if (strcmp(cmd, "PENALTY-GET") == 0) {
-		if (args[0] == NULL) {
-			*error_r = "PENALTY-GET: Not enough parameters";
-			return -1;
-		}
-		value = penalty_get(penalty, args[0], &stamp);
-		o_stream_nsend_str(conn->conn.output,
-			t_strdup_printf("%u %s\n", value, dec2str(stamp)));
-	} else if (strcmp(cmd, "PENALTY-INC") == 0) {
-		if (args[0] == NULL || args[1] == NULL || args[2] == NULL) {
-			*error_r = "PENALTY-INC: Not enough parameters";
-			return -1;
-		}
-		if (str_to_uint(args[1], &checksum) < 0 ||
-		    str_to_uint(args[2], &value) < 0 ||
-		    value > PENALTY_MAX_VALUE ||
-		    (value == 0 && checksum != 0)) {
-			*error_r = "PENALTY-INC: Invalid parameters";
-			return -1;
-		}
-		penalty_inc(penalty, args[0], checksum, value);
-	} else if (strcmp(cmd, "PENALTY-SET-EXPIRE-SECS") == 0) {
-		if (args[0] == NULL || str_to_uint(args[0], &value) < 0) {
-			*error_r = "PENALTY-SET-EXPIRE-SECS: "
-				"Invalid parameters";
-			return -1;
-		}
-		penalty_set_expire_secs(penalty, value);
-	} else if (strcmp(cmd, "PENALTY-DUMP") == 0) {
-		penalty_dump(penalty, conn->conn.output);
-	} else {
+	}
+	if (cmd_def == NULL) {
 		*error_r = t_strconcat("Unknown command: ", cmd, NULL);
 		return -1;
 	}
-	return 0;
+	if (conn->conn_type != cmd_def->allowed_type) {
+		*error_r = t_strdup_printf(
+			"%s: Not allowed on this connection type", cmd_def->name);
+		return -1;
+	}
+	return cmd_def->handler(conn, args + 1, error_r);
 }
 
 static int
@@ -594,7 +711,7 @@ anvil_connection_handshake(struct anvil_connection *conn,
 
 	struct ostream *orig_output = conn->conn.output;
 	conn->conn.output = o_stream_create_multiplex(orig_output, SIZE_MAX,
-		OSTREAM_MULTIPLEX_FORMAT_PACKET);
+		OSTREAM_MULTIPLEX_FORMAT_STREAM);
 	o_stream_set_no_error_handling(conn->conn.output, TRUE);
 	o_stream_unref(&orig_output);
 
@@ -640,7 +757,9 @@ anvil_connection_input_line(struct connection *_conn, const char *line)
 	if (!conn->conn.version_received) {
 		if (!version_string_verify(line, "anvil-client",
 				ANVIL_CLIENT_PROTOCOL_MAJOR_VERSION)) {
-			if (anvil_restarted && (conn->master || conn->fifo)) {
+			if (anvil_restarted &&
+			    (conn->conn_type == ANVIL_CONNECTION_TYPE_SHARED_FIFO ||
+			     conn->fifo)) {
 				/* old pending data. ignore input until we get
 				   the handshake. */
 				return 1;
@@ -675,7 +794,7 @@ anvil_connection_input_line(struct connection *_conn, const char *line)
 	return 1;
 }
 
-void anvil_connection_create(int fd, bool master, bool fifo)
+void anvil_connection_create(int fd, enum anvil_connection_type type, bool fifo)
 {
 	struct anvil_connection *conn;
 
@@ -689,7 +808,7 @@ void anvil_connection_create(int fd, bool master, bool fifo)
 		o_stream_nsend_str(conn->conn.output,
 				   "VERSION\tanvil-server\t2\t0\n");
 	}
-	conn->master = master;
+	conn->conn_type = type;
 	conn->fifo = fifo;
 	i_array_init(&conn->commands, 8);
 }

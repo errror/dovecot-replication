@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -15,10 +15,13 @@
 #include "eacces-error.h"
 #include "env-util.h"
 #include "execv-const.h"
+#include "version.h"
+#include "storage-version.h"
 #include "settings.h"
 #include "stats-client.h"
 #include "master-service-private.h"
 #include "master-service-settings.h"
+#include "strescape.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -26,6 +29,7 @@
 #include <sys/stat.h>
 
 #define DOVECOT_CONFIG_BIN_PATH BINDIR"/doveconf"
+#define DOVECOT_CONFIG_BIN_PATH_ENV "DOVECONF_PATH"
 #define DOVECOT_CONFIG_SOCKET_PATH PKG_RUNDIR"/config"
 
 #define CONFIG_READ_TIMEOUT_SECS 10
@@ -153,6 +157,45 @@ master_service_set_process_shutdown_filter_wrapper(struct event_filter *filter)
 	master_service_set_process_shutdown_filter(master_service, filter);
 }
 
+/* List of dovecot_config_versions accepted at parse / startup time.
+   dovecot_storage_version accepts these as well, plus an extra legacy set
+   defined in storage_version_check(). */
+static const char *const dovecot_config_supported_versions[] = {
+#ifdef DOVECOT_PRO_EDITION
+	"3.1.0",
+	"3.1.1",
+	"3.1.2",
+	"3.1.3",
+	"3.1.4",
+	"3.1.5",
+	"3.1.6",
+	"3.2.0",
+#else
+	"2.4.0",
+	"2.4.1",
+	"2.4.2",
+	"2.4.3",
+	"2.4.4",
+#endif
+	NULL
+};
+
+bool dovecot_config_version_find(const char *version, const char **error_r)
+{
+	/* FIXME: implement full version checking later */
+	if (!str_array_find(dovecot_config_supported_versions, version) &&
+	    strcmp(DOVECOT_CONFIG_VERSION, version) != 0) {
+		*error_r = t_strdup_printf(
+			"Currently supported versions are: %s%s",
+			t_strarray_join(dovecot_config_supported_versions, " "),
+			str_array_find(dovecot_config_supported_versions,
+				       DOVECOT_CONFIG_VERSION) ? "" :
+			t_strdup_printf(" %s", DOVECOT_CONFIG_VERSION));
+		return FALSE;
+	}
+	return TRUE;
+}
+
 static bool storage_version_check(const char *version, const char **error_r)
 {
 #define STORAGE_MIN_VERSION "2.3.0"
@@ -172,14 +215,26 @@ static bool storage_version_check(const char *version, const char **error_r)
 			STORAGE_MIN_VERSION);
 		return FALSE;
 	}
-	if (version_is_valid(DOVECOT_VERSION) &&
-	    version_cmp(version, DOVECOT_VERSION) > 0) {
-		*error_r = t_strdup_printf(
-			"dovecot_storage_version is too new - "
-			"current version is %s", DOVECOT_VERSION);
-		return FALSE;
+	/* Legacy: any version <= 2.3.22.1 is accepted. */
+	if (version_cmp(version, "2.3.22.1") <= 0)
+		return TRUE;
+#ifdef DOVECOT_PRO_EDITION
+	if (version_cmp(version, "3.0.0") >= 0 &&
+	    version_cmp(version, "3.0.5") <= 0)
+		return TRUE;
+#endif
+	const char *config_err;
+	if (dovecot_config_version_find(version, &config_err))
+		return TRUE;
+
+	if (strcmp(version, storage_version_default()) == 0) {
+		/* git build */
+		return TRUE;
 	}
-	return TRUE;
+	*error_r = t_strdup_printf(
+		"Unsupported dovecot_storage_version %s. %s",
+		version, config_err);
+	return FALSE;
 }
 
 static bool
@@ -259,7 +314,10 @@ master_service_exec_config(struct master_service *service,
 		env_put("DOVECONF_PROTOCOL", input->protocol);
 
 	t_array_init(&conf_argv, 11 + (service->argc + 1) + 1);
-	strarr_push(&conf_argv, DOVECOT_CONFIG_BIN_PATH);
+	const char *config_bin_path = getenv(DOVECOT_CONFIG_BIN_PATH_ENV);
+	if (config_bin_path == NULL)
+		config_bin_path = DOVECOT_CONFIG_BIN_PATH;
+	strarr_push(&conf_argv, config_bin_path);
 	if ((service->flags & MASTER_SERVICE_FLAG_CONFIG_DEFAULTS) != 0)
 		strarr_push(&conf_argv, "-d");
 	else {
@@ -337,7 +395,26 @@ static int master_service_binary_config_cache_get(const char *cache_dir,
 	int fd = open(cache_path, O_RDONLY);
 	if (fd == -1 && errno != ENOENT)
 		i_error("Binary config cache: open(%s) failed: %m", cache_path);
+	else if (fd != -1)
+		fd_close_on_exec(fd, TRUE);
 	return fd;
+}
+
+/* Returns the error string for a failed config read. EINTR once the alarm()
+   timeout has elapsed means that the config socket didn't reply in time. */
+static const char *
+config_read_error(const char *func, const char *path, time_t start_time)
+{
+	int saved_errno = errno;
+	time_t secs = time(NULL) - start_time;
+
+	if (saved_errno == EINTR && secs >= (time_t)CONFIG_READ_TIMEOUT_SECS) {
+		return t_strdup_printf(
+			"Timeout (%ld secs) while reading config from %s",
+			(long)secs, path);
+	}
+	errno = saved_errno;
+	return t_strdup_printf("%s(%s) failed: %m", func, path);
 }
 
 static int
@@ -413,10 +490,11 @@ master_service_open_config(struct master_service *service,
 	if (input->reload_config)
 		str_append(str, "\treload");
 	str_append_c(str, '\n');
+	time_t start_time = time(NULL);
 	alarm(CONFIG_READ_TIMEOUT_SECS);
 	int ret = write_full(fd, str_data(str), str_len(str));
 	if (ret < 0)
-		*error_r = t_strdup_printf("write_full(%s) failed: %m", path);
+		*error_r = config_read_error("write_full", path, start_time);
 	else
 		*error_r = NULL;
 
@@ -426,7 +504,7 @@ master_service_open_config(struct master_service *service,
 		char buf[1024];
 		ret = fd_read(fd, buf, sizeof(buf)-1, &config_fd);
 		if (ret < 0)
-			*error_r = t_strdup_printf("fd_read() failed: %m");
+			*error_r = config_read_error("fd_read", path, start_time);
 		else if (ret > 0 && buf[0] == '+' && buf[1] == '\n') {
 			/* success, if fd was received */
 			if (config_fd == -1)
@@ -527,15 +605,10 @@ master_service_settings_read_int(struct master_service *service,
 	} else if (!settings_has_mmap(service->settings_root)) {
 		/* Use default settings. Set dovecot_storage_version to the
 		   latest version, so it won't cause a failure. Use userdb
-		   type, so it can still be overridden with -o parameter.
-
-		   When building from git we don't know the latest version, so
-		   just use 9999. The version validity checks are disabled for
-		   git builds, so this should work. */
-		const char *version = version_is_valid(DOVECOT_VERSION) ?
-			DOVECOT_VERSION : "9999";
+		   type, so it can still be overridden with -o parameter. */
 		settings_root_override(service->settings_root,
-				       "dovecot_storage_version", version,
+				       "dovecot_storage_version",
+				       storage_version_default(),
 				       SETTINGS_OVERRIDE_TYPE_USERDB);
 	}
 	if (!settings_has_mmap(service->settings_root)) {
@@ -654,10 +727,12 @@ master_service_get_import_environment_keyvals(struct master_service *service)
 	for (unsigned int i = 0; i < len; i += 2) {
 		const char *const *key = array_idx(&arr, i);
 		const char *const *val = array_idx(&arr, i + 1);
-		str_append(keyvals, t_strdup_printf("%s=%s", *key, *val));
+		str_append_tabescaped(keyvals, *key);
+		str_append_c(keyvals, '=');
+		str_append_tabescaped(keyvals, *val);
 
 		if (i + 2 < len)
-			str_append_c(keyvals, ' ');
+			str_append_c(keyvals, '\t');
 	}
 	return str_c(keyvals);
 }

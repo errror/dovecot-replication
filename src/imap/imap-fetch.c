@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "array.h"
@@ -94,7 +94,7 @@ void imap_fetch_init_nofail_handler(struct imap_fetch_context *ctx,
 }
 
 int imap_fetch_att_list_parse(struct client *client, pool_t pool,
-			      const struct imap_arg *list,
+			      const struct imap_arg *list, bool utf8,
 			      struct imap_fetch_context **fetch_ctx_r,
 			      const char **client_error_r)
 {
@@ -102,7 +102,7 @@ int imap_fetch_att_list_parse(struct client *client, pool_t pool,
 	const char *str;
 
 	i_zero(&init_ctx);
-	init_ctx.fetch_ctx = imap_fetch_alloc(client, pool, "NOTIFY");
+	init_ctx.fetch_ctx = imap_fetch_alloc(client, pool, "NOTIFY", utf8);
 	init_ctx.pool = pool;
 	init_ctx.args = list;
 
@@ -126,7 +126,8 @@ int imap_fetch_att_list_parse(struct client *client, pool_t pool,
 }
 
 struct imap_fetch_context *
-imap_fetch_alloc(struct client *client, pool_t pool, const char *reason)
+imap_fetch_alloc(struct client *client, pool_t pool, const char *reason,
+		 bool utf8)
 {
 	struct imap_fetch_context *ctx;
 
@@ -134,6 +135,7 @@ imap_fetch_alloc(struct client *client, pool_t pool, const char *reason)
 	ctx->client = client;
 	ctx->ctx_pool = pool;
 	ctx->reason = p_strdup(pool, reason);
+	ctx->utf8 = utf8;
 	pool_ref(pool);
 
 	p_array_init(&ctx->all_headers, pool, 64);
@@ -732,6 +734,34 @@ static bool fetch_body_init(struct imap_fetch_init_context *ctx)
 	return imap_fetch_body_section_init(ctx);
 }
 
+static int fetch_bodystructure_stream_continue(struct imap_fetch_context *ctx)
+{
+	struct imap_fetch_state *state = &ctx->state;
+	enum ostream_send_istream_result res;
+
+	o_stream_set_max_buffer_size(ctx->client->output, 0);
+	res = o_stream_send_istream(ctx->client->output, state->cur_input);
+	o_stream_set_max_buffer_size(ctx->client->output, SIZE_MAX);
+
+	switch (res) {
+	case OSTREAM_SEND_ISTREAM_RESULT_FINISHED:
+		i_stream_unref(&state->cur_input);
+		state->cont_handler = NULL;
+		if (o_stream_send(ctx->client->output, ")", 1) < 0)
+			return -1;
+		return 1;
+	case OSTREAM_SEND_ISTREAM_RESULT_WAIT_INPUT:
+		i_unreached();
+	case OSTREAM_SEND_ISTREAM_RESULT_WAIT_OUTPUT:
+		return 0;
+	case OSTREAM_SEND_ISTREAM_RESULT_ERROR_INPUT:
+		i_unreached();
+	case OSTREAM_SEND_ISTREAM_RESULT_ERROR_OUTPUT:
+		return -1;
+	}
+	i_unreached();
+}
+
 static int fetch_bodystructure(struct imap_fetch_context *ctx,
 			       struct mail *mail, void *context ATTR_UNUSED)
 {
@@ -748,12 +778,13 @@ static int fetch_bodystructure(struct imap_fetch_context *ctx,
 			return -1;
 	}
 
-	if (o_stream_send(ctx->client->output, "BODYSTRUCTURE (", 15) < 0 ||
-	    o_stream_send_str(ctx->client->output, bodystructure) < 0 ||
-	    o_stream_send(ctx->client->output, ")", 1) < 0)
+	if (o_stream_send(ctx->client->output, "BODYSTRUCTURE (", 15) < 0)
 		return -1;
 
-	return 1;
+	ctx->state.cur_input =
+		i_stream_create_from_data(bodystructure, strlen(bodystructure));
+	ctx->state.cont_handler = fetch_bodystructure_stream_continue;
+	return fetch_bodystructure_stream_continue(ctx);
 }
 
 static bool fetch_bodystructure_init(struct imap_fetch_init_context *ctx)
@@ -762,6 +793,34 @@ static bool fetch_bodystructure_init(struct imap_fetch_init_context *ctx)
 	imap_fetch_add_handler(ctx, 0, "("BODY_NIL_REPLY" NIL NIL NIL NIL)",
 			       fetch_bodystructure, NULL);
 	return TRUE;
+}
+
+static int fetch_envelope_stream_continue(struct imap_fetch_context *ctx)
+{
+	struct imap_fetch_state *state = &ctx->state;
+	enum ostream_send_istream_result res;
+
+	o_stream_set_max_buffer_size(ctx->client->output, 0);
+	res = o_stream_send_istream(ctx->client->output, state->cur_input);
+	o_stream_set_max_buffer_size(ctx->client->output, SIZE_MAX);
+
+	switch (res) {
+	case OSTREAM_SEND_ISTREAM_RESULT_FINISHED:
+		i_stream_unref(&state->cur_input);
+		state->cont_handler = NULL;
+		if (o_stream_send(ctx->client->output, ")", 1) < 0)
+			return -1;
+		return 1;
+	case OSTREAM_SEND_ISTREAM_RESULT_WAIT_INPUT:
+		i_unreached();
+	case OSTREAM_SEND_ISTREAM_RESULT_WAIT_OUTPUT:
+		return 0;
+	case OSTREAM_SEND_ISTREAM_RESULT_ERROR_INPUT:
+		i_unreached();
+	case OSTREAM_SEND_ISTREAM_RESULT_ERROR_OUTPUT:
+		return -1;
+	}
+	i_unreached();
 }
 
 static int fetch_envelope(struct imap_fetch_context *ctx, struct mail *mail,
@@ -779,11 +838,13 @@ static int fetch_envelope(struct imap_fetch_context *ctx, struct mail *mail,
 			return -1;
 	}
 
-	if (o_stream_send(ctx->client->output, "ENVELOPE (", 10) < 0 ||
-	    o_stream_send_str(ctx->client->output, envelope) < 0 ||
-	    o_stream_send(ctx->client->output, ")", 1) < 0)
+	if (o_stream_send(ctx->client->output, "ENVELOPE (", 10) < 0)
 		return -1;
-	return 1;
+
+	ctx->state.cur_input =
+		i_stream_create_from_data(envelope, strlen(envelope));
+	ctx->state.cont_handler = fetch_envelope_stream_continue;
+	return fetch_envelope_stream_continue(ctx);
 }
 
 static bool fetch_envelope_init(struct imap_fetch_init_context *ctx)
@@ -925,7 +986,7 @@ static int fetch_guid(struct imap_fetch_context *ctx, struct mail *mail,
 		return -1;
 
 	str_append(ctx->state.cur_str, "X-GUID ");
-	imap_append_astring(ctx->state.cur_str, value);
+	imap_append_astring(ctx->state.cur_str, value, 0);
 	str_append_c(ctx->state.cur_str, ' ');
 	return 1;
 }
@@ -941,8 +1002,8 @@ static bool fetch_guid_init(struct imap_fetch_init_context *ctx)
 static int fetch_x_mailbox(struct imap_fetch_context *ctx, struct mail *mail,
 			   void *context ATTR_UNUSED)
 {
+	enum imap_quote_flags qflags = (ctx->utf8 ? IMAP_QUOTE_FLAG_UTF8 : 0);
 	const char *name;
-	string_t *mutf7_name;
 
 	if (mail_get_special(mail, MAIL_FETCH_MAILBOX_NAME, &name) < 0) {
 		/* This can happen with virtual mailbox if the backend mail
@@ -950,12 +1011,15 @@ static int fetch_x_mailbox(struct imap_fetch_context *ctx, struct mail *mail,
 		return -1;
 	}
 
-	mutf7_name = t_str_new(strlen(name)*2);
-	if (imap_utf8_to_utf7(name, mutf7_name) < 0)
-		i_panic("FETCH: Mailbox name not UTF-8: %s", name);
+	if (!ctx->utf8) {
+		string_t *mutf7_name = t_str_new(strlen(name)*2);
+		if (imap_utf8_to_utf7(name, mutf7_name) < 0)
+			i_panic("FETCH: Mailbox name not UTF-8: %s", name);
+		name = str_c(mutf7_name);
+	}
 
 	str_append(ctx->state.cur_str, "X-MAILBOX ");
-	imap_append_astring(ctx->state.cur_str, str_c(mutf7_name));
+	imap_append_astring(ctx->state.cur_str, name, qflags);
 	str_append_c(ctx->state.cur_str, ' ');
 	return 1;
 }

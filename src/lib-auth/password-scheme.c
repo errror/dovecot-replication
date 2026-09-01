@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -13,8 +13,8 @@
 #include "randgen.h"
 #include "sha1.h"
 #include "sha2.h"
-#include "otp.h"
 #include "str.h"
+#include "auth-digest.h"
 #include "password-scheme.h"
 #include "password-scheme-private.h"
 
@@ -92,7 +92,8 @@ int password_verify(const char *plaintext,
 	}
 
 	if (s->weak && !g_allow_weak) {
-		*error_r = t_strdup_printf("Weak password scheme '%s' used and refused",
+		*error_r = t_strdup_printf("Weak password scheme '%s' used and refused "
+					   "(Set auth_allow_weak_schemes=yes to allow)",
 					   s->name);
 		return -1;
 	}
@@ -647,7 +648,8 @@ static void
 digest_md5_generate(const char *plaintext, const struct password_generate_params *params,
 		    const unsigned char **raw_password_r, size_t *size_r)
 {
-	const char *realm, *str, *user;
+	static const struct hash_method *const hmethod = &hash_method_md5;
+	const char *realm, *user;
 	unsigned char *digest;
 
 	if (params->user == NULL)
@@ -667,12 +669,12 @@ digest_md5_generate(const char *plaintext, const struct password_generate_params
 	}
 
 	/* user:realm:passwd */
-	digest = t_malloc_no0(MD5_RESULTLEN);
-	str = t_strdup_printf("%s:%s:%s", user, realm, plaintext);
-	md5_get_digest(str, strlen(str), digest);
+	digest = t_malloc_no0(hmethod->digest_size);
+	auth_digest_get_hash_a1_secret(hmethod, user, realm, plaintext,
+				       digest);
 
 	*raw_password_r = digest;
-	*size_r = MD5_RESULTLEN;
+	*size_r = hmethod->digest_size;
 }
 
 static void
@@ -699,33 +701,6 @@ plain_md5_generate(const char *plaintext, const struct password_generate_params 
 
 	*raw_password_r = digest;
 	*size_r = MD5_RESULTLEN;
-}
-
-static int otp_verify(const char *plaintext, const struct password_generate_params *params ATTR_UNUSED,
-		      const unsigned char *raw_password, size_t size,
-		      const char **error_r)
-{
-	const char *password, *generated;
-
-	password = t_strndup(raw_password, size);
-	if (password_generate_otp(plaintext, password, UINT_MAX, &generated) < 0) {
-		*error_r = "Invalid OTP data in passdb";
-		return -1;
-	}
-
-	return strcasecmp(password, generated) == 0 ? 1 : 0;
-}
-
-static void
-otp_generate(const char *plaintext, const struct password_generate_params *params ATTR_UNUSED,
-	     const unsigned char **raw_password_r, size_t *size_r)
-{
-	const char *password;
-
-	if (password_generate_otp(plaintext, NULL, OTP_HASH_SHA1, &password) < 0)
-		i_unreached();
-	*raw_password_r = (const unsigned char *)password;
-	*size_r = strlen(password);
 }
 
 static const struct password_scheme builtin_schemes[] = {
@@ -889,13 +864,6 @@ static const struct password_scheme builtin_schemes[] = {
 		.weak = TRUE,
 		.password_verify = NULL,
 		.password_generate = plain_md5_generate,
-	},
-	{
-		.name = "OTP",
-		.default_encoding = PW_ENCODING_NONE,
-		.raw_password_len = 0,
-		.password_verify = otp_verify,
-		.password_generate = otp_generate,
 	},
 	{
 		.name = "PBKDF2",

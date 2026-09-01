@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "istream.h"
@@ -10,7 +10,7 @@
 #include "str-sanitize.h"
 #include "randgen.h"
 #include "master-service.h"
-#include "mech.h"
+#include "auth-sasl.h"
 #include "auth-request-handler.h"
 #include "auth-client-interface.h"
 #include "auth-client-connection.h"
@@ -192,14 +192,12 @@ static void auth_client_finish_handshake(struct auth_client_connection *conn)
 		return;
 
 	if (conn->token_auth) {
-		mechanisms = t_strconcat("MECH\t",
-			mech_dovecot_token.mech_name, "\tprivate\n", NULL);
+		mechanisms = "MECH\t"
+			AUTH_SASL_MECH_NAME_DOVECOT_TOKEN "\tprivate\n";
 	} else {
-		mechanisms = str_c(conn->auth->reg->handshake);
-		if (conn->conn.minor_version >= AUTH_CLIENT_MINOR_VERSION_CHANNEL_BINDING) {
-			mechanisms_cbind =
-				str_c(conn->auth->reg->handshake_cbind);
-		}
+		mechanisms = auth_sasl_mechs_get_handshake();
+		if (conn->conn.minor_version >= AUTH_CLIENT_MINOR_VERSION_CHANNEL_BINDING)
+			mechanisms_cbind = auth_sasl_mechs_get_handshake_cbind();
 	}
 
 	str = t_str_new(128);

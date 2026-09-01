@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "ioloop.h"
@@ -206,9 +206,9 @@ static const struct master_admin_client_callback admin_callbacks = {
 };
 
 static void auth_connect_notify(struct auth_client *client ATTR_UNUSED,
-				bool connected, void *context ATTR_UNUSED)
+				const char *error, void *context ATTR_UNUSED)
 {
-	if (connected) {
+	if (error == NULL) {
 		auth_connected_once = TRUE;
 		clients_notify_auth_connected();
 	} else if (shutting_down)
@@ -270,7 +270,7 @@ void login_anvil_init(void)
 		.reconnect = anvil_reconnect_callback,
 		.command = anvil_cmd_input,
 	};
-	anvil = anvil_client_init("anvil", &callbacks, 0);
+	anvil = anvil_client_init("anvil-connect-limit", &callbacks, 0);
 	if (anvil_client_connect(anvil, TRUE) < 0)
 		i_fatal("Couldn't connect to anvil");
 }
@@ -481,7 +481,6 @@ int login_binary_run(struct login_binary *binary,
 	master_service = master_service_init(login_binary->process_name,
 					     service_flags, &argc, &argv,
 					     "Dl:R:S");
-	master_service_init_log(master_service);
 
 	while ((c = master_getopt(master_service)) > 0) {
 		switch (c) {
@@ -501,6 +500,7 @@ int login_binary_run(struct login_binary *binary,
 			return FATAL_DEFAULT;
 		}
 	}
+	master_service_init_log(master_service);
 
 	login_binary->preinit();
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
@@ -9,7 +9,6 @@
 #include "array.h"
 #include "str.h"
 #include "password-scheme.h"
-#include "auth-cache.h"
 #include "settings.h"
 #include "auth-settings.h"
 #include "db-ldap.h"
@@ -153,9 +152,11 @@ ldap_auth_bind_callback(struct ldap_connection *conn,
 					    NULL, NULL, NULL, NULL, FALSE);
 		if (ret == LDAP_SUCCESS)
 			ret = result;
-		if (ret == LDAP_SUCCESS)
+		if (ret == LDAP_SUCCESS) {
 			passdb_result = PASSDB_RESULT_OK;
-		else if (ret == LDAP_INVALID_CREDENTIALS) {
+			e_debug(authdb_event(auth_request),
+				"binding successful");
+		} else if (ret == LDAP_INVALID_CREDENTIALS) {
 			auth_request_db_log_login_failure(auth_request,
 				AUTH_LOG_MSG_PASSWORD_MISMATCH" (for LDAP bind)");
 			passdb_result = PASSDB_RESULT_PASSWORD_MISMATCH;
@@ -181,17 +182,31 @@ static void ldap_auth_bind(struct ldap_connection *conn,
 		container_of(brequest, struct passdb_ldap_request, request.bind);
 	struct auth_request *auth_request = brequest->request.auth_request;
 
+	if (auth_request->fields.skip_password_check) {
+		/* Already verified that the password matched -
+		   we just wanted to get any extra fields */
+		passdb_ldap_request->callback.
+			verify_plain(PASSDB_RESULT_OK, auth_request);
+		auth_request_unref(&auth_request);
+		return;
+	}
+
 	if (*auth_request->mech_password == '\0') {
-		/* Assume that empty password fails. This is especially
-		   important with Windows 2003 AD, which always returns success
-		   with empty passwords. */
+		/* An empty password is an unauthenticated bind, which verifies
+		   nothing - Windows AD in particular answers it with success.
+		   The common verify_plain check already rejects empty client
+		   passwords before the passdb lookup, so this stays as a cheap
+		   defensive guard. */
 		e_info(authdb_event(auth_request),
 		       "Login attempt with empty password");
 		passdb_ldap_request->callback.
 			verify_plain(PASSDB_RESULT_PASSWORD_MISMATCH,
 				     auth_request);
+		auth_request_unref(&auth_request);
 		return;
 	}
+
+	e_debug(authdb_event(auth_request), "bind: dn=%s", brequest->dn);
 
 	brequest->request.callback = ldap_auth_bind_callback;
 	db_ldap_request(conn, &brequest->request);
@@ -204,7 +219,7 @@ static void passdb_ldap_request_fail(struct passdb_ldap_request *request,
 
 	if (auth_request->wanted_credentials_scheme != NULL) {
 		request->callback.lookup_credentials(passdb_result, NULL, 0,
-						     auth_request);
+						     NULL, auth_request);
 	} else {
 		request->callback.verify_plain(passdb_result, auth_request);
 	}
@@ -376,9 +391,12 @@ ldap_verify_plain(struct auth_request *request,
 		return;
 	}
 
+	const struct settings_get_params params = {
+		.escape_func = ldap_escape,
+	};
 	const struct ldap_pre_settings *ldap_pre = NULL;
-	if (settings_get(event, &ldap_pre_setting_parser_info, 0,
-			 &ldap_pre, &error) < 0 ||
+	if (settings_get_params(event, &ldap_pre_setting_parser_info,
+				&params, &ldap_pre, &error) < 0 ||
 	    ldap_pre_settings_post_check(ldap_pre, DB_LDAP_LOOKUP_TYPE_PASSDB,
 					 &error) < 0) {
 		e_error(event, "%s", error);
@@ -414,10 +432,13 @@ static void ldap_lookup_credentials(struct auth_request *request,
 	auth_request_ref(request);
 	ldap_request->request.ldap.auth_request = request;
 
+	const struct settings_get_params params = {
+		.escape_func = ldap_escape,
+	};
 	const char *error;
 	const struct ldap_pre_settings *ldap_pre = NULL;
-	if (settings_get(event, &ldap_pre_setting_parser_info, 0,
-			 &ldap_pre, &error) < 0 ||
+	if (settings_get_params(event, &ldap_pre_setting_parser_info, &params,
+				&ldap_pre, &error) < 0 ||
 	    ldap_pre_settings_post_check(ldap_pre, DB_LDAP_LOOKUP_TYPE_PASSDB,
 					 &error) < 0) {
 		e_error(event, "%s", error);
@@ -434,9 +455,11 @@ static void ldap_lookup_credentials(struct auth_request *request,
 	settings_free(ldap_pre);
 }
 
-static int passdb_ldap_preinit(pool_t pool, struct event *event,
-		   	       struct passdb_module **module_r,
-			       const char **error_r)
+static int
+passdb_ldap_preinit(pool_t pool, struct event *event,
+		    const struct passdb_parameters *passdb_params,
+		    struct passdb_module **module_r,
+		    const char **error_r)
 {
 	const struct auth_passdb_post_settings *auth_post = NULL;
 	const struct ldap_pre_settings *ldap_pre = NULL;
@@ -446,8 +469,13 @@ static int passdb_ldap_preinit(pool_t pool, struct event *event,
 	if (settings_get(event, &auth_passdb_post_setting_parser_info,
 			 RAW_SETTINGS, &auth_post, error_r) < 0)
 		goto failed;
-	if (settings_get(event, &ldap_pre_setting_parser_info,
-			 RAW_SETTINGS, &ldap_pre, error_r) < 0)
+
+	const struct settings_get_params params = {
+		.escape_func = ldap_escape,
+		.flags = RAW_SETTINGS,
+	};
+	if (settings_get_params(event, &ldap_pre_setting_parser_info,
+				&params, &ldap_pre, error_r) < 0)
 		goto failed;
 
 	module = p_new(pool, struct ldap_passdb_module, 1);
@@ -459,13 +487,14 @@ static int passdb_ldap_preinit(pool_t pool, struct event *event,
 				    ldap_pre->passdb_ldap_bind ?
 				    	"password" : NULL);
 
-	module->module.default_cache_key = auth_cache_parse_key_and_fields(
-		pool, t_strconcat(ldap_pre->ldap_base,
-				  ldap_pre->passdb_ldap_filter, NULL),
-		&auth_post->fields, NULL);
+	const char *query = t_strconcat(ldap_pre->ldap_base,
+					ldap_pre->passdb_ldap_bind_userdn,
+					ldap_pre->passdb_ldap_filter, NULL);
+	ret = passdb_set_cache_key(&module->module, passdb_params, pool,
+				   query, &auth_post->fields,
+				   NULL, error_r);
 
 	*module_r = &module->module;
-	ret = 0;
 
 failed:
 	settings_free(auth_post);
@@ -487,6 +516,7 @@ static void passdb_ldap_deinit(struct passdb_module *_module)
 	struct ldap_passdb_module *module =
 		container_of(_module, struct ldap_passdb_module, module);
 
+	db_ldap_abort_all_requests(module->conn);
 	db_ldap_unref(&module->conn);
 }
 

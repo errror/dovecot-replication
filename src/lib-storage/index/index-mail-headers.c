@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -200,7 +200,8 @@ static void index_mail_parse_header_register_all_wanted(struct index_mail *mail)
 }
 
 void index_mail_parse_header_init(struct index_mail *mail,
-				  struct mailbox_header_lookup_ctx *headers)
+				  struct mailbox_header_lookup_ctx *headers,
+				  bool full_header_stream)
 {
 	struct index_mail_data *data = &mail->data;
 	const uint8_t *match;
@@ -239,6 +240,18 @@ void index_mail_parse_header_init(struct index_mail *mail,
 		}
 	}
 
+	mail->data.header_parser_initialized = TRUE;
+	mail->data.parse_line_num = 0;
+	i_zero(&mail->data.parse_line);
+
+	if (!full_header_stream) {
+		/* Input stream contains only the specified headers. Don't
+		   initialize any other header matches, because they won't be
+		   in the input. */
+		i_assert(headers != NULL && headers->count > 0);
+		return;
+	}
+
 	if (data->wanted_headers != NULL && data->wanted_headers != headers) {
 		headers = data->wanted_headers;
 		for (i = 0; i < headers->count; i++) {
@@ -268,9 +281,6 @@ void index_mail_parse_header_init(struct index_mail *mail,
 		array_idx_set(&mail->header_match, field_idx,
 			      &mail->header_match_value);
 	}
-	mail->data.header_parser_initialized = TRUE;
-	mail->data.parse_line_num = 0;
-	i_zero(&mail->data.parse_line);
 }
 
 static void index_mail_parse_finish_imap_envelope(struct index_mail *mail)
@@ -281,7 +291,9 @@ static void index_mail_parse_finish_imap_envelope(struct index_mail *mail)
 	string_t *str;
 
 	str = str_new(mail->mail.data_pool, 256);
-	imap_envelope_write(mail->data.envelope_data, str);
+	/* FIXME: Implement UTF-8 support for quoted strings in generated
+	          ENVELOPE element. */
+	imap_envelope_write(mail->data.envelope_data, str, 0);
 	mail->data.envelope = str_c(str);
 	mail->data.save_envelope = FALSE;
 
@@ -308,12 +320,15 @@ void index_mail_parse_header(struct message_part *part,
 	if (data->save_bodystructure_header &&
 	    !data->parsed_bodystructure_header) {
 		i_assert(part != NULL);
-		message_part_data_parse_from_header(mail->mail.data_pool, part, hdr);
+		message_part_data_parse_from_header(mail->mail.data_pool, part,
+						    &mail->data.part_data_limits,
+						    hdr);
 	}
 
 	if (data->save_envelope) {
 		message_part_envelope_parse_from_header(mail->mail.data_pool,
-					   &data->envelope_data, hdr);
+					   &data->envelope_data,
+					   &mail->data.part_data_limits, hdr);
 
 		if (hdr == NULL)
                         index_mail_parse_finish_imap_envelope(mail);
@@ -408,7 +423,7 @@ index_mail_cache_parse_init(struct mail *_mail, struct istream *input)
 	input = tee_i_stream_create_child(mail->data.tee_stream);
 	input2 = tee_i_stream_create_child(mail->data.tee_stream);
 
-	index_mail_parse_header_init(mail, NULL);
+	index_mail_parse_header_init(mail, NULL, TRUE);
 	mail->data.parser_input = input;
 	mail->data.parser_ctx =
 		message_parser_init(mail->mail.data_pool, input,
@@ -459,7 +474,7 @@ int index_mail_parse_headers_internal(struct index_mail *mail,
 
 	i_assert(data->stream != NULL);
 
-	index_mail_parse_header_init(mail, headers);
+	index_mail_parse_header_init(mail, headers, TRUE);
 
 	if (data->parts == NULL || data->save_bodystructure_header ||
 	    (data->access_part & PARSE_BODY) != 0) {
@@ -510,7 +525,8 @@ imap_envelope_parse_callback(struct message_header_line *hdr,
 			     struct index_mail *mail)
 {
 	message_part_envelope_parse_from_header(mail->mail.data_pool,
-				   &mail->data.envelope_data, hdr);
+				   &mail->data.envelope_data,
+				   &mail->data.part_data_limits, hdr);
 
 	if (hdr == NULL)
 		index_mail_parse_finish_imap_envelope(mail);
@@ -754,7 +770,7 @@ static int unfold_header(pool_t pool, const char **_str)
 		return 0;
 
 	/* @UNSAFE */
-	new_str = p_malloc(pool, i + strlen(str+i) + 1);
+	new_str = p_malloc(pool, MALLOC_ADD3(i, strlen(str+i), 1));
 	memcpy(new_str, str, i);
 	for (j = i; str[i] != '\0'; i++) {
 		if (str[i] == '\n') {
@@ -984,7 +1000,7 @@ int index_mail_get_header_stream(struct mail *_mail,
 	if (mail_get_hdr_stream_because(_mail, NULL, reason, &input) < 0)
 		return -1;
 
-	index_mail_parse_header_init(mail, headers);
+	index_mail_parse_header_init(mail, headers, TRUE);
 	mail->data.filter_stream =
 		i_stream_create_header_filter(mail->data.stream,
 					      HEADER_FILTER_INCLUDE |
@@ -992,6 +1008,11 @@ int index_mail_get_header_stream(struct mail *_mail,
 					      HEADER_FILTER_HIDE_BODY,
 					      headers->name, headers->count,
 					      header_cache_callback, mail);
+	/* Cap per-header data so a single pathological header cannot exhaust
+	   memory in mail->header_data / the filter's buffer. */
+	i_stream_header_filter_set_max_header_block_size(
+		mail->data.filter_stream,
+		MESSAGE_HEADER_BLOCK_DEFAULT_MAX_SIZE);
 	*stream_r = mail->data.filter_stream;
 	return 0;
 }

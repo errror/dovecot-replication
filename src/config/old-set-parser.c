@@ -1,11 +1,18 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
-#include "master-service.h"
+#include "version.h"
 #include "settings-history.h"
 #include "config-parser-private.h"
 #include "old-set-parser.h"
+
+static bool has_config_version(const char *dovecot_config_version)
+{
+	return dovecot_config_version[0] != '\0' &&
+		/* 0.0.0 is for git builds - it's always the latest */
+		strcmp(dovecot_config_version, "0.0.0") != 0;
+}
 
 static void ATTR_FORMAT(2, 3)
 obsolete(struct config_parser_context *ctx, const char *str, ...)
@@ -13,7 +20,7 @@ obsolete(struct config_parser_context *ctx, const char *str, ...)
 	static bool seen_obsoletes = FALSE;
 	va_list args;
 
-	if (ctx->hide_obsolete_warnings)
+	if ((ctx->flags & CONFIG_PARSE_FLAG_HIDE_OBSOLETE_WARNINGS) != 0)
 		return;
 
 	if (!seen_obsoletes) {
@@ -35,7 +42,7 @@ static void old_settings_handle_rename(struct config_parser_context *ctx,
 	struct settings_history *history = settings_history_get();
 	const struct setting_history_rename *rename;
 
-	if (ctx->dovecot_config_version[0] == '\0')
+	if (!has_config_version(ctx->dovecot_config_version))
 		return;
 
 	array_foreach(&history->renames, rename) {
@@ -78,18 +85,26 @@ bool old_settings_default(const char *dovecot_config_version,
 {
 	struct settings_history *history = settings_history_get();
 	const struct setting_history_default *def;
+	const char *generic_value = NULL;
 
-	if (dovecot_config_version[0] == '\0')
+	if (!has_config_version(dovecot_config_version))
 		return FALSE;
 
 	array_foreach(&history->defaults, def) {
 		if (version_cmp(def->version, dovecot_config_version) <= 0)
 			break;
-		if (strcmp(def->key, key) == 0 ||
-		    strcmp(def->key, key_with_path) == 0) {
+		if (strcmp(def->key, key_with_path) == 0) {
+			/* Exact filter path match is the most specific and
+			   always wins over a match on just the setting name. */
 			*old_default_r = def->old_value;
 			return TRUE;
 		}
+		if (generic_value == NULL && strcmp(def->key, key) == 0)
+			generic_value = def->old_value;
+	}
+	if (generic_value != NULL) {
+		*old_default_r = generic_value;
+		return TRUE;
 	}
 	return FALSE;
 }
@@ -100,6 +115,9 @@ old_settings_default_changes_count(const char *dovecot_config_version)
 	struct settings_history *history = settings_history_get();
 	const struct setting_history_default *def;
 	unsigned int count = 0;
+
+	if (!has_config_version(dovecot_config_version))
+		return 0;
 
 	array_foreach(&history->defaults, def) {
 		if (version_cmp(def->version, dovecot_config_version) <= 0)

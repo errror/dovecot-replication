@@ -16,7 +16,6 @@
 #include "str.h"
 #include "net.h"
 #include "safe-memset.h"
-#include "auth-cache.h"
 #include "settings.h"
 
 #include <sys/stat.h>
@@ -32,6 +31,8 @@
 #else
 #  define pam_const const
 #endif
+
+#define PAM_MAX_MESSAGES 1024
 
 typedef pam_const void *pam_item_t;
 
@@ -113,6 +114,12 @@ pam_userpass_conv(int num_msg, pam_const struct pam_message **msg,
 	int i;
 
 	*resp_r = NULL;
+	if (num_msg > PAM_MAX_MESSAGES) {
+		e_error(authdb_event(ctx->request),
+			"PAM wanted to send %u messages, which exceeds limit %u",
+			num_msg, PAM_MAX_MESSAGES);
+		return PAM_CONV_ERR;
+	}
 
 	resp = calloc(num_msg, sizeof(struct pam_response));
 	if (resp == NULL)
@@ -391,8 +398,10 @@ pam_verify_plain(struct auth_request *request, const char *password,
 }
 
 
-static int pam_preinit(pool_t pool, struct event *event,
-		       struct passdb_module **module_r, const char **error_r)
+static int
+pam_preinit(pool_t pool, struct event *event,
+	    const struct passdb_parameters *passdb_params,
+	    struct passdb_module **module_r, const char **error_r)
 {
 	const struct auth_pam_settings *set;
 	const struct auth_passdb_post_settings *post_set;
@@ -413,10 +422,10 @@ static int pam_preinit(pool_t pool, struct event *event,
 	}
 
 	module = p_new(pool, struct pam_passdb_module, 1);
-	module->module.default_cache_key =
-		auth_cache_parse_key_and_fields(pool,
-						t_strdup_printf("%%u/%s", set->service_name),
-						&post_set->fields, "pam");
+	const char *query = t_strdup_printf("%"AUTH_CACHE_KEY_USER"\t%s",
+					    set->service_name);
+	int ret = passdb_set_cache_key(&module->module, passdb_params, pool,
+				       query, &post_set->fields, "pam", error_r);
 	module->requests_left = set->max_requests;
 	module->pam_setcred = set->setcred;
 	module->pam_session = set->session;
@@ -426,7 +435,7 @@ static int pam_preinit(pool_t pool, struct event *event,
 	settings_free(set);
 
 	*module_r = &module->module;
-	return 0;
+	return ret;
 }
 
 struct passdb_module_interface passdb_pam = {

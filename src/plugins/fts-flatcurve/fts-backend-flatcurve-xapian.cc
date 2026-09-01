@@ -1,5 +1,4 @@
-/* Copyright (c) the Dovecot authors, based on code by Michael Slusarz.
- * See the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 extern "C" {
 #include "lib.h"
@@ -159,6 +158,9 @@ struct flatcurve_xapian {
 	/* List of mailboxes to optimize at shutdown. */
 	HASH_TABLE(char *, char *) optimize;
 
+	/* Optimization triggers. */
+	uint64_t density_threshold;
+
 	bool deinit:1;
 };
 
@@ -166,14 +168,14 @@ struct flatcurve_fts_query_xapian_maybe {
 	Xapian::Query *query;
 };
 
- struct flatcurve_fts_query_xapian {
+struct flatcurve_fts_query_xapian {
 	Xapian::Query *query;
 	ARRAY(struct flatcurve_fts_query_xapian_maybe) maybe_queries;
 
 	bool and_search:1;
 	bool maybe:1;
 	bool start:1;
- };
+};
 
 struct flatcurve_xapian_db_iter {
 	struct flatcurve_fts_backend *backend;
@@ -237,11 +239,21 @@ fts_flatcurve_xapian_db_populate(struct flatcurve_fts_backend *backend,
 
 void fts_flatcurve_xapian_init(struct flatcurve_fts_backend *backend)
 {
+	struct fts_flatcurve_user *fuser = backend->fuser;
+
 	backend->xapian = p_new(backend->pool, struct flatcurve_xapian, 1);
 	backend->xapian->pool =
 		pool_alloconly_create(FTS_FLATCURVE_LABEL " xapian", 2048);
 	hash_table_create(&backend->xapian->dbs, backend->xapian->pool,
 			  4, str_hash, strcmp);
+
+	if (fuser != NULL &&
+	    fuser->set != NULL &&
+	    fuser->set->optimize_density_percentage > 0 &&
+	    fuser->set->rotate_count > 0)
+		backend->xapian->density_threshold =
+			(uint64_t)fuser->set->rotate_count *
+			fuser->set->optimize_density_percentage / 100;
 }
 
 void fts_flatcurve_xapian_deinit(struct flatcurve_fts_backend *backend)
@@ -257,8 +269,9 @@ void fts_flatcurve_xapian_deinit(struct flatcurve_fts_backend *backend)
 
 		void *key, *val;
 		while (hash_table_iterate(iter, x->optimize, &key, &val)) {
-			str_append(backend->boxname, (const char *)key);
-			str_append(backend->db_path, (const char *)val);
+			fts_backend_flatcurve_set_mailbox_params(
+				backend, (const char *)key,
+				(const char *)val, FALSE, NULL);
 
 			if (fts_flatcurve_xapian_optimize_box(
 				backend, &error) < 0)
@@ -349,9 +362,14 @@ fts_flatcurve_xapian_db_iter_next(struct flatcurve_xapian_db_iter *iter)
 
 	struct stat st;
 	if (stat(iter->path->path, &st) < 0) {
+		if (errno == ENOENT) {
+			/* Another process deleted the entry after readdir()
+			   returned it, e.g. a temporary lock file created by
+			   file_create_locked(). Just skip it. */
+			return fts_flatcurve_xapian_db_iter_next(iter);
+		}
 		iter->error = i_strdup_printf(
-			"stat(%s) failed: %m",
-			str_c(iter->backend->db_path));
+			"stat(%s) failed: %m", iter->path->path);
 		return FALSE;
 	}
 
@@ -519,9 +537,6 @@ fts_flatcurve_xapian_optimize_mailbox(struct flatcurve_fts_backend *backend)
 {
 	struct flatcurve_xapian *x = backend->xapian;
 
-	if (x->deinit || !fts_flatcurve_xapian_need_optimize(backend))
-		return;
-
 	if (!hash_table_is_created(x->optimize))
 		hash_table_create(&x->optimize, backend->pool, 0, str_hash,
 				  strcmp);
@@ -653,7 +668,8 @@ fts_flatcurve_xapian_db_read_add(struct flatcurve_fts_backend *backend,
 	++x->shards;
 	x->db_read->add_database(*(xdb->db));
 
-	fts_flatcurve_xapian_optimize_mailbox(backend);
+	if (!x->deinit && fts_flatcurve_xapian_need_optimize(backend))
+		fts_flatcurve_xapian_optimize_mailbox(backend);
 
 	return 1;
 }
@@ -1619,6 +1635,13 @@ int fts_flatcurve_xapian_expunge(struct flatcurve_fts_backend *backend,
 		if (fts_flatcurve_xapian_check_commit_limit(
 			backend, xdb, error_r) < 0)
 			return -1;
+
+		/* Check for density threshold when we are removing messages
+		 * from a non-current shard. */
+		if (backend->xapian->density_threshold &&
+		    xdb->type == FLATCURVE_XAPIAN_DB_TYPE_INDEX &&
+		    xdb->dbw->get_doccount() <= backend->xapian->density_threshold)
+			fts_flatcurve_xapian_optimize_mailbox(backend);
 		return 1;
 	} catch (Xapian::Error &e) {
 		*error_r = t_strdup_printf(
@@ -1903,6 +1926,10 @@ fts_flatcurve_xapian_optimize_box_do(struct flatcurve_fts_backend *backend,
 		return 0;
 	}
 
+	/* Close all write handles before deleting directories. */
+	if (fts_flatcurve_xapian_refresh(backend, error_r) < 0)
+		return -1;
+
 	/* Delete old indexes. */
 	struct flatcurve_xapian_db_iter *iter =
 		fts_flatcurve_xapian_db_iter_init(backend, opts);
@@ -1958,11 +1985,6 @@ int fts_flatcurve_xapian_optimize_box(struct flatcurve_fts_backend *backend,
 		backend, opts, &db, error_r)) <= 0)
 		return ret;
 
-	if (backend->xapian->deinit &&
-	    !fts_flatcurve_xapian_need_optimize(backend)) {
-		return fts_flatcurve_xapian_close(backend, error_r);
-	}
-
 	e_debug(event_create_passthrough(backend->event)->
 		set_name("fts_flatcurve_optimize")->
 		add_str("mailbox", str_c(backend->boxname))->event(),
@@ -1986,13 +2008,25 @@ int fts_flatcurve_xapian_optimize_box(struct flatcurve_fts_backend *backend,
 }
 
 static void
+fts_flatcurve_build_add_maybe_query(struct flatcurve_fts_query *query,
+				    Xapian::Query *q)
+{
+	struct flatcurve_fts_query_xapian_maybe *mquery;
+	struct flatcurve_fts_query_xapian *x = query->xapian;
+
+	if (!array_is_created(&x->maybe_queries))
+		p_array_init(&x->maybe_queries, query->pool, 4);
+	mquery = array_append_space(&x->maybe_queries);
+	mquery->query = q;
+}
+
+static void
 fts_flatcurve_build_query_arg_term(struct flatcurve_fts_query *query,
 				   struct mail_search_arg *arg,
 				   const char *term)
 {
 	const char *hdr;
 	bool maybe_or = FALSE;
-	struct flatcurve_fts_query_xapian_maybe *mquery;
 	Xapian::Query::op op = Xapian::Query::OP_INVALID;
 	Xapian::Query *oldq, q;
 	struct flatcurve_fts_query_xapian *x = query->xapian;
@@ -2083,10 +2117,8 @@ fts_flatcurve_build_query_arg_term(struct flatcurve_fts_query *query,
 		/* Maybe searches are not added to the "master search" query if this
 		 * is an OR search; they will be run independently. Matches will be
 		 * placed in the maybe results array. */
-		if (!array_is_created(&x->maybe_queries))
-			p_array_init(&x->maybe_queries, query->pool, 4);
-		mquery = array_append_space(&x->maybe_queries);
-		mquery->query = new Xapian::Query(std_move(q));
+		fts_flatcurve_build_add_maybe_query(query,
+						    new Xapian::Query(std_move(q)));
 	} else if (x->query == NULL) {
 		x->query = new Xapian::Query(std_move(q));
 	} else {
@@ -2102,6 +2134,20 @@ fts_flatcurve_build_query_arg(struct flatcurve_fts_query *query,
 {
 	if (arg->no_fts)
 		return;
+
+	/* Phrase searching is not supported natively, so we can only do
+	 * single token searching (as FTS core provides index terms without
+	 * positional context).
+	 *
+	 * We can do matching for the tokenized input, as these results reduce
+	 * the message space iterated by the core search code to do the full
+	 * phrase matching (since these results are ANDed with the phrase search
+	 * due to FTS_BACKEND_FLAG_SEARCH_ARGS_V2 being set). */
+	if (HAS_ANY_BITS(arg->value.search_flags, MAIL_SEARCH_ARG_FLAG_PHRASE_FULL)) {
+		/* We skip the full phrase and don't set "match_always", so
+		 * that the core FTS code will process this search argument. */
+		return;
+	}
 
 	switch (arg->type) {
 	case SEARCH_TEXT:
@@ -2137,19 +2183,9 @@ fts_flatcurve_build_query_arg(struct flatcurve_fts_query *query,
 		return;
 	}
 
-	if (strchr(arg->value.str, ' ') == NULL) {
-		/* Prepare search term.
-		 * This includes existence searches where arg is "" */
-		fts_flatcurve_build_query_arg_term(query, arg, arg->value.str);
-	} else {
-		/* Phrase searching is not supported natively, so we can only do
-		 * single term searching with Xapian (FTS core provides index
-		 * terms without positional context).
-
-		 * FTS core will send both the phrase search and individual search
-		 * terms separately as part of the same query. Therefore, if we
-		 * encounter a multi-term search, just ignore it */
-	}
+	/* Prepare search term.
+	 * This includes existence searches where arg is "" */
+	fts_flatcurve_build_query_arg_term(query, arg, arg->value.str);
 }
 
 void

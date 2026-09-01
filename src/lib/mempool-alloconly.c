@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /* @UNSAFE: whole file */
 #include "lib.h"
@@ -281,6 +281,8 @@ pool_t pool_alloconly_create_clean(const char *name, size_t size)
 static void pool_alloconly_free_block(struct alloconly_pool *apool ATTR_UNUSED,
 				      struct pool_block *block)
 {
+	int old_errno = errno;
+
 #ifdef DEBUG
 	safe_memset(block, CLEAR_CHR, SIZEOF_POOLBLOCK + block->size);
 #else
@@ -290,6 +292,7 @@ static void pool_alloconly_free_block(struct alloconly_pool *apool ATTR_UNUSED,
 	}
 #endif
 	free(block);
+	errno = old_errno;
 }
 
 static void
@@ -381,11 +384,13 @@ static void block_alloc(struct alloconly_pool *apool, size_t size)
 #endif
 	}
 
+	int old_errno = errno;
 	block = calloc(size, 1);
 	if (unlikely(block == NULL)) {
 		i_fatal_status(FATAL_OUTOFMEM, "block_alloc(%zu"
 			       "): Out of memory", size);
 	}
+	errno = old_errno;
 	block->prev = apool->block;
 	apool->block = block;
 
@@ -496,6 +501,9 @@ static void pool_alloconly_clear(pool_t pool)
 	check_sentries(apool->block);
 #endif
 
+	/* the pool's contents are being freed, so anything referring to the
+	   external pools is gone as well */
+	pool_external_refs_unref(&apool->pool);
 	pool_alloconly_free_blocks_until_last(apool);
 
 	/* clear the first block */

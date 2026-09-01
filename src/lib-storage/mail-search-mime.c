@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -16,7 +16,7 @@
 
 static struct mail_search_mime_arg *
 mail_search_mime_arg_dup_one(pool_t pool,
-	const struct mail_search_mime_arg *arg)
+			     const struct mail_search_mime_arg *arg)
 {
 	struct mail_search_mime_arg *new_arg;
 
@@ -66,8 +66,7 @@ mail_search_mime_arg_dup_one(pool_t pool,
 	case SEARCH_MIME_FILENAME_CONTAINS:
 	case SEARCH_MIME_FILENAME_BEGINS:
 	case SEARCH_MIME_FILENAME_ENDS:
-		new_arg->value.str =
-			p_strdup(pool, arg->value.str);
+		new_arg->value.str = p_strdup(pool, arg->value.str);
 		break;
 	case SEARCH_MIME_SENTBEFORE:
 	case SEARCH_MIME_SENTON:
@@ -92,8 +91,7 @@ mail_search_mime_arg_dup_one(pool_t pool,
 }
 
 struct mail_search_mime_arg *
-mail_search_mime_arg_dup(pool_t pool,
-	const struct mail_search_mime_arg *arg)
+mail_search_mime_arg_dup(pool_t pool, const struct mail_search_mime_arg *arg)
 {
 	struct mail_search_mime_arg *new_arg = NULL, **dest = &new_arg;
 
@@ -106,7 +104,7 @@ mail_search_mime_arg_dup(pool_t pool,
 
 struct mail_search_mime_part *
 mail_search_mime_part_dup(pool_t pool,
-	const struct mail_search_mime_part *mpart)
+			  const struct mail_search_mime_part *mpart)
 {
 	struct mail_search_mime_part *new_mpart;
 
@@ -121,10 +119,11 @@ mail_search_mime_part_dup(pool_t pool,
  */
 
 void mail_search_mime_args_reset(struct mail_search_mime_arg *args,
-	bool full_reset)
+				 bool full_reset)
 {
 	while (args != NULL) {
-		if (args->type == SEARCH_MIME_OR || args->type == SEARCH_MIME_SUB)
+		if (args->type == SEARCH_MIME_OR ||
+		    args->type == SEARCH_MIME_SUB)
 			mail_search_mime_args_reset(args->value.subargs, full_reset);
 
 		if (args->match_always) {
@@ -149,9 +148,10 @@ void mail_search_mime_args_reset(struct mail_search_mime_arg *args,
 	}
 }
 
-static void search_mime_arg_foreach(struct mail_search_mime_arg *arg,
-			       mail_search_mime_foreach_callback_t *callback,
-			       void *context)
+static void
+search_mime_arg_foreach(struct mail_search_mime_arg *arg,
+			mail_search_mime_foreach_callback_t *callback,
+			void *context)
 {
 	struct mail_search_mime_arg *subarg;
 
@@ -210,8 +210,8 @@ static void search_mime_arg_foreach(struct mail_search_mime_arg *arg,
 
 #undef mail_search_mime_args_foreach
 int mail_search_mime_args_foreach(struct mail_search_mime_arg *args,
-			     mail_search_mime_foreach_callback_t *callback,
-			     void *context)
+				  mail_search_mime_foreach_callback_t *callback,
+				  void *context)
 {
 	int result;
 
@@ -236,17 +236,16 @@ int mail_search_mime_args_foreach(struct mail_search_mime_arg *args,
  */
 
 bool mail_search_mime_arg_one_equals(const struct mail_search_mime_arg *arg1,
-				const struct mail_search_mime_arg *arg2)
+				     const struct mail_search_mime_arg *arg2)
 {
-	if (arg1->type != arg2->type ||
-	    arg1->match_not != arg2->match_not)
+	if (arg1->type != arg2->type || arg1->match_not != arg2->match_not)
 		return FALSE;
 
 	switch (arg1->type) {
 	case SEARCH_MIME_OR:
 	case SEARCH_MIME_SUB:
 		return mail_search_mime_arg_equals(arg1->value.subargs,
-					      arg2->value.subargs);
+						   arg2->value.subargs);
 
 	case SEARCH_MIME_SIZE_EQUAL:
 	case SEARCH_MIME_SIZE_LARGER:
@@ -300,7 +299,7 @@ bool mail_search_mime_arg_one_equals(const struct mail_search_mime_arg *arg1,
 		if (arg2->value.subargs == NULL)
 			return FALSE;
 		return mail_search_mime_arg_equals(arg1->value.subargs,
-					      arg2->value.subargs);
+						   arg2->value.subargs);
 
 	case SEARCH_MIME_DEPTH_EQUAL:
 	case SEARCH_MIME_DEPTH_MIN:
@@ -312,7 +311,7 @@ bool mail_search_mime_arg_one_equals(const struct mail_search_mime_arg *arg1,
 }
 
 bool mail_search_mime_arg_equals(const struct mail_search_mime_arg *arg1,
-			    const struct mail_search_mime_arg *arg2)
+				 const struct mail_search_mime_arg *arg2)
 {
 	while (arg1 != NULL && arg2 != NULL) {
 		if (!mail_search_mime_arg_one_equals(arg1, arg2))
@@ -324,7 +323,7 @@ bool mail_search_mime_arg_equals(const struct mail_search_mime_arg *arg1,
 }
 
 bool mail_search_mime_parts_equal(const struct mail_search_mime_part *mpart1,
-			    const struct mail_search_mime_part *mpart2)
+				  const struct mail_search_mime_part *mpart2)
 {
 	i_assert(mpart1->simplified == mpart2->simplified);
 
@@ -348,9 +347,12 @@ void mail_search_mime_simplify(struct mail_search_mime_part *mpart)
 
 static bool
 mail_search_mime_subargs_to_imap(string_t *dest,
-	const struct mail_search_mime_arg *args,
-	const char *prefix, const char **error_r)
+				 const struct mail_search_mime_arg *args,
+				 const char *prefix,
+				 enum imap_quote_flags qflags,
+				 const char **error_r)
 {
+	bool utf8 = HAS_ALL_BITS(qflags, IMAP_QUOTE_FLAG_UTF8);
 	const struct mail_search_mime_arg *arg;
 
 	if (prefix[0] == '\0')
@@ -358,7 +360,7 @@ mail_search_mime_subargs_to_imap(string_t *dest,
 	for (arg = args; arg != NULL; arg = arg->next) {
 		if (arg->next != NULL)
 			str_append(dest, prefix);
-		if (!mail_search_mime_arg_to_imap(dest, arg, error_r))
+		if (!mail_search_mime_arg_to_imap(dest, arg, utf8, error_r))
 			return FALSE;
 		if (arg->next != NULL)
 			str_append_c(dest, ' ');
@@ -370,7 +372,7 @@ mail_search_mime_subargs_to_imap(string_t *dest,
 
 static bool
 mail_search_mime_arg_to_imap_date(string_t *dest,
-	const struct mail_search_mime_arg *arg)
+				  const struct mail_search_mime_arg *arg)
 {
 	time_t timestamp = arg->value.time;
 	const char *str;
@@ -388,19 +390,22 @@ mail_search_mime_arg_to_imap_date(string_t *dest,
 }
 
 bool mail_search_mime_arg_to_imap(string_t *dest,
-	const struct mail_search_mime_arg *arg, const char **error_r)
+				  const struct mail_search_mime_arg *arg,
+				  bool utf8, const char **error_r)
 {
+	enum imap_quote_flags qflags = (utf8 ? IMAP_QUOTE_FLAG_UTF8 : 0);
+
 	if (arg->match_not)
 		str_append(dest, "NOT ");
 	switch (arg->type) {
 	case SEARCH_MIME_OR:
-		if (!mail_search_mime_subargs_to_imap
-			(dest, arg->value.subargs, "OR ", error_r))
+		if (!mail_search_mime_subargs_to_imap(
+			dest, arg->value.subargs, "OR ", qflags, error_r))
 			return FALSE;
 		break;
 	case SEARCH_MIME_SUB:
-		if (!mail_search_mime_subargs_to_imap
-			(dest, arg->value.subargs, "", error_r))
+		if (!mail_search_mime_subargs_to_imap(
+			dest, arg->value.subargs, "", qflags, error_r))
 			return FALSE;
 		break;
 	case SEARCH_MIME_SIZE_EQUAL:
@@ -414,93 +419,93 @@ bool mail_search_mime_arg_to_imap(string_t *dest,
 		break;
 	case SEARCH_MIME_DESCRIPTION:
 		str_append(dest, "DESCRIPTION ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_DISPOSITION_TYPE:
 		str_append(dest, "DISPOSITION TYPE ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		break;
 	case SEARCH_MIME_DISPOSITION_PARAM:
 		str_append(dest, "DISPOSITION PARAM ");
-		imap_append_astring(dest, arg->field_name);
+		imap_append_astring(dest, arg->field_name, 0);
 		str_append_c(dest, ' ');
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_ENCODING:
 		str_append(dest, "ENCODING ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		break;
 	case SEARCH_MIME_ID:
 		str_append(dest, "ID ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		break;
 	case SEARCH_MIME_LANGUAGE:
 		str_append(dest, "LANGUAGE ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		break;
 	case SEARCH_MIME_LOCATION:
 		str_append(dest, "LOCATION ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		break;
 	case SEARCH_MIME_MD5:
 		str_append(dest, "MD5 ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		break;
 	case SEARCH_MIME_TYPE:
 		str_append(dest, "TYPE ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		break;
 	case SEARCH_MIME_SUBTYPE:
 		str_append(dest, "SUBTYPE ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		break;
 	case SEARCH_MIME_PARAM:
 		str_append(dest, "PARAM ");
-		imap_append_astring(dest, arg->field_name);
+		imap_append_astring(dest, arg->field_name, 0);
 		str_append_c(dest, ' ');
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_HEADER:
 		str_append(dest, "HEADER ");
-		imap_append_astring(dest, arg->field_name);
+		imap_append_astring(dest, arg->field_name, 0);
 		str_append_c(dest, ' ');
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_BODY:
 		str_append(dest, "BODY ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_TEXT:
 		str_append(dest, "TEXT ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_CC:
 		str_append(dest, "CC ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_BCC:
 		str_append(dest, "BCC ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_FROM:
 		str_append(dest, "FROM ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_IN_REPLY_TO:
 		str_append(dest, "IN-REPLY-TO ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_MESSAGE_ID:
 		str_append(dest, "MESSAGE-ID ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_REPLY_TO:
 		str_append(dest, "REPLY-TO ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_SENDER:
 		str_append(dest, "SENDER ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_SENTBEFORE:
 		str_append(dest, "SENTBEFORE");
@@ -531,11 +536,11 @@ bool mail_search_mime_arg_to_imap(string_t *dest,
 		break;
 	case SEARCH_MIME_SUBJECT:
 		str_append(dest, "SUBJECT ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_TO:
 		str_append(dest, "TO ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_DEPTH_EQUAL:
 		str_printfa(dest, "DEPTH %u", arg->value.number);
@@ -553,51 +558,54 @@ bool mail_search_mime_arg_to_imap(string_t *dest,
 		str_append(dest, "PARENT ");
 		if (arg->value.subargs == NULL)
 			str_append(dest, "EXISTS");
-		else if (!mail_search_mime_subargs_to_imap
-			(dest, arg->value.subargs, "", error_r))
+		else if (!mail_search_mime_subargs_to_imap(
+				dest, arg->value.subargs, "", qflags, error_r))
 			return FALSE;
 		break;
 	case SEARCH_MIME_CHILD:
 		str_append(dest, "CHILD ");
 		if (arg->value.subargs == NULL)
 			str_append(dest, "EXISTS");
-		else if (!mail_search_mime_subargs_to_imap
-			(dest, arg->value.subargs, "", error_r))
+		else if (!mail_search_mime_subargs_to_imap(
+				dest, arg->value.subargs, "", qflags, error_r))
 			return FALSE;
 		break;
 	case SEARCH_MIME_FILENAME_IS:
 		str_append(dest, "FILENAME IS ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_FILENAME_CONTAINS:
 		str_append(dest, "FILENAME CONTAINS ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_FILENAME_BEGINS:
 		str_append(dest, "FILENAME BEGINS ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	case SEARCH_MIME_FILENAME_ENDS:
 		str_append(dest, "FILENAME ENDS ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, qflags);
 		break;
 	}
 	return TRUE;
 }
 
 bool mail_search_mime_part_to_imap(string_t *dest,
-	const struct mail_search_mime_part *mpart, const char **error_r)
+				   const struct mail_search_mime_part *mpart,
+				   bool utf8, const char **error_r)
 {
 	const struct mail_search_mime_arg *arg;
 
 	i_assert(mpart->args != NULL);
 	if (mpart->args->next == NULL) {
-		if (!mail_search_mime_arg_to_imap(dest, mpart->args, error_r))
+		if (!mail_search_mime_arg_to_imap(dest, mpart->args, utf8,
+						  error_r))
 			return FALSE;
 	} else {
 		str_append_c(dest, '(');
 		for (arg = mpart->args; arg != NULL; arg = arg->next) {
-			if (!mail_search_mime_arg_to_imap(dest, arg, error_r))
+			if (!mail_search_mime_arg_to_imap(dest, arg, utf8,
+							  error_r))
 				return FALSE;
 			if (arg->next != NULL)
 				str_append_c(dest, ' ');
@@ -606,4 +614,3 @@ bool mail_search_mime_part_to_imap(string_t *dest,
 	}
 	return TRUE;
 }
-

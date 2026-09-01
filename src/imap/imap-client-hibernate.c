@@ -1,6 +1,7 @@
-/* Copyright (c) 2014-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
+#include "hostpid.h"
 #include "fdpass.h"
 #include "net.h"
 #include "istream.h"
@@ -9,7 +10,7 @@
 #include "base64.h"
 #include "str.h"
 #include "strescape.h"
-#include "master-service.h"
+#include "version.h"
 #include "compression.h"
 #include "mailbox-watch.h"
 #include "imap-state.h"
@@ -61,7 +62,10 @@ static void imap_hibernate_write_cmd(struct client *client, string_t *cmd,
 	str_append_tabescaped(cmd, user->set->unexpanded_mail_log_prefix);
 	str_printfa(cmd, "\tidle_notify_interval=%u",
 		    client->set->imap_idle_notify_interval);
-	if (fstat(client->fd_in, &peer_st) == 0) {
+	/* e.g. FreeBSD returns NODEV as sockets' st_dev, which can't be
+	   used for verifying that the fd is the expected one. */
+	if (fstat(client->fd_in, &peer_st) == 0 &&
+	    peer_st.st_dev != (dev_t)-1) {
 		str_printfa(cmd, "\tpeer_dev_major=%lu\tpeer_dev_minor=%lu\tpeer_ino=%llu",
 			    (unsigned long)major(peer_st.st_dev),
 			    (unsigned long)minor(peer_st.st_dev),
@@ -87,11 +91,23 @@ static void imap_hibernate_write_cmd(struct client *client, string_t *cmd,
 	if (client->userdb_fields != NULL) {
 		string_t *userdb_fields = t_str_new(256);
 		unsigned int i;
+		bool have_auth_token_session_pid = FALSE;
 
 		for (i = 0; client->userdb_fields[i] != NULL; i++) {
 			if (i > 0)
 				str_append_c(userdb_fields, '\t');
+			if (str_begins_with(client->userdb_fields[i],
+					    "auth_token_session_pid="))
+				have_auth_token_session_pid = TRUE;
 			str_append_tabescaped(userdb_fields, client->userdb_fields[i]);
+		}
+		if (!have_auth_token_session_pid) {
+			if (i > 0)
+				str_append_c(userdb_fields, '\t');
+			/* This is picked up by mail-storage-service when
+			   unhibernating. */
+			str_printfa(userdb_fields, "auth_token_session_pid=%s",
+				    dec2str(client->user->auth_token_session_pid));
 		}
 		str_append(cmd, "\tuserdb_fields=");
 		str_append_tabescaped(cmd, str_c(userdb_fields));
@@ -108,6 +124,10 @@ static void imap_hibernate_write_cmd(struct client *client, string_t *cmd,
 		str_append(cmd, "\ttag=");
 		str_append_tabescaped(cmd, tag);
 	}
+	str_append(cmd, "\tauth_token=");
+	str_append_tabescaped(cmd, user->auth_token);
+	str_printfa(cmd, "\tsession_pid=%s",
+		    dec2str(user->auth_token_session_pid));
 	str_append(cmd, "\tstats=");
 	str_append_tabescaped(cmd, client_stats(client));
 	if (client->command_queue != NULL &&
@@ -242,6 +262,10 @@ bool imap_client_hibernate(struct client **_client, const char **reason_r)
 		*reason_r = "stdio clients can't be hibernated";
 		return FALSE;
 	}
+	if (client->user->auth_token == NULL) {
+		*reason_r = "User is missing auth_token";
+		return FALSE;
+	}
 
 #ifdef BUILD_IMAP_HIBERNATE
 	buffer_t *state;
@@ -304,9 +328,12 @@ bool imap_client_hibernate(struct client **_client, const char **reason_r)
 		/* hide the disconnect log message, because the client didn't
 		   actually log out */
 		e_debug(e->event(),
-			"Successfully hibernated imap client in mailbox %s",
+			"Successfully hibernated imap client in mailbox %s "
+			"(session_pid=%s auth_token=%s)",
 			client->mailbox == NULL ? "<none>" :
-			mailbox_get_vname(client->mailbox));
+			mailbox_get_vname(client->mailbox),
+			dec2str(client->user->auth_token_session_pid),
+			client->user->auth_token);
 		client->disconnected = TRUE;
 		client->hibernated = TRUE;
 		client_destroy(client, NULL);

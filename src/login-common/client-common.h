@@ -5,7 +5,7 @@ struct module;
 
 #include "net.h"
 #include "login-proxy.h"
-#include "sasl-server.h"
+#include "sasl-proxy.h"
 #include "login-client.h"
 
 #define LOGIN_MAX_SESSION_ID_LEN 64
@@ -64,6 +64,7 @@ enum client_auth_fail_code {
 	CLIENT_AUTH_FAIL_CODE_MECH_INVALID,
 	CLIENT_AUTH_FAIL_CODE_MECH_SSL_REQUIRED,
 	CLIENT_AUTH_FAIL_CODE_ANONYMOUS_DENIED,
+	CLIENT_AUTH_FAIL_CODE_INVALID_CREDENTIALS,
 
 	CLIENT_AUTH_FAIL_CODE_COUNT
 };
@@ -122,9 +123,11 @@ struct client_auth_reply {
 struct client_vfuncs {
 	struct client *(*alloc)(pool_t pool);
 	int (*create)(struct client *client);
+	void (*disconnect)(struct client *client, const char *reason);
 	void (*destroy)(struct client *client);
 	int (*reload_config)(struct client *client, const char **error_r);
 	void (*notify_auth_ready)(struct client *client);
+	void (*notify_auth_connected)(struct client *client);
 	void (*notify_disconnect)(struct client *client,
 				  enum client_disconnect_reason reason,
 				  const char *text);
@@ -194,6 +197,9 @@ struct client {
 	const char *session_id, *listener_name, *postlogin_socket_path;
 	const char *local_name;
 	const char *client_cert_common_name;
+	struct var_expand_program *log_progam;
+	const char *const *const log_template;
+	ARRAY_TYPE(const_expansion_program) *log_elements;
 
 	string_t *client_id;
 	ARRAY_TYPE(const_string) forward_fields;
@@ -225,7 +231,7 @@ struct client {
 	unsigned int proxy_ttl;
 
 	char *auth_mech_name;
-	enum sasl_server_auth_flags auth_flags;
+	enum sasl_proxy_auth_flags auth_flags;
 	/* Auth request set while the client is authenticating.
 	   During this time authenticating=TRUE also. */
 	struct auth_client_request *auth_request;
@@ -244,10 +250,11 @@ struct client {
 	   sending client fd to mail process. authenticating is always TRUE
 	   while this is non-zero. */
 	unsigned int master_tag;
-	sasl_server_callback_t *sasl_callback;
+	sasl_proxy_callback_t *sasl_callback;
 
 	unsigned int bad_counter;
 	unsigned int auth_attempts, auth_successes;
+	char *last_proxy_auth_failure_reason;
 	enum client_auth_fail_code last_auth_fail;
 	enum login_proxy_failure_type proxy_last_failure;
 	pid_t mail_pid;
@@ -262,6 +269,9 @@ struct client {
 	   Can also be NULL if there are no user_* fields. */
 	const char **alt_usernames;
 
+	/* Last host we tried to connect to */
+	char *proxy_last_host;
+
 	bool create_finished:1;
 	bool disconnected:1;
 	bool destroyed:1;
@@ -274,6 +284,9 @@ struct client {
 	bool connection_used_starttls:1;
 	/* HAProxy terminated the TLS connection. */
 	bool haproxy_terminated_tls:1;
+	/* HAProxy reports that the end client presented a verified client
+	   certificate. Implies haproxy_terminated_tls. */
+	bool haproxy_ssl_client_cert:1;
 	/* Connection from the previous hop (client, proxy, haproxy) is
 	   considered secured. Either because TLS is used, or because the
 	   connection is otherwise considered not to need TLS. Note that this
@@ -357,6 +370,11 @@ void client_destroy_success(struct client *client, const char *reason);
 void client_ref(struct client *client);
 bool client_unref(struct client **client) ATTR_NOWARN_UNUSED_RESULT;
 
+int client_settings_reload(struct client *client, const char **error_r)
+	ATTR_WARN_UNUSED_RESULT;
+int client_addresses_changed(struct client *client, const char **error_r)
+	ATTR_WARN_UNUSED_RESULT;
+
 void client_rawlog_init(struct client *client);
 void client_rawlog_deinit(struct client *client);
 
@@ -381,9 +399,6 @@ bool client_get_extra_disconnect_reason(struct client *client,
 					const char **event_reason_r);
 
 void client_auth_respond(struct client *client, const char *response);
-/* Called when client asks for SASL authentication to be aborted by sending
-   "*" line. */
-void client_auth_abort(struct client *client);
 bool client_is_tls_enabled(struct client *client);
 void client_auth_fail(struct client *client, const char *text);
 const char *client_get_session_id(struct client *client);
@@ -399,6 +414,7 @@ client_does_custom_io(struct client *client)
 }
 
 void client_notify_auth_ready(struct client *client);
+void client_notify_auth_connected(struct client *client);
 void client_notify_status(struct client *client, bool bad, const char *text);
 void client_notify_disconnect(struct client *client,
 			      enum client_disconnect_reason reason,

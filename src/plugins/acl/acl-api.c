@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,7 +7,6 @@
 #include "hash.h"
 #include "mail-user.h"
 #include "mailbox-list.h"
-#include "acl-global-file.h"
 #include "acl-cache.h"
 #include "acl-api-private.h"
 
@@ -190,7 +189,10 @@ acl_default_object_list_init(struct acl_object *aclobj)
 	if (aclobj->backend->v->object_refresh_cache(aclobj) < 0)
 		iter->failed = TRUE;
 
-	aclobj_rights = array_get(&aclobj->rights, &iter->count);
+	iter->count = 0;
+	if (array_not_empty(&aclobj->rights))
+		aclobj_rights = array_get(&aclobj->rights, &iter->count);
+
 	if (iter->count > 0) {
 		iter->rights = p_new(pool, struct acl_rights, iter->count);
 		for (i = 0; i < iter->count; i++)
@@ -383,16 +385,3 @@ void acl_object_remove_all_access(struct acl_object *aclobj)
 	array_push_back(&aclobj->rights, &rights);
 }
 
-void acl_object_add_global_acls(struct acl_object *aclobj)
-{
-	struct acl_backend *backend = aclobj->backend;
-	const char *vname, *error;
-
-	if (mailbox_list_is_valid_name(backend->list, aclobj->name, &error))
-		vname = mailbox_list_get_vname(backend->list, aclobj->name);
-	else
-		vname = "";
-
-	acl_global_file_get(backend->global_file, vname,
-			    aclobj->rights_pool, &aclobj->rights);
-}

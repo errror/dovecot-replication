@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "mycrypt.h"
@@ -130,7 +130,7 @@ crypt_verify_blowfish(const char *plaintext, const struct password_generate_para
 		return -1;
 	}
 
-	return strcmp(crypted, password) == 0 ? 1 : 0;
+	return str_equals_timing_almost_safe(crypted, password) ? 1 : 0;
 }
 
 static void

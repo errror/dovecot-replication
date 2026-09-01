@@ -1,4 +1,4 @@
-/* Copyright (c) 1999-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #define _GNU_SOURCE /* For Linux's struct ucred */
 #include "lib.h"
@@ -628,12 +628,8 @@ int net_accept(int fd, struct ip_addr *addr_r, in_port_t *port_r)
 	addrlen = sizeof(so);
 	ret = accept(fd, &so.sa, &addrlen);
 
-	if (ret < 0) {
-		if (errno == EAGAIN || errno == ECONNABORTED)
-			return -1;
-		else
-			return -2;
-	}
+	if (ret < 0)
+		return -1;
 	if (so.sin.sin_family == AF_UNIX) {
 		if (addr_r != NULL)
 			i_zero(addr_r);

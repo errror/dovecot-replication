@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -21,6 +21,7 @@
 #include "master-service-settings.h"
 #include "imap-keepalive.h"
 #include "imap-master-connection.h"
+#include "imap-parser.h"
 #include "imap-client.h"
 
 #include <unistd.h>
@@ -76,6 +77,9 @@ struct imap_client {
 	struct timeout *to_keepalive;
 	struct imap_master_connection *master_conn;
 	struct ioloop_context *ioloop_ctx;
+	/* Points to imap_hibernate_client.imap_client. Set to NULL when this
+	   client is destroyed. */
+	struct imap_client **destroy_ref;
 	const char *log_prefix;
 	unsigned int next_read_threshold;
 	bool bad_done, idle_done;
@@ -148,7 +152,7 @@ imap_client_parse_userdb_fields(struct imap_client *client,
 	}
 }
 
-static void
+static int
 imap_client_move_back_send_callback(void *context, struct ostream *output)
 {
 	struct imap_client *client = context;
@@ -199,6 +203,14 @@ imap_client_move_back_send_callback(void *context, struct ostream *output)
 		str_append(str, "\tstate=");
 		base64_encode(state->state, state->state_size, str);
 	}
+	if (state->auth_token != NULL) {
+		str_append(str, "\tauth_token=");
+		str_append_tabescaped(str, state->auth_token);
+	}
+	if (state->session_pid != NULL) {
+		str_append(str, "\tsession_pid=");
+		str_append_tabescaped(str, state->session_pid);
+	}
 	input_data = i_stream_get_data(client->input, &input_size);
 	if (input_size > 0) {
 		str_append(str, "\tclient_input=");
@@ -239,7 +251,7 @@ imap_client_move_back_send_callback(void *context, struct ostream *output)
 		const char *error = t_strdup_printf(
 			"fd_send(%s) failed: %m", o_stream_get_name(output));
 		imap_client_unhibernate_failed(&client, error);
-		return;
+		return -1;
 	}
 	/* If unhibernation fails after this, shutdown() the fd to make sure
 	   the imap process won't later on finish unhibernation after all and
@@ -247,6 +259,7 @@ imap_client_move_back_send_callback(void *context, struct ostream *output)
 	client->shutdown_fd_on_destroy = TRUE;
 	i_assert(ret > 0);
 	o_stream_nsend(output, str_data(str) + 1, str_len(str) - 1);
+	return 0;
 }
 
 static void
@@ -334,62 +347,77 @@ static void imap_client_move_back(struct imap_client *client)
 }
 
 static enum imap_client_input_state
+imap_client_input_parse_input(struct istream *input, struct imap_parser *parser,
+			      const char **tag_r)
+{
+	const unsigned char *rest;
+	size_t rest_size;
+	const char *word, *tag;
+	enum imap_client_input_state state = IMAP_CLIENT_INPUT_STATE_DONE_LF;
+	int ret;
+
+	/* read DONE */
+	word = imap_parser_read_word(parser);
+	if (word == NULL)
+		return IMAP_CLIENT_INPUT_STATE_UNKNOWN;
+	if (strcasecmp(word, "DONE") != 0)
+		return IMAP_CLIENT_INPUT_STATE_BAD;
+
+	/* read [\r]\n after DONE */
+	rest = i_stream_get_data(input, &rest_size);
+	if (rest_size == 0)
+		return IMAP_CLIENT_INPUT_STATE_UNKNOWN;
+	if (rest[0] == '\r') {
+		state = IMAP_CLIENT_INPUT_STATE_DONE_CRLF;
+		i_stream_skip(input, 1);
+		rest = i_stream_get_data(input, &rest_size);
+		if (rest_size == 0)
+			return IMAP_CLIENT_INPUT_STATE_UNKNOWN;
+	}
+	if (rest[0] != '\n')
+		return IMAP_CLIENT_INPUT_STATE_BAD;
+	i_stream_skip(input, 1);
+
+	/* optionally followed by "<tag> IDLE[\r]\n" - checking this assumes
+	   that the DONE and IDLE are sent in the same IP packet, otherwise
+	   we'll unnecessarily recreate the imap process and immediately resume
+	   IDLE there. if this becomes an issue we could add a small delay to
+	   the imap process creation and wait for the IDLE command during it. */
+	if (i_stream_get_data_size(input) == 0)
+		return state;
+
+	ret = imap_parser_read_tag(parser, &tag);
+	if (ret <= 0)
+		return state;
+
+	/* read IDLE */
+	word = imap_parser_read_word(parser);
+	if (word == NULL || strcasecmp(word, "IDLE") != 0)
+		return state;
+
+	/* require [\r]\n and nothing else left */
+	rest = i_stream_get_data(input, &rest_size);
+	if (rest_size > 0 && rest[0] == '\r') {
+		i_stream_skip(input, 1);
+		rest = i_stream_get_data(input, &rest_size);
+	}
+	if (rest_size != 1 || rest[0] != '\n')
+		return state;
+
+	*tag_r = t_strdup(tag);
+	return IMAP_CLIENT_INPUT_STATE_DONEIDLE;
+}
+
+static enum imap_client_input_state
 imap_client_input_parse(const unsigned char *data, size_t size, const char **tag_r)
 {
-	const unsigned char *tag_start, *tag_end;
-
-	enum imap_client_input_state state = IMAP_CLIENT_INPUT_STATE_DONE_LF;
-
-	/* skip over DONE[\r]\n */
-	if (i_memcasecmp(data, "DONE", I_MIN(size, 4)) != 0)
-		return IMAP_CLIENT_INPUT_STATE_BAD;
-	if (size <= 4)
-		return IMAP_CLIENT_INPUT_STATE_UNKNOWN;
-	data += 4; size -= 4;
-
-	if (data[0] == '\r') {
-		state = IMAP_CLIENT_INPUT_STATE_DONE_CRLF;
-		data++; size--;
-	}
-	if (size == 0)
-		return IMAP_CLIENT_INPUT_STATE_UNKNOWN;
-	if (data[0] != '\n')
-		return IMAP_CLIENT_INPUT_STATE_BAD;
-	data++; size--;
-	if (size == 0)
-		return state;
-
-	tag_start = data;
-
-	/* skip over tag */
-	while(data[0] != ' ' &&
-	      data[0] != '\r' &&
-	      data[0] != '\t' ) { data++; size--; }
-
-	tag_end = data;
-
-	if (size == 0)
-		return state;
-	if (data[0] != ' ')
-		return IMAP_CLIENT_INPUT_STATE_BAD;
-	data++; size--;
-
-	/* skip over IDLE[\r]\n - checking this assumes that the DONE and IDLE
-	   are sent in the same IP packet, otherwise we'll unnecessarily
-	   recreate the imap process and immediately resume IDLE there. if this
-	   becomes an issue we could add a small delay to the imap process
-	   creation and wait for the IDLE command during it. */
-	if (size <= 4 || i_memcasecmp(data, "IDLE", 4) != 0)
-		return state;
-	data += 4; size -= 4;
-
-	if (data[0] == '\r') {
-		data++; size--;
-	}
-	if (size == 1 && data[0] == '\n') {
-		*tag_r = t_strdup_until(tag_start, tag_end);
-		return IMAP_CLIENT_INPUT_STATE_DONEIDLE;
-	}
+	struct istream *input = i_stream_create_from_data(data, size);
+	struct imap_parser *parser =
+		imap_parser_create(input, NULL, size, NULL);
+	enum imap_client_input_state state =
+		imap_client_input_parse_input(input, parser, tag_r);
+	imap_parser_unref(&parser);
+	i_stream_unref(&input);
 	return state;
 }
 
@@ -588,7 +616,7 @@ static void imap_client_io_deactivate_user(struct imap_client *client ATTR_UNUSE
 }
 
 static const char *const *
-userdb_fields_get_alt_usernames(char *const *userdb_fields)
+userdb_fields_get_alt_usernames(const char *const *userdb_fields)
 {
 	ARRAY_TYPE(const_string) alt_usernames;
 	t_array_init(&alt_usernames, 4);
@@ -638,12 +666,34 @@ imap_client_create(int fd, const struct imap_client_state *state)
 		o_stream_unref(&client->output);
 		client->output = output;
 	}
-	client->state = *state;
 	client->state.username = p_strdup(pool, state->username);
 	client->state.session_id = p_strdup(pool, state->session_id);
 	client->state.userdb_fields = p_strdup(pool, state->userdb_fields);
 	client->state.stats = p_strdup(pool, state->stats);
+	client->state.auth_token = p_strdup(pool, state->auth_token);
+	client->state.session_pid = p_strdup(pool, state->session_pid);
+	client->state.local_ip = state->local_ip;
+	client->state.remote_ip = state->remote_ip;
+	client->state.local_port = state->local_port;
+	client->state.remote_port = state->remote_port;
+	client->state.session_created = state->session_created;
+
+	client->state.uid = state->uid;
+	client->state.gid = state->gid;
+
+	client->state.peer_dev = state->peer_dev;
+	client->state.peer_ino = state->peer_ino;
+
 	client->state.tag = i_strdup(state->tag);
+	client->state.logout_stats = state->logout_stats;
+
+	guid_128_copy(client->state.anvil_conn_guid, state->anvil_conn_guid);
+	client->state.imap_idle_notify_interval =
+		state->imap_idle_notify_interval;
+	client->state.idle_cmd = state->idle_cmd;
+	client->state.have_notify_fd = state->have_notify_fd;
+	client->state.anvil_sent = state->anvil_sent;
+	client->state.multiplex_ostream = state->multiplex_ostream;
 
 	client->event = event_create(NULL);
 	event_add_category(client->event, &event_category_imap_hibernate);
@@ -672,12 +722,14 @@ imap_client_create(int fd, const struct imap_client_state *state)
 		.ip = client->state.remote_ip,
 	};
 	T_BEGIN {
-		char **fields = p_strsplit_tabescaped(unsafe_data_stack_pool,
-						      client->state.userdb_fields);
+		/* the imap process sends userdb_fields only if it has any */
+		const char *const *fields = client->state.userdb_fields == NULL ?
+			empty_str_array :
+			t_strsplit_tabescaped(client->state.userdb_fields);
 		const struct var_expand_params params = {
 			.table = imap_client_get_var_expand_table(client),
 			.providers = funcs,
-			.context = fields,
+			.context = (void *)fields,
 			.event = client->event,
 		};
 		string_t *str;
@@ -689,6 +741,9 @@ imap_client_create(int fd, const struct imap_client_state *state)
 				state->mail_log_prefix, error);
 		}
 		client->log_prefix = p_strdup(pool, str_c(str));
+		/* the ioloop context isn't active for all of the logging,
+		   e.g. when the client is kicked before it's finished */
+		event_replace_log_prefix(client->event, client->log_prefix);
 		anvil_session.alt_usernames =
 			userdb_fields_get_alt_usernames(fields);
 		if (master_service_anvil_connect(master_service, &anvil_session,
@@ -727,6 +782,8 @@ void imap_client_destroy(struct imap_client **_client, const char *reason)
 	struct imap_client *client = *_client;
 
 	*_client = NULL;
+	if (client->destroy_ref != NULL)
+		*client->destroy_ref = NULL;
 
 	if (reason != NULL) {
 		/* the client input/output bytes don't count the DONE+IDLE by
@@ -772,6 +829,12 @@ void imap_client_destroy(struct imap_client **_client, const char *reason)
 	pool_unref(&client->pool);
 
 	master_service_client_connection_destroyed(master_service);
+}
+
+void imap_client_set_destroy_ref(struct imap_client *client,
+				 struct imap_client **ref)
+{
+	client->destroy_ref = ref;
 }
 
 void imap_client_add_notify_fd(struct imap_client *client, int fd)
@@ -842,7 +905,6 @@ static void imap_clients_unhibernate(void *context ATTR_UNUSED)
 
 static void imap_client_kick(struct imap_client *client, bool shutdown)
 {
-	imap_client_io_activate_user(client);
 	o_stream_nsend_str(client->output,
 			   "* BYE "MASTER_SERVICE_SHUTTING_DOWN_MSG".\r\n");
 	imap_client_destroy(&client, shutdown ?

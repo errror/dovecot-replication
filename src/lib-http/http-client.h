@@ -87,8 +87,8 @@ struct http_client_settings {
 
 	   if > 0, the maximum will be enforced across all IPs for that host,
 	   meaning that IPs may be tried more than once eventually if the number
-	   of IPs is smaller than the specified maximum attempts. If the number
-	   of IPs is higher than the maximum attempts, not all IPs are tried.
+	   of IPs is less than the specified maximum attempts. If the number
+	   of IPs is greater than the maximum attempts, not all IPs are tried.
 	   If 0, all IPs are tried at most once.
 	 */
 	unsigned int max_connect_attempts;
@@ -174,6 +174,9 @@ enum http_client_request_error {
 	/* The request timed out (either this was the last attempt or the
 	   absolute timeout was hit) */
 	HTTP_CLIENT_REQUEST_ERROR_TIMED_OUT = 9008,
+	/* The request is already known to fail as acquiring authorization
+	   token already failed. Mark the request as failed before sending it */
+	HTTP_CLIENT_REQUEST_ERROR_PREREQUISITE_FAILED = 9009,
 };
 
 enum http_request_state {

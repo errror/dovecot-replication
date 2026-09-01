@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -15,7 +15,9 @@
  * Envelope write
  */
 
-static void imap_write_address(string_t *str, struct message_address *addr)
+static void
+imap_write_address(string_t *str, struct message_address *addr,
+		   enum imap_quote_flags qflags)
 {
 	if (addr == NULL) {
 		str_append(str, "NIL");
@@ -29,14 +31,15 @@ static void imap_write_address(string_t *str, struct message_address *addr)
 			str_append(str, "NIL");
 		else {
 			imap_append_string_for_humans(str,
-				(const void *)addr->name, strlen(addr->name));
+				(const void *)addr->name, strlen(addr->name),
+				qflags);
 		}
 		str_append_c(str, ' ');
-		imap_append_nstring(str, addr->route);
+		imap_append_nstring(str, addr->route, qflags);
 		str_append_c(str, ' ');
-		imap_append_nstring(str, addr->mailbox);
+		imap_append_nstring(str, addr->mailbox, qflags);
 		str_append_c(str, ' ');
-		imap_append_nstring(str, addr->domain);
+		imap_append_nstring(str, addr->domain, qflags);
 		str_append_c(str, ')');
 
 		addr = addr->next;
@@ -44,8 +47,8 @@ static void imap_write_address(string_t *str, struct message_address *addr)
 	str_append_c(str, ')');
 }
 
-void imap_envelope_write(struct message_part_envelope *data,
-				   string_t *str)
+void imap_envelope_write(struct message_part_envelope *data, string_t *str,
+			 enum imap_quote_flags qflags)
 {
 #define NVL(str, nullstr) ((str) != NULL ? (str) : (nullstr))
 	static const char *empty_envelope =
@@ -56,33 +59,33 @@ void imap_envelope_write(struct message_part_envelope *data,
 		return;
 	}
 
-	imap_append_nstring_nolf(str, data->date);
+	imap_append_nstring_nolf(str, data->date, qflags);
 	str_append_c(str, ' ');
 	if (data->subject == NULL)
 		str_append(str, "NIL");
 	else {
 		imap_append_string_for_humans(str,
 			(const unsigned char *)data->subject,
-			strlen(data->subject));
+			strlen(data->subject), qflags);
 	}
 
 	str_append_c(str, ' ');
-	imap_write_address(str, data->from.head);
+	imap_write_address(str, data->from.head, qflags);
 	str_append_c(str, ' ');
-	imap_write_address(str, NVL(data->sender.head, data->from.head));
+	imap_write_address(str, NVL(data->sender.head, data->from.head), qflags);
 	str_append_c(str, ' ');
-	imap_write_address(str, NVL(data->reply_to.head, data->from.head));
+	imap_write_address(str, NVL(data->reply_to.head, data->from.head), qflags);
 	str_append_c(str, ' ');
-	imap_write_address(str, data->to.head);
+	imap_write_address(str, data->to.head, qflags);
 	str_append_c(str, ' ');
-	imap_write_address(str, data->cc.head);
+	imap_write_address(str, data->cc.head, qflags);
 	str_append_c(str, ' ');
-	imap_write_address(str, data->bcc.head);
+	imap_write_address(str, data->bcc.head, qflags);
 
 	str_append_c(str, ' ');
-	imap_append_nstring_nolf(str, data->in_reply_to);
+	imap_append_nstring_nolf(str, data->in_reply_to, qflags);
 	str_append_c(str, ' ');
-	imap_append_nstring_nolf(str, data->message_id);
+	imap_append_nstring_nolf(str, data->message_id, qflags);
 }
 
 /*
@@ -222,7 +225,7 @@ bool imap_envelope_parse(const char *envelope,
 	input = i_stream_create_from_data(envelope, strlen(envelope));
 	(void)i_stream_read(input);
 
-	parser = imap_parser_create(input, NULL, SIZE_MAX);
+	parser = imap_parser_create(input, NULL, SIZE_MAX, NULL);
 	ret = imap_parser_finish_line(parser, 0,
 				      IMAP_PARSE_FLAG_LITERAL_TYPE, &args);
 	if (ret < 0) {

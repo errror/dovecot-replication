@@ -1,10 +1,12 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /* @UNSAFE: whole file */
 
 #include "lib.h"
 #include "safe-memset.h"
 #include "buffer.h"
+
+#define BUFFER_TRAILING_SENTRY_CHR 0xAB
 
 /* Disable our memcpy() safety wrapper. This file is very performance sensitive
    and it's been checked to work correctly with memcpy(). */
@@ -55,7 +57,7 @@ buffer_check_limits(struct real_buffer *buf, size_t pos, size_t data_size)
 {
 	size_t new_size;
 
-	if (unlikely(buf->max_size - pos < data_size))
+	if (unlikely(pos > buf->max_size || buf->max_size - pos < data_size))
 		i_panic("Buffer write out of range (%zu + %zu)", pos, data_size);
 
 	new_size = pos + data_size;
@@ -110,6 +112,14 @@ buffer_check_limits(struct real_buffer *buf, size_t pos, size_t data_size)
 		buf->used = new_size;
 	i_assert(buf->used <= buf->alloc);
 	i_assert(buf->w_buffer != NULL);
+
+#ifdef DEBUG_FAST
+	if (new_size == buf->used && new_size < buf->alloc &&
+	    buf->dirty <= new_size && buf->w_buffer != NULL) {
+		buf->w_buffer[new_size] = BUFFER_TRAILING_SENTRY_CHR;
+		buf->dirty = new_size + 1;
+	}
+#endif
 }
 
 static inline void
@@ -118,10 +128,16 @@ buffer_check_append_limits(struct real_buffer *buf, size_t data_size)
 	/* Fast path: See if data to be appended fits into allocated buffer.
 	   If it does, we don't even need to memset() the dirty buffer since
 	   it's going to be filled with the newly appended data. */
+#ifndef DEBUG_FAST
+	i_assert(buf->used <= buf->writable_size);
 	if (buf->writable_size - buf->used < data_size)
 		buffer_check_limits(buf, buf->used, data_size);
 	else
 		buf->used += data_size;
+#else
+	/* Always add trailing sentry with debug checks */
+	buffer_check_limits(buf, buf->used, data_size);
+#endif
 }
 
 #undef buffer_create_from_data
@@ -167,7 +183,7 @@ buffer_t *buffer_create_dynamic_max(pool_t pool, size_t init_size,
 {
 	struct real_buffer *buf;
 
-#ifdef DEBUG
+#ifdef DEBUG_FAST
 	/* we increment this by 1 later on, so if it's SIZE_MAX
 	   it turns into 0 and hides a potential bug.
 
@@ -230,6 +246,12 @@ void buffer_write(buffer_t *_buf, size_t pos,
 		memcpy(buf->w_buffer + pos, data, data_size);
 }
 
+void buffer_write_array(buffer_t *buf, size_t pos,
+			const void *data, size_t count, size_t size)
+{
+	buffer_write(buf, pos, data, MALLOC_MULTIPLY(count, size));
+}
+
 void buffer_append(buffer_t *_buf, const void *data, size_t data_size)
 {
 	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
@@ -239,6 +261,12 @@ void buffer_append(buffer_t *_buf, const void *data, size_t data_size)
 		buffer_check_append_limits(buf, data_size);
 		memcpy(buf->w_buffer + pos, data, data_size);
 	}
+}
+
+void buffer_append_array(buffer_t *buf, const void *data,
+			 size_t count, size_t size)
+{
+	buffer_append(buf, data, MALLOC_MULTIPLY(count, size));
 }
 
 void buffer_append_c(buffer_t *_buf, unsigned char chr)
@@ -261,6 +289,12 @@ void buffer_insert(buffer_t *_buf, size_t pos,
 		buffer_copy(_buf, pos + data_size, _buf, pos, SIZE_MAX);
 		memcpy(buf->w_buffer + pos, data, data_size);
 	}
+}
+
+void buffer_insert_array(buffer_t *buf, size_t pos,
+			 const void *data, size_t count, size_t size)
+{
+	buffer_insert(buf, pos, data, MALLOC_MULTIPLY(count, size));
 }
 
 void buffer_delete(buffer_t *_buf, size_t pos, size_t size)
@@ -346,6 +380,18 @@ void buffer_insert_zero(buffer_t *_buf, size_t pos, size_t data_size)
 		buffer_copy(_buf, pos + data_size, _buf, pos, SIZE_MAX);
 		memset(buf->w_buffer + pos, 0, data_size);
 	}
+}
+
+void buffer_nul_terminate(buffer_t *_buf)
+{
+	struct real_buffer *buf = container_of(_buf, struct real_buffer, buf);
+
+	/* +1 extra byte is always kept for NUL termination */
+	i_assert(buf->used < buf->alloc);
+	/* Buffer might not be writable, so check first if the NUL is
+	   already there. */
+	if (((const char *)buf->r_buffer)[buf->used] != '\0')
+		buf->w_buffer[buf->used] = '\0';
 }
 
 void buffer_copy(buffer_t *_dest, size_t dest_pos,

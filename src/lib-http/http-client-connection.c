@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -280,7 +280,10 @@ void http_client_connection_lost(struct http_client_connection **_conn,
 			error = t_strdup_printf("%s (last SSL error: %s)",
 						error, sslerr);
 		}
-		if (ssl_iostream_has_handshake_failed(conn->ssl_iostream)) {
+		enum ssl_iostream_state state =
+			ssl_iostream_get_state(conn->ssl_iostream);
+		if (state == SSL_IOSTREAM_STATE_INVALID_CERT ||
+		    state == SSL_IOSTREAM_STATE_NAME_MISMATCH) {
 			/* This isn't really a "connection lost", but that we
 			   don't trust the remote's SSL certificate. don't
 			   retry. */
@@ -904,7 +907,7 @@ http_client_connection_return_response(struct http_client_connection *conn,
 		/* Request is dereferenced in payload destroy callback */
 		i_stream_unref(&payload);
 
-		if (conn->to_input != NULL && conn->conn.input != NULL) {
+		if (conn->to_input != NULL && !conn->conn.input->closed) {
 			/* Already finished reading the payload */
 			http_client_payload_finished(conn);
 		}
@@ -913,7 +916,7 @@ http_client_connection_return_response(struct http_client_connection *conn,
 		http_client_connection_unref_request(conn, &req);
 	}
 
-	if (conn->incoming_payload == NULL && conn->conn.input != NULL) {
+	if (conn->incoming_payload == NULL && !conn->conn.input->closed) {
 		i_assert(conn->conn.io != NULL ||
 			 pshared->addr.type == HTTP_CLIENT_PEER_ADDR_RAW);
 		return http_client_connection_unref(&conn);
@@ -1339,7 +1342,8 @@ static void http_client_connection_ready(struct http_client_connection *conn)
 
 	/* Start raw log */
 	if (ppool->rawlog_dir != NULL) {
-		iostream_rawlog_create(ppool->rawlog_dir,
+		iostream_rawlog_create(conn->event, "http_client_rawlog_dir",
+				       ppool->rawlog_dir,
 				       &conn->conn.input, &conn->conn.output);
 	}
 
@@ -1377,6 +1381,13 @@ static void http_client_connection_ready(struct http_client_connection *conn)
 		.max_field_size = set->response_hdr_max_field_size,
 		.max_fields = set->response_hdr_max_fields,
 	};
+	/* Intentionally lenient (not STRICT): the client parses responses
+	   from arbitrary/untrusted upstream servers, many of which send
+	   legitimately non-compliant framing (e.g. obs-fold). Unlike the
+	   server-side request parser, the response is consumed internally by
+	   this connection rather than re-emitted downstream, so there is no
+	   response-splitting precondition here to justify the interop risk
+	   of rejecting it. */
 	conn->http_parser = http_response_parser_init(
 		conn->conn.input, &limits, 0);
 	o_stream_set_finish_via_child(conn->conn.output, FALSE);
@@ -1384,24 +1395,27 @@ static void http_client_connection_ready(struct http_client_connection *conn)
 				    http_client_connection_output, conn);
 }
 
-static int
+static enum ssl_iostream_state
 http_client_connection_ssl_handshaked(const char **error_r, void *context)
 {
 	struct http_client_connection *conn = context;
 	struct http_client_peer_shared *pshared = conn->ppool->peer;
 	const char *error, *host = pshared->addr.a.tcp.https_name;
+	enum ssl_iostream_cert_validity validity =
+		ssl_iostream_check_cert_validity(conn->ssl_iostream, host, &error);
 
-	if (ssl_iostream_check_cert_validity(conn->ssl_iostream,
-					     host, &error) == 0)
+	if (validity == SSL_IOSTREAM_CERT_VALIDITY_OK)
 		e_debug(conn->event, "SSL handshake successful");
 	else if (ssl_iostream_get_allow_invalid_cert(conn->ssl_iostream)) {
 		e_debug(conn->event, "SSL handshake successful, "
 			"ignoring invalid certificate: %s", error);
 	} else {
 		*error_r = error;
-		return -1;
+		return validity == SSL_IOSTREAM_CERT_VALIDITY_NAME_MISMATCH ?
+			SSL_IOSTREAM_STATE_NAME_MISMATCH :
+			SSL_IOSTREAM_STATE_INVALID_CERT;
 	}
-	return 0;
+	return SSL_IOSTREAM_STATE_OK;
 }
 
 static int

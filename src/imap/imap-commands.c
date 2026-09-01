@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "array.h"
@@ -178,8 +178,15 @@ void command_stats_start(struct client_command_context *cmd)
 void command_stats_flush(struct client_command_context *cmd)
 {
 	io_loop_time_refresh();
-	cmd->stats.running_usecs +=
-		timeval_diff_usecs(&ioloop_timeval, &cmd->stats_start.timeval);
+	/* The command may also be flushed while it isn't running, e.g. when
+	   IDLE sends its tagline from the client's input callback. The time
+	   spent waiting in the ioloop until then isn't running time - it's
+	   already counted in the ioloop wait usecs. */
+	if (cmd->executing) {
+		cmd->stats.running_usecs +=
+			timeval_diff_usecs(&ioloop_timeval,
+					   &cmd->stats_start.timeval);
+	}
 	cmd->stats.lock_wait_usecs +=
 		file_lock_wait_get_total_usecs() -
 		cmd->stats_start.lock_wait_usecs;
@@ -208,12 +215,11 @@ bool command_exec(struct client_command_context *cmd)
 	finished = cmd->func(cmd);
 	array_foreach(&command_hooks, hook)
 		hook->post(cmd);
+	command_stats_flush(cmd);
 	cmd->executing = FALSE;
 	event_pop_global(cmd->global_event);
 	if (cmd->state == CLIENT_COMMAND_STATE_DONE)
 		finished = TRUE;
-
-	command_stats_flush(cmd);
 	return finished;
 }
 

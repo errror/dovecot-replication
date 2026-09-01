@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "base64.h"
@@ -40,7 +40,7 @@ bool cmd_capa(struct pop3_client *client, const char *args ATTR_UNUSED)
 		str_append(str, "USER\r\n");
 
 	str_append(str, "SASL");
-	mech = sasl_server_get_advertised_mechs(&client->common, &count);
+	mech = sasl_proxy_get_advertised_mechs(&client->common, &count);
 	for (i = 0; i < count; i++) {
 		str_append_c(str, ' ');
 		str_append(str, mech[i].name);
@@ -89,6 +89,9 @@ void pop3_client_auth_result(struct client *client,
 	case CLIENT_AUTH_RESULT_TEMPFAIL:
 		client_send_reply(client, POP3_CMD_REPLY_TEMPFAIL, text);
 		break;
+	case CLIENT_AUTH_RESULT_LIMIT_REACHED:
+		client_send_reply(client, POP3_CMD_REPLY_LIMIT, text);
+		break;
 	case CLIENT_AUTH_RESULT_AUTHFAILED:
 	case CLIENT_AUTH_RESULT_AUTHFAILED_REASON:
 	case CLIENT_AUTH_RESULT_AUTHZFAILED:
@@ -131,7 +134,7 @@ int cmd_auth(struct pop3_client *pop3_client)
 			const struct auth_mech_desc *mech;
 
 			client_send_raw(client, "+OK\r\n");
-			mech = sasl_server_get_advertised_mechs(client, &count);
+			mech = sasl_proxy_get_advertised_mechs(client, &count);
 			for (i = 0; i < count; i++) {
 				client_send_raw(client, mech[i].name);
 				client_send_raw(client, "\r\n");
@@ -212,7 +215,7 @@ bool cmd_pass(struct pop3_client *pop3_client, const char *args)
 	base64 = t_buffer_create(MAX_BASE64_ENCODED_SIZE(plain_login->used));
 	base64_encode(plain_login->data, plain_login->used, base64);
 
-	(void)client_auth_begin(client, "PLAIN", str_c(base64));
+	(void)client_auth_begin(client, SASL_MECH_NAME_PLAIN, str_c(base64));
 	return TRUE;
 }
 
@@ -272,6 +275,7 @@ bool cmd_apop(struct pop3_client *pop3_client, const char *args)
 		return TRUE;
 	}
 
-	(void)client_auth_begin_private(client, "APOP", str_c(base64));
+	(void)client_auth_begin_private(client, AUTH_SASL_MECH_NAME_APOP,
+					str_c(base64));
 	return TRUE;
 }

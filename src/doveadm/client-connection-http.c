@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "compat.h"
@@ -165,7 +165,7 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 {
 	struct client_connection_http *conn = req->conn;
 	struct istream *is;
-	const char *user;
+	const char *user = NULL;
 	struct ioloop *ioloop, *prev_ioloop;
 
 	/* final preflight check */
@@ -187,9 +187,11 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 	}
 
 	prev_ioloop = current_ioloop;
+	struct event *event_parent = http_server_request_get_event(req->http_request);
+	event_add_str(event_parent, "origin", "http");
 
 	struct doveadm_cmd_context *cctx = doveadm_cmd_context_create(
-		conn->conn.type, doveadm_verbose || doveadm_debug);
+		event_parent, conn->conn.type, doveadm_verbose || doveadm_debug);
 
 	cctx->input = req->input;
 	cctx->output = req->output;
@@ -217,12 +219,14 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 		"cmd %s: ", cctx->cmd->name));
 
 	if (doveadm_cmd_param_str(cctx, "user", &user))
-		e_info(cctx->event, "Executing command as '%s'", user);
+		e_debug(cctx->event, "Executing command as '%s'", user);
 	else
-		e_info(cctx->event, "Executing command");
+		e_debug(cctx->event, "Executing command");
+	event_add_str(cctx->event, "user", user);
+	event_add_str(cctx->event, "agent", http_request_header_get(
+		http_server_request_get(req->http_request), "User-Agent"));
 	cctx->cmd->cmd(cctx);
 
-	event_drop_parent_log_prefixes(cctx->event, 1);
 	client_connection_set_proctitle(&conn->conn, "");
 
 	o_stream_switch_ioloop_to(req->output, prev_ioloop);
@@ -231,9 +235,9 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 	if ((cctx->cmd->flags & CMD_FLAG_NO_PRINT) == 0)
 		doveadm_print_deinit();
 	if (o_stream_finish(doveadm_print_ostream) < 0) {
-		e_info(cctx->event, "Error writing output in command %s: %s",
-		       req->cmd->name,
-		       o_stream_get_error(doveadm_print_ostream));
+		e_error(cctx->event, "Error writing output in command %s: %s",
+			req->cmd->name,
+			o_stream_get_error(doveadm_print_ostream));
 		doveadm_exit_code = EX_TEMPFAIL;
 	}
 
@@ -253,6 +257,7 @@ doveadm_http_server_command_execute(struct client_request_http *req)
 		doveadm_http_server_json_success(req, is);
 	}
 	i_stream_unref(&is);
+	doveadm_cmd_context_finished(cctx);
 	doveadm_cmd_context_unref(&cctx);
 }
 
@@ -695,7 +700,7 @@ doveadm_http_server_read_request_v1(struct client_request_http *req)
 	if (req->input->stream_errno != 0) {
 		http_server_request_fail_close(http_sreq,
 			400, "Client disconnected");
-		e_info(req->conn->conn.event,
+		e_error(req->conn->conn.event,
 			"read(%s) failed: %s",
 		       i_stream_get_name(req->input),
 		       i_stream_get_error(req->input));
@@ -821,16 +826,6 @@ doveadm_http_server_options_handler(struct client_request_http *req)
 	struct http_server_response *http_resp;
 
 	http_resp = http_server_response_create(http_sreq, 200, "OK");
-	http_server_response_add_header(http_resp,
-		"Access-Control-Allow-Origin", "*");
-	http_server_response_add_header(http_resp,
-		"Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-	http_server_response_add_header(http_resp,
-		"Access-Control-Allow-Request-Headers",
-		"Content-Type, X-API-Key, Authorization");
-	http_server_response_add_header(http_resp,
-		"Access-Control-Allow-Headers",
-		"Content-Type, WWW-Authenticate");
 	http_server_response_submit(http_resp);
 }
 
@@ -883,9 +878,9 @@ static void doveadm_http_server_send_response(struct client_request_http *req)
 
 	if (req->output != NULL) {
 		if (o_stream_finish(req->output) == -1) {
-			e_info(req->conn->conn.event,
-			       "error writing output: %s",
-			       o_stream_get_error(req->output));
+			e_error(req->conn->conn.event,
+				"error writing output: %s",
+				o_stream_get_error(req->output));
 			o_stream_destroy(&req->output);
 			http_server_request_fail(http_sreq,
 				500, "Internal server error");
@@ -913,31 +908,9 @@ doveadm_http_server_request_destroy(struct client_request_http *req)
 {
 	struct client_connection_http *conn = req->conn;
 	struct http_server_request *http_sreq = req->http_request;
-	const struct http_request *http_req =
-		http_server_request_get(http_sreq);
-	struct http_server_response *http_resp =
-		http_server_request_get_response(http_sreq);
 
 	i_assert(conn->request == req);
 
-	if (http_resp != NULL) {
-		const char *agent, *url, *reason;
-		uoff_t size;
-		int status;
-
-		http_server_response_get_status(http_resp, &status, &reason);
-		size = http_server_response_get_total_size(http_resp);
-		agent = http_request_header_get(http_req, "User-Agent");
-		if (agent == NULL) agent = "";
-
-		url = http_url_create(http_req->target.url);
-		e_info(conn->conn.event, "doveadm: %s %s %s \"%s %s "
-		       "HTTP/%d.%d\" %d %"PRIuUOFF_T" \"%s\" \"%s\"",
-		       net_ip2addr(&conn->conn.remote_ip), "-", "-",
-		       http_req->method, http_req->target.url->path,
-		       http_req->version_major, http_req->version_minor,
-		       status, size, url, agent);
-	}
 	json_istream_destroy(&req->json_input);
 	json_ostream_destroy(&req->json_output);
 	if (req->output != NULL)
@@ -960,7 +933,7 @@ doveadm_http_server_auth_basic(struct client_request_http *req,
 	struct client_connection_http *conn = req->conn;
 	const struct doveadm_settings *set = conn->conn.set;
 	string_t *b64_value;
-	char *value;
+	const char *value;
 
 	if (*set->doveadm_password == '\0') {
 		e_error(conn->conn.event,
@@ -969,11 +942,11 @@ doveadm_http_server_auth_basic(struct client_request_http *req,
 		return FALSE;
 	}
 
-	b64_value = str_new(conn->conn.pool, 32);
-	value = p_strdup_printf(conn->conn.pool,
-				"doveadm:%s", set->doveadm_password);
-	base64_encode(value, strlen(value), b64_value);
-	if (creds->data != NULL && strcmp(creds->data, str_c(b64_value)) == 0)
+	value = t_strdup_printf("doveadm:%s", set->doveadm_password);
+	b64_value = t_base64_encode_str(0, UINT_MAX, value);
+
+	if (creds->data != NULL &&
+	    str_equals_hash_timing_safe(str_c(b64_value), creds->data))
 		return TRUE;
 
 	e_error(conn->conn.event,
@@ -987,7 +960,7 @@ doveadm_http_server_auth_api_key(struct client_request_http *req,
 				 const struct http_auth_credentials *creds)
 {
 	struct client_connection_http *conn = req->conn;
-	const struct doveadm_settings *set = doveadm_settings;
+	const struct doveadm_settings *set = conn->conn.set;
 	string_t *b64_value;
 
 	if (*set->doveadm_api_key == '\0') {
@@ -997,10 +970,9 @@ doveadm_http_server_auth_api_key(struct client_request_http *req,
 		return FALSE;
 	}
 
-	b64_value = str_new(conn->conn.pool, 32);
-	base64_encode(set->doveadm_api_key,
-		      strlen(set->doveadm_api_key), b64_value);
-	if (creds->data != NULL && strcmp(creds->data, str_c(b64_value)) == 0)
+	b64_value = t_base64_encode_str(0, UINT_MAX, set->doveadm_api_key);
+	if (creds->data != NULL &&
+	    str_equals_hash_timing_safe(creds->data, str_c(b64_value)))
 		return TRUE;
 
 	e_error(conn->conn.event,
@@ -1094,6 +1066,30 @@ doveadm_http_server_handle_request(void *context,
 		doveadm_http_server_request_destroy, req);
 
 	conn->request = req;
+
+	/* Only origin-form ("/path") and absolute-form
+	   ("http://host/path") request targets carry a path for the local
+	   resources served here. Origin-form is what direct clients send;
+	   absolute-form is what clients send through a proxy, and an origin
+	   server must accept it (RFC 7230, Section 5.3.2). The other forms
+	   leave url->path NULL and would crash the mount comparison below. */
+	if (http_req->target.format != HTTP_REQUEST_TARGET_FORMAT_ORIGIN &&
+	    http_req->target.format != HTTP_REQUEST_TARGET_FORMAT_ABSOLUTE) {
+		if (http_req->target.format ==
+			HTTP_REQUEST_TARGET_FORMAT_ASTERISK &&
+		    strcmp(http_req->method, "OPTIONS") == 0) {
+			/* "OPTIONS *" queries the capabilities of the server
+			   in general (RFC 7231, Section 4.3.7). */
+			doveadm_http_server_options_handler(req);
+			return;
+		}
+		/* Asterisk-form is usable only for OPTIONS and authority-form
+		   only for CONNECT (RFC 7230, Section 5.3), and CONNECT
+		   requests never reach this handler. */
+		http_server_request_fail(http_sreq, 400, "Bad Request");
+		return;
+	}
+	i_assert(http_req->target.url->path != NULL);
 
 	for (i = 0; i < N_ELEMENTS(doveadm_http_server_mounts); i++) {
 		if (doveadm_http_server_mounts[i].verb == NULL ||

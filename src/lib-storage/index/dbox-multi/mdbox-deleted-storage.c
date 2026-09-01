@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -21,6 +21,15 @@
 extern struct mail_storage mdbox_deleted_storage;
 extern struct mailbox mdbox_deleted_mailbox;
 extern struct dbox_storage_vfuncs mdbox_deleted_dbox_storage_vfuncs;
+
+/* mdbox_deleted mailboxes have no permanent index files, so there is nowhere
+   to store a mailbox GUID. All of them also list the same mails: every mail in
+   the storage that hasn't been purged yet. Use a single hardcoded GUID for
+   them, so at least it stays the same between sessions. It's "mdbox_deleted"
+   as ASCII, zero-padded. */
+static const guid_128_t mdbox_deleted_mailbox_guid = {
+	'm', 'd', 'b', 'o', 'x', '_', 'd', 'e', 'l', 'e', 't', 'e', 'd', 0, 0, 0
+};
 
 static struct mail_storage *mdbox_deleted_storage_alloc(void)
 {
@@ -111,7 +120,7 @@ mdbox_deleted_mailbox_get_metadata(struct mailbox *box,
 		return -1;
 
 	if ((items & MAILBOX_METADATA_GUID) != 0)
-		guid_128_generate(metadata_r->guid);
+		guid_128_copy(metadata_r->guid, mdbox_deleted_mailbox_guid);
 	return 0;
 }
 
@@ -239,10 +248,16 @@ mdbox_deleted_storage_sync_init(struct mailbox *box,
 
 struct mail_storage mdbox_deleted_storage = {
 	.name = MDBOX_DELETED_STORAGE_NAME,
+	/* mdbox_deleted is just a different view into the same mdbox storage,
+	   so it must use exactly the same settings as mdbox. */
+	.set_filter_name = MDBOX_STORAGE_NAME,
 	.class_flags = MAIL_STORAGE_CLASS_FLAG_UNIQUE_ROOT |
 		MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_GUIDS |
 		MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_SAVE_GUIDS |
-		MAIL_STORAGE_CLASS_FLAG_BINARY_DATA,
+		MAIL_STORAGE_CLASS_FLAG_BINARY_DATA |
+		MAIL_STORAGE_CLASS_FLAG_NO_LIST_INDEX_CACHE,
+	.event_category = &event_category_mdbox,
+	.set_info = &mdbox_setting_parser_info,
 
 	.v = {
 		mdbox_deleted_storage_alloc,

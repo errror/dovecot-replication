@@ -1,3 +1,7 @@
+include $(top_srcdir)/Makefile.test.include
+
+AUTOMAKE_OPTIONS += subdir-objects
+
 SUBDIRS = list index
 
 noinst_LTLIBRARIES = libstorage.la
@@ -122,47 +126,10 @@ shlibs = \
 	list/libstorage_list.la \
 	index/libstorage_index.la \
 	../lib-index/libindex.la \
-	../lib-imap-storage/libimap-storage.la \
 	../lib-language/liblanguage.la
 
 libstorage_la_LIBADD = $(shlibs)
 libstorage_la_DEPENDENCIES = $(shlibs)
-
-pkglib_LTLIBRARIES = libdovecot-storage.la
-libdovecot_storage_la_SOURCES =
-libdovecot_storage_la_LIBADD = \
-	libstorage.la \
-	$(LIBDOVECOT) \
-	$(LINKED_STORAGE_LDADD)
-libdovecot_storage_la_DEPENDENCIES = \
-	libstorage.la \
-	$(LIBDOVECOT_DEPS)
-libdovecot_storage_la_LDFLAGS = -export-dynamic
-
-if HAVE_LUA
-pkglib_LTLIBRARIES += libdovecot-storage-lua.la
-libdovecot_storage_lua_la_SOURCES = \
-	mail-lua.c \
-	mail-user-lua.c \
-	mail-storage-lua.c \
-	mailbox-lua.c \
-	mailbox-attribute-lua.c
-libdovecot_storage_lua_la_CPPFLAGS = \
-	$(AM_CPPFLAGS) \
-	$(LUA_CFLAGS) \
-	-I$(top_srcdir)/src/lib-lua
-libdovecot_storage_lua_la_LIBADD = \
-	libdovecot-storage.la \
-	../lib-lua/libdovecot-lua.la
-libdovecot_storage_lua_la_DEPENDENCIES = \
-	libdovecot-storage.la \
-	../lib-lua/libdovecot-lua.la
-libdovecot_storage_lua_la_LDFLAGS = -export-dynamic
-
-headers += \
-	mail-storage-lua.h \
-	mail-storage-lua-private.h
-endif
 
 test_programs = \
 	test-mail-search-args-imap \
@@ -170,9 +137,8 @@ test_programs = \
 	test-mail \
 	test-mail-storage \
 	test-mailbox-get \
-	test-mailbox-list
-
-noinst_PROGRAMS = $(test_programs)
+	test-mailbox-list \
+	test-index
 
 test_libs = \
 	$(top_builddir)/src/lib-var-expand/libvar_expand.la \
@@ -203,10 +169,9 @@ test_mailbox_list_SOURCES = test-mailbox-list.c
 test_mailbox_list_LDADD = libstorage.la $(LIBDOVECOT)
 test_mailbox_list_DEPENDENCIES = libstorage.la $(LIBDOVECOT_DEPS)
 
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done
+test_index_SOURCES = index/test-index.c
+test_index_LDADD = libstorage.la $(LIBDOVECOT)
+test_index_DEPENDENCIES = libstorage.la $(LIBDOVECOT_DEPS)
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)

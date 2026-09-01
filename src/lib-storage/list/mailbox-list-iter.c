@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -37,6 +37,7 @@ struct ns_list_iterate_context {
 	bool inbox_list:1;
 	bool inbox_listed:1;
 	bool inbox_seen:1;
+	bool inbox_acl_denied:1;
 };
 
 static void mailbox_list_ns_iter_failed(struct ns_list_iterate_context *ctx);
@@ -157,6 +158,21 @@ mailbox_list_iter_init_multiple(struct mailbox_list *list,
 	}
 
 	ctx = list->v.iter_init(list, patterns, flags);
+	if ((flags & (MAILBOX_LIST_ITER_SELECT_SUBSCRIBED |
+		      MAILBOX_LIST_ITER_RETURN_SUBSCRIBED)) != 0) {
+		char sep = mail_namespace_get_sep(list->ns);
+		ctx->subscriptions = mailbox_tree_init(sep);
+		mailbox_list_subscriptions_fill(ctx, ctx->subscriptions);
+
+		struct mailbox_tree_iterate_context *iter =
+			mailbox_tree_iterate_init(ctx->subscriptions, NULL, 0);
+		const char *name ATTR_UNUSED;
+		struct mailbox_node *node;
+		while ((node = mailbox_tree_iterate_next(iter, &name)) != NULL)
+			node->flags |= MAILBOX_NONEXISTENT;
+		mailbox_tree_iterate_deinit(&iter);
+	}
+
 	if ((flags & MAILBOX_LIST_ITER_NO_AUTO_BOXES) == 0) {
 		if (mailbox_list_iter_init_autocreate(ctx) < 0) {
 			hash_table_destroy(&ctx->autocreate_ctx->duplicate_vnames);
@@ -164,7 +180,42 @@ mailbox_list_iter_init_multiple(struct mailbox_list *list,
 			return &mailbox_list_iter_failed;
 		}
 	}
+	ctx->info_pool = pool_alloconly_create("mailbox list iter info", 128);
 	return ctx;
+}
+
+static bool node_has_existing_subscription(enum mailbox_info_flags node_flags)
+{
+	if ((node_flags & MAILBOX_NONEXISTENT) == 0 &&
+	    (node_flags & MAILBOX_SUBSCRIBED) != 0)
+		return TRUE;
+	if ((node_flags & MAILBOX_CHILD_SUBSCRIBED) != 0 &&
+	    (node_flags & MAILBOX_CHILDREN) != 0) {
+		/* When listing e.g. public/% but only public/foo/bar
+		   is subscribed, we need to list public/foo. However, since
+		   public/foo/bar doesn't match the list glob, the mailbox node
+		   doesn't exist in the tree. We can instead rely on the
+		   MAILBOX_CHILDREN flag to know whether there are visible
+		   children. */
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static bool
+mailbox_list_want_subscription(struct mail_namespace *ns,
+			       enum mailbox_info_flags node_flags)
+{
+	if (ns->type != MAIL_NAMESPACE_TYPE_PRIVATE &&
+	    (ns->flags & NAMESPACE_FLAG_SUBSCRIPTIONS) != 0) {
+		/* Non-private namespace with subscriptions=yes. This could be
+		   a site-global subscriptions file, so hide subscriptions for
+		   mailboxes the user doesn't have ACLs to see. This actually
+		   hides all mailboxes that are nonexistent, so the assumption
+		   is that the nonexistence is due to ACLs. */
+		return node_has_existing_subscription(node_flags);
+	}
+	return TRUE;
 }
 
 static bool
@@ -437,6 +488,29 @@ mailbox_ns_prefix_check_selection_criteria(struct ns_list_iterate_context *ctx)
 	return TRUE;
 }
 
+static int ns_has_child_subscriptions(struct ns_list_iterate_context *ctx,
+				      struct mail_namespace *parent_ns)
+{
+	struct mail_namespace *ns;
+
+	for (ns = ctx->namespaces; ns != NULL; ns = ns->next) {
+		if (ns->prefix_len > parent_ns->prefix_len &&
+		    strncmp(ns->prefix, parent_ns->prefix,
+			    parent_ns->prefix_len) == 0) {
+			if (mailbox_list_iter_subscriptions_refresh(ns->list) < 0)
+				return -1;
+
+			if (mailbox_tree_get_root(ns->list->subscriptions) != NULL)
+				return 1;
+
+			int ret = ns_has_child_subscriptions(ctx, ns);
+			if (ret != 0)
+				return ret;
+		}
+	}
+	return 0;
+}
+
 static bool
 mailbox_list_ns_prefix_return(struct ns_list_iterate_context *ctx,
 			      struct mail_namespace *ns, bool has_children)
@@ -464,32 +538,36 @@ mailbox_list_ns_prefix_return(struct ns_list_iterate_context *ctx,
 		ctx->ns_info.flags |= MAILBOX_CHILD_SPECIALUSE;
 
 	if (strcasecmp(ctx->ns_info.vname, "INBOX") == 0) {
+		if (ctx->inbox_acl_denied) {
+			/* ACL denied LOOKUP on this INBOX. This namespace
+			   prefix *is* INBOX (e.g. prefix=INBOX. maildir++),
+			   so emitting it here would be the same disclosure
+			   inbox_info_init() already suppressed via
+			   ctx->inbox_list - don't let it leak out through
+			   this second emit site instead. */
+			return FALSE;
+		}
 		i_assert(!ctx->inbox_listed);
 		ctx->inbox_listed = TRUE;
 		ctx->ns_info.flags |= ctx->inbox_info.flags | MAILBOX_SELECT;
+	} else {
+		/* see if namespace prefix is selectable */
+		box = mailbox_alloc(ns->list, ctx->ns_info.vname, 0);
+		if (mailbox_exists(box, TRUE, &existence) == 0 &&
+		    existence == MAILBOX_EXISTENCE_SELECT)
+			ctx->ns_info.flags |= MAILBOX_SELECT;
+		else
+			ctx->ns_info.flags |= MAILBOX_NONEXISTENT;
+		mailbox_free(&box);
 	}
-
-	if ((ctx->ctx.flags & (MAILBOX_LIST_ITER_RETURN_SUBSCRIBED |
-			       MAILBOX_LIST_ITER_SELECT_SUBSCRIBED)) != 0) {
-		/* Refresh subscriptions first, this won't cause a duplicate
-		   call later on as this is only called when the namespace's
-		   children definitely don't match */
-		if (mailbox_list_iter_subscriptions_refresh(ns->list) < 0) {
-			mailbox_list_ns_iter_failed(ctx);
-			return FALSE;
-		}
-		mailbox_list_set_subscription_flags(ns->list,
-						    ctx->ns_info.vname,
-						    &ctx->ns_info.flags);
-	}
-	if (!mailbox_ns_prefix_check_selection_criteria(ctx))
-		return FALSE;
 
 	/* see if the namespace has children */
 	if (has_children)
 		ctx->ns_info.flags |= MAILBOX_CHILDREN;
 	else if ((ctx->ctx.flags & MAILBOX_LIST_ITER_RETURN_CHILDREN) != 0 ||
-		 (ns->flags & NAMESPACE_FLAG_LIST_CHILDREN) != 0) {
+		 (ns->flags & NAMESPACE_FLAG_LIST_CHILDREN) != 0 ||
+		 (ctx->ctx.flags & (MAILBOX_LIST_ITER_RETURN_SUBSCRIBED |
+				    MAILBOX_LIST_ITER_SELECT_SUBSCRIBED)) != 0) {
 		/* need to check this explicitly */
 		if ((ret = mailbox_list_match_anything(ctx, ns, ns->prefix)) > 0)
 			ctx->ns_info.flags |= MAILBOX_CHILDREN;
@@ -503,17 +581,43 @@ mailbox_list_ns_prefix_return(struct ns_list_iterate_context *ctx,
 		}
 	}
 
-	if ((ctx->ns_info.flags & MAILBOX_SELECT) == 0) {
-		/* see if namespace prefix is selectable */
-		box = mailbox_alloc(ns->list, ctx->ns_info.vname, 0);
-		if (mailbox_exists(box, TRUE, &existence) == 0 &&
-		    existence == MAILBOX_EXISTENCE_SELECT)
-			ctx->ns_info.flags |= MAILBOX_SELECT;
-		else
-			ctx->ns_info.flags |= MAILBOX_NONEXISTENT;
-		mailbox_free(&box);
+	if ((ctx->ctx.flags & (MAILBOX_LIST_ITER_RETURN_SUBSCRIBED |
+			       MAILBOX_LIST_ITER_SELECT_SUBSCRIBED)) != 0) {
+		/* Refresh subscriptions first, this won't cause a duplicate
+		   call later on as this is only called when the namespace's
+		   children definitely don't match */
+		if (mailbox_list_iter_subscriptions_refresh(ns->list) < 0) {
+			mailbox_list_ns_iter_failed(ctx);
+			return FALSE;
+		}
+
+		struct mailbox_node *subs_node =
+			mailbox_tree_lookup(ns->list->subscriptions,
+					    ctx->ns_info.vname);
+		enum mailbox_info_flags subs_flags = 0;
+		if (subs_node == NULL)
+			;
+		else if ((subs_node->flags & MAILBOX_SUBSCRIBED) != 0)
+			subs_flags = MAILBOX_SUBSCRIBED;
+		else if (subs_node->children != NULL) {
+			/* the only reason why node in subscriptions tree might
+			   have a child is if one of them is subscribed */
+			subs_flags = MAILBOX_CHILD_SUBSCRIBED;
+		}
+		if (subs_flags == 0) {
+			if ((ret = ns_has_child_subscriptions(ctx, ns)) < 0) {
+				mailbox_list_ns_iter_failed(ctx);
+				return FALSE;
+			}
+			if (ret > 0)
+				subs_flags = MAILBOX_CHILD_SUBSCRIBED;
+		}
+		if (subs_flags != 0 &&
+		    mailbox_list_want_subscription(ns, ctx->ns_info.flags |
+						   subs_flags))
+			ctx->ns_info.flags |= subs_flags;
 	}
-	return TRUE;
+	return mailbox_ns_prefix_check_selection_criteria(ctx);
 }
 
 static void inbox_set_children_flags(struct ns_list_iterate_context *ctx)
@@ -727,21 +831,41 @@ patterns_match_inbox(struct mail_namespace *namespaces,
 	return imap_match(glob, "INBOX") == IMAP_MATCH_YES;
 }
 
+/* When acl_user makes this session a non-owner of the inbox namespace, the
+   INBOX we are about to force into the listing belongs to somebody else. The
+   per-namespace iterator would filter it out via
+   acl_mailbox_list_info_is_visible(), but the ns-level forced entry is
+   emitted from a synthetic mailbox_list that no plugin wraps, so ACL never
+   sees it. mailbox_list_mailbox_full() reaches acl_mailbox_exists() for us;
+   take its LOOKUP verdict rather than trying to infer one from the return
+   value. acl_mailbox_exists() deliberately answers "exists" for READ or
+   INSERT as well as LOOKUP (RFC 4314 deviation, used by SUBSCRIBE and the
+   METADATA commands), but listing is governed by LOOKUP alone, so the
+   return value is not usable here in either direction. */
 static int inbox_info_init(struct ns_list_iterate_context *ctx,
 			   struct mail_namespace *namespaces)
 {
 	enum mailbox_info_flags flags;
+	bool acl_no_lookup_right;
 	int ret;
 
 	ctx->inbox_info.vname = "INBOX";
 	ctx->inbox_info.ns = mail_namespace_find_inbox(namespaces);
 	i_assert(ctx->inbox_info.ns != NULL);
 
-	if ((ret = mailbox_list_mailbox(ctx->inbox_info.ns->list, "INBOX", &flags)) > 0)
-		ctx->inbox_info.flags = flags;
-	else if (ret < 0) {
+	ret = mailbox_list_mailbox_full(ctx->inbox_info.ns->list, "INBOX",
+					&flags, &acl_no_lookup_right);
+	if (ret < 0) {
 		ctx->cur_ns = ctx->inbox_info.ns;
 		mailbox_list_ns_iter_failed(ctx);
+		return ret;
+	}
+	if (ret > 0)
+		ctx->inbox_info.flags = flags;
+	if (acl_no_lookup_right &&
+	    (ctx->ctx.flags & MAILBOX_LIST_ITER_RAW_LIST) == 0) {
+		ctx->inbox_acl_denied = TRUE;
+		ctx->inbox_list = FALSE;
 	}
 	return ret;
 }
@@ -752,9 +876,13 @@ mailbox_list_iter_init_namespaces(struct mail_namespace *namespaces,
 				  enum mail_namespace_type type_mask,
 				  enum mailbox_list_iter_flags flags)
 {
+	struct mailbox_list *list = namespaces->list;
+	const struct mail_storage_settings *mail_set = list->mail_set;
+	bool nfc = mail_set->mailbox_list_normalize_names_to_nfc;
 	struct ns_list_iterate_context *ctx;
 	unsigned int i, count;
 	pool_t pool;
+	int ret;
 
 	i_assert(namespaces != NULL);
 
@@ -771,8 +899,18 @@ mailbox_list_iter_init_namespaces(struct mail_namespace *namespaces,
 
 	count = str_array_length(patterns);
 	ctx->patterns = p_new(pool, const char *, count + 1);
-	for (i = 0; i < count; i++)
-		ctx->patterns[i] = p_strdup(pool, patterns[i]);
+	for (i = 0; i < count; i++) {
+		const char *pattern;
+
+		if (!nfc)
+			pattern = patterns[i];
+		else {
+			ret = uni_utf8_to_nfc(patterns[i], strlen(patterns[i]),
+					      &pattern);
+			i_assert(ret >= 0);
+		}
+		ctx->patterns[i] = p_strdup(pool, pattern);
+	}
 	if (patterns_match_inbox(namespaces, ctx->patterns) &&
 	    (flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) == 0) {
 		/* we're going to list the INBOX. get its own flags (i.e. not
@@ -797,6 +935,8 @@ mailbox_list_iter_init_namespaces(struct mail_namespace *namespaces,
 
 	ctx->cur_ns = namespaces;
 	ctx->ctx.list->ns = namespaces;
+	ctx->ctx.info_pool =
+		pool_alloconly_create("mailbox list iter info", 128);
 	return &ctx->ctx;
 }
 
@@ -999,6 +1139,118 @@ static bool autocreate_iter_autobox(struct mailbox_list_iterate_context *ctx,
 	return FALSE;
 }
 
+static void mailbox_list_mark_node_visited(struct mailbox_node *node)
+{
+	node->flags &= ENUM_NEGATE(MAILBOX_MATCHED);
+	while (node->parent != NULL) {
+		node = node->parent;
+		if ((node->flags & MAILBOX_SUBSCRIBED) == 0)
+			node->flags &= ENUM_NEGATE(MAILBOX_MATCHED);
+	}
+}
+
+static bool
+mailbox_list_match_subscriptions(struct mailbox_list_iterate_context *ctx,
+				 const struct mailbox_info **info)
+{
+	if (ctx->subscriptions == NULL)
+		return TRUE;
+
+	bool created ATTR_UNUSED;
+	struct mailbox_node *node =
+		mailbox_tree_get(ctx->subscriptions, (*info)->vname, &created);
+	enum mailbox_info_flags subs_flags =
+		node->flags & MAILBOX_SUBSCRIBED;
+	if (subs_flags == 0) {
+		if (HAS_ANY_BITS((*info)->flags, MAILBOX_SUBSCRIBED |
+						 MAILBOX_CHILD_SUBSCRIBED)) {
+			/* auto-subscribed mailbox */
+			mailbox_list_mark_node_visited(node);
+			return TRUE;
+		}
+		node->flags |= (*info)->flags;
+		if (HAS_NO_BITS(ctx->flags, MAILBOX_LIST_ITER_SELECT_SUBSCRIBED)) {
+			mailbox_list_mark_node_visited(node);
+			return TRUE;
+		}
+		else
+			return FALSE;
+	}
+
+	ctx->subscriptions_info = **info;
+	ctx->subscriptions_info.flags &= ENUM_NEGATE(MAILBOX_SUBSCRIBED |
+						     MAILBOX_CHILD_SUBSCRIBED);
+	ctx->subscriptions_info.flags |= subs_flags;
+	*info = &ctx->subscriptions_info;
+
+	mailbox_list_mark_node_visited(node);
+	return TRUE;
+}
+
+static bool node_has_existing_children(struct mailbox_node *parent)
+{
+	struct mailbox_node *node;
+
+	for (node = parent->children; node != NULL; node = node->next) {
+		if ((node->flags & MAILBOX_NONEXISTENT) == 0)
+			return TRUE;
+		if ((node->flags & MAILBOX_CHILDREN) != 0)
+			return TRUE;
+		if ((node->flags & MAILBOX_NOCHILDREN) == 0) {
+			if (node_has_existing_children(node))
+				return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static const struct mailbox_info *
+mailbox_list_finish_subscriptions(struct mailbox_list_iterate_context *ctx)
+{
+	if (ctx->subscriptions == NULL ||
+	    HAS_NO_BITS(ctx->flags, MAILBOX_LIST_ITER_SELECT_SUBSCRIBED))
+		return NULL;
+
+	if (ctx->subscriptions_iter == NULL)
+		ctx->subscriptions_iter = mailbox_tree_iterate_init(
+			ctx->subscriptions, NULL, MAILBOX_MATCHED|MAILBOX_SUBSCRIBED);
+
+	struct mailbox_node *node;
+	const char *vname;
+	for (;;) {
+		node = mailbox_tree_iterate_next(ctx->subscriptions_iter, &vname);
+		if (node != NULL) {
+			if (!mailbox_list_want_subscription(ctx->list->ns, node->flags))
+				continue;
+			break;
+		}
+
+		if (ctx->subscriptions_children)
+			return NULL;
+
+		ctx->subscriptions_children = TRUE;
+		mailbox_tree_iterate_deinit(&ctx->subscriptions_iter);
+		ctx->subscriptions_iter = mailbox_tree_iterate_init(
+			ctx->subscriptions, NULL, MAILBOX_MATCHED|MAILBOX_CHILD_SUBSCRIBED);
+	}
+
+	i_zero(&ctx->subscriptions_info);
+	ctx->subscriptions_info.ns = ctx->list->ns;
+	ctx->subscriptions_info.vname = vname;
+	ctx->subscriptions_info.flags = node->flags;
+	if ((node->flags & (MAILBOX_CHILDREN | MAILBOX_NOCHILDREN)) == 0) {
+		/* Subscription tree was filled by mailbox list iteration.
+		   We can use it to get the children flags. */
+		if (node_has_existing_children(node))
+			ctx->subscriptions_info.flags |= MAILBOX_CHILDREN;
+		else
+			ctx->subscriptions_info.flags |= MAILBOX_NOCHILDREN;
+	}
+
+	mailbox_list_mark_node_visited(node);
+	return &ctx->subscriptions_info;
+}
+
 static const struct mailbox_info *
 mailbox_list_iter_next_call(struct mailbox_list_iterate_context *ctx)
 {
@@ -1006,27 +1258,74 @@ mailbox_list_iter_next_call(struct mailbox_list_iterate_context *ctx)
 	const struct mailbox_settings *set;
 	int ret;
 
-	info = ctx->list->v.iter_next(ctx);
-	if (info == NULL)
-		return NULL;
+	while ((info = ctx->list->v.iter_next(ctx)) != NULL)
+		if (mailbox_list_match_subscriptions(ctx, &info))
+			break;
 
-	ctx->list->ns->flags |= NAMESPACE_FLAG_USABLE;
+	if (info == NULL)
+		if ((info = mailbox_list_finish_subscriptions(ctx)) == NULL)
+			return NULL;
+
+	/* NOTE: ctx->list may be fake - don't use it directly */
+	struct mailbox_list *list = info->ns->list;
+	const struct mail_storage_settings *mail_set = list->mail_set;
+	bool nfc = mail_set->mailbox_list_normalize_names_to_nfc &&
+		(ctx->flags & MAILBOX_LIST_ITER_RAW_LIST) == 0 &&
+		(ctx->flags & MAILBOX_LIST_ITER_NO_RENAMING) == 0;
+	bool need_nfc_normalize = FALSE;
+	const char *vname;
+
+	if (!nfc)
+		vname = info->vname;
+	else {
+		ret = uni_utf8_to_nfc(info->vname, strlen(info->vname), &vname);
+		i_assert(ret >= 0);
+		need_nfc_normalize = (strcmp(info->vname, vname) != 0);
+	}
+	if (need_nfc_normalize) {
+		const char *vname_new = vname, *error;
+		int ret;
+
+		ret = mailbox_rename_nfc_forced(list, info->vname, vname,
+						&vname_new, &error);
+		if (ret < 0) {
+			mailbox_list_set_critical(list,
+				"Failed to rename mailbox '%s' for NFC normalization: %s",
+				info->vname, error);
+			ctx->failed = TRUE;
+		} else if (ret == 0) {
+			/* No rename performed */
+		} else if (strcmp(vname, vname_new) == 0) {
+			e_debug(list->event,
+				"Mailbox '%s' renamed for NFC normalization",
+				vname);
+		} else {
+			e_debug(list->event,
+				"Mailbox '%s' renamed to '%s' for NFC normalization "
+				"(mailbox with NFC normalized name existed already)",
+				info->vname, vname_new);
+		}
+
+		ctx->info = *info;
+		ctx->info.vname = p_strdup(ctx->info_pool, vname_new);
+		info = &ctx->info;
+	}
+
+	list->ns->flags |= NAMESPACE_FLAG_USABLE;
 	if ((ctx->flags & MAILBOX_LIST_ITER_RETURN_SPECIALUSE) != 0) {
-		/* NOTE: ctx->list is fake - don't use it directly */
 		const char *error;
 
-		ret = mailbox_name_try_get_settings(info->ns->list, info->vname,
+		ret = mailbox_name_try_get_settings(list, info->vname,
 						    &set, &error);
 		if (ret == 0) {
 			struct event *event = mail_storage_mailbox_create_event(
-				info->ns->list->event, info->ns->list,
-				info->vname);
+				list->event, list, info->vname);
 			ret = settings_get(event, &mailbox_setting_parser_info, 0,
 					   &set, &error);
 			event_unref(&event);
 		}
 		if (ret < 0) {
-			mailbox_list_set_critical(info->ns->list, "%s", error);
+			mailbox_list_set_critical(list, "%s", error);
 			ctx->failed = TRUE;
 			return NULL;
 		}
@@ -1093,6 +1392,9 @@ mailbox_list_iter_next(struct mailbox_list_iterate_context *ctx)
 
 	if (ctx == &mailbox_list_iter_failed)
 		return NULL;
+
+	p_clear(ctx->info_pool);
+
 	do {
 		T_BEGIN {
 			info = mailbox_list_iter_next_call(ctx);
@@ -1112,6 +1414,9 @@ int mailbox_list_iter_deinit(struct mailbox_list_iterate_context **_ctx)
 	if (ctx->autocreate_ctx != NULL)
 		hash_table_destroy(&ctx->autocreate_ctx->duplicate_vnames);
 	i_free(ctx->specialuse_info_flags);
+	mailbox_tree_iterate_deinit(&ctx->subscriptions_iter);
+	mailbox_tree_deinit(&ctx->subscriptions);
+	pool_unref(&ctx->info_pool);
 	return ctx->list->v.iter_deinit(ctx);
 }
 
@@ -1132,12 +1437,11 @@ mailbox_list_iter_update_real(struct mailbox_list_iter_update_context *ctx,
 {
 	struct mail_namespace *ns = ctx->iter_ctx->list->ns;
 	struct mailbox_node *node;
-	enum mailbox_info_flags create_flags, always_flags;
+	enum mailbox_info_flags create_flags = 0, always_flags;
 	enum imap_match_result match;
 	const char *p;
 	bool created, add_matched;
 
-	create_flags = MAILBOX_NOCHILDREN;
 	always_flags = ctx->leaf_flags;
 	add_matched = TRUE;
 
@@ -1145,21 +1449,15 @@ mailbox_list_iter_update_real(struct mailbox_list_iter_update_context *ctx,
 		created = FALSE;
 		match = imap_match(ctx->glob, name);
 		if (match == IMAP_MATCH_YES) {
-			node = ctx->update_only ?
-				mailbox_tree_lookup(ctx->tree_ctx, name) :
-				mailbox_tree_get(ctx->tree_ctx, name, &created);
+			node = mailbox_tree_get(ctx->tree_ctx, name, &created);
 			if (created) {
 				node->flags = create_flags;
 				if (create_flags != 0)
 					node_fix_parents(node);
 			}
-			if (node != NULL) {
-				if (!ctx->update_only && add_matched)
-					node->flags |= MAILBOX_MATCHED;
-				if ((always_flags & MAILBOX_CHILDREN) != 0)
-					node->flags &= ENUM_NEGATE(MAILBOX_NOCHILDREN);
-				node->flags |= always_flags;
-			}
+			if (add_matched)
+				node->flags |= MAILBOX_MATCHED;
+			node->flags |= always_flags;
 			/* We don't want to show the parent mailboxes unless
 			   something else matches them, but if they are matched
 			   we want to show them having child subscriptions */
@@ -1182,8 +1480,7 @@ mailbox_list_iter_update_real(struct mailbox_list_iter_update_context *ctx,
 
 		name = t_strdup_until(name, p);
 		create_flags |= MAILBOX_NONEXISTENT;
-		create_flags &= ENUM_NEGATE(MAILBOX_NOCHILDREN);
-		always_flags = MAILBOX_CHILDREN | ctx->parent_flags;
+		always_flags = ctx->parent_flags;
 	}
 }
 

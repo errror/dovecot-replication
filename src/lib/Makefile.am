@@ -1,14 +1,50 @@
+include $(top_srcdir)/Makefile.test.include
+
 AM_CPPFLAGS = \
+	-I$(top_srcdir)/src/lib-test \
 	$(LIBUNWIND_CFLAGS)
 
 noinst_LTLIBRARIES = liblib.la
 
-BUILT_SOURCES = $(srcdir)/unicodemap.c \
+BUILT_SOURCES = $(srcdir)/unicode-data-tables.c \
+		$(srcdir)/unicode-data-tables.h \
+		$(srcdir)/unicode-data-types.c \
+		$(srcdir)/unicode-data-types.h \
 		event-filter-lexer.c \
 		event-filter-parser.c \
 		event-filter-parser.h
 
-EXTRA_DIST = unicodemap.c unicodemap.pl UnicodeData.txt
+UCD_URL = https://dovecot.org/res
+UCD_DIR = $(srcdir)/ucd
+UCD_ABS_DIR = $(abs_srcdir)/ucd
+UCD_FILES = \
+	$(UCD_DIR)/CaseFolding.txt \
+	$(UCD_DIR)/CompositionExclusions.txt \
+	$(UCD_DIR)/DerivedBidiClass.txt \
+	$(UCD_DIR)/DerivedCoreProperties.txt \
+	$(UCD_DIR)/DerivedJoiningType.txt \
+	$(UCD_DIR)/DerivedNormalizationProps.txt \
+	$(UCD_DIR)/emoji-data.txt \
+	$(UCD_DIR)/GraphemeBreakProperty.txt \
+	$(UCD_DIR)/GraphemeBreakTest.txt \
+	$(UCD_DIR)/NormalizationTest.txt \
+	$(UCD_DIR)/PropertyValueAliases.txt \
+	$(UCD_DIR)/PropList.txt \
+	$(UCD_DIR)/Scripts.txt \
+	$(UCD_DIR)/SpecialCasing.txt \
+	$(UCD_DIR)/UnicodeData.txt \
+	$(UCD_DIR)/WordBreakProperty.txt \
+	$(UCD_DIR)/IdnaMappingTable.txt \
+	$(UCD_DIR)/IdnaTestV2.txt
+
+EXTRA_DIST = \
+	unicode-data-tables.c \
+	unicode-data-tables.h \
+	unicode-data-types.c \
+	unicode-data-types.h \
+	unicode-ucd-compile.py \
+	$(UCD_FILES)
+EXTRA_CLEAN = unicode-data-tables.c
 
 # Squelch autoconf error about using .[ly] sources but not defining $(LEX)
 # and $(YACC).  Using false here avoids accidental use.
@@ -30,13 +66,49 @@ YACC=/bin/false
 # dependency, anything including the header will race the bison process.
 event-filter-parser.h: event-filter-parser.c
 
-$(srcdir)/UnicodeData.txt:
-	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ https://dovecot.org/res/UnicodeData.txt
+$(UCD_DIR)/CaseFolding.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/CaseFolding.txt
+$(UCD_DIR)/CompositionExclusions.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/CompositionExclusions.txt
+$(UCD_DIR)/DerivedBidiClass.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/DerivedBidiClass.txt
+$(UCD_DIR)/DerivedCoreProperties.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/DerivedCoreProperties.txt
+$(UCD_DIR)/DerivedJoiningType.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/DerivedJoiningType.txt
+$(UCD_DIR)/DerivedNormalizationProps.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/DerivedNormalizationProps.txt
+$(UCD_DIR)/emoji-data.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/emoji-data.txt
+$(UCD_DIR)/GraphemeBreakProperty.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/GraphemeBreakProperty.txt
+$(UCD_DIR)/GraphemeBreakTest.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/GraphemeBreakTest.txt
+$(UCD_DIR)/NormalizationTest.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/NormalizationTest.txt
+$(UCD_DIR)/PropertyValueAliases.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/PropertyValueAliases.txt
+$(UCD_DIR)/PropList.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/PropList.txt
+$(UCD_DIR)/Scripts.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/Scripts.txt
+$(UCD_DIR)/SpecialCasing.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/SpecialCasing.txt
+$(UCD_DIR)/UnicodeData.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/UnicodeData.txt
+$(UCD_DIR)/WordBreakProperty.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/WordBreakProperty.txt
+$(UCD_DIR)/IdnaMappingTable.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/IdnaMappingTable.txt
+$(UCD_DIR)/IdnaTestV2.txt:
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ $(UCD_URL)/IdnaTestV2.txt
 
-$(srcdir)/unicodemap.c: $(srcdir)/unicodemap.pl $(srcdir)/UnicodeData.txt
-	$(AM_V_GEN)$(PERL) $(srcdir)/unicodemap.pl < $(srcdir)/UnicodeData.txt > $@
+$(srcdir)/unicode-data-tables.c $(srcdir)/unicode-data-tables.h \
+	$(srcdir)/unicode-data-types.c $(srcdir)/unicode-data-types.h &: \
+	$(srcdir)/unicode-ucd-compile.py $(UCD_FILES)
+	$(AM_V_GEN)$(PYTHON) $(srcdir)/unicode-ucd-compile.py $(UCD_DIR) $(srcdir)
 
-liblib_la_LIBADD = $(LIBUNWIND_LIBS)
+liblib_la_LIBADD = $(LIBUNWIND_LIBS) $(ZLIB_LIBS_STATIC) $(ZLIB_LIBS)
 liblib_la_SOURCES = \
 	array.c \
 	aqueue.c \
@@ -45,6 +117,7 @@ liblib_la_SOURCES = \
 	base32.c \
 	base64.c \
 	bits.c \
+	bitmap.c \
 	bsearch-insert-pos.c \
 	buffer.c \
 	buffer-istream.c \
@@ -83,6 +156,8 @@ liblib_la_SOURCES = \
 	home-expand.c \
 	hook-build.c \
 	hostpid.c \
+	idna.c \
+	idna-punycode.c \
 	imem.c \
 	ipwd.c \
 	iostream.c \
@@ -162,7 +237,6 @@ liblib_la_SOURCES = \
 	process-stat.c \
 	process-title.c \
 	priorityq.c \
-	punycode.c \
 	randgen.c \
 	rand.c \
 	read-full.c \
@@ -177,6 +251,7 @@ liblib_la_SOURCES = \
 	sha1.c \
 	sha2.c \
 	sha3.c \
+	xxh64.c \
 	sleep.c \
 	sort.c \
 	stats-dist.c \
@@ -193,13 +268,20 @@ liblib_la_SOURCES = \
 	unlink-directory.c \
 	unlink-old-files.c \
 	unichar.c \
+	unicode-break.c \
+	unicode-data-types.c \
+	unicode-data-tables.c \
+	unicode-data.c \
+	unicode-transform.c \
 	uri-util.c \
 	utc-offset.c \
 	utc-mktime.c \
+	version.c \
 	wildcard-match.c \
 	write-full.c
 
 headers = \
+	abnf.h \
 	aqueue.h \
 	array.h \
 	array-decl.h \
@@ -208,6 +290,7 @@ headers = \
 	base32.h \
 	base64.h \
 	bits.h \
+	bitmap.h \
 	bsearch-insert-pos.h \
 	buffer.h \
 	byteorder.h \
@@ -251,6 +334,8 @@ headers = \
 	home-expand.h \
 	hook-build.h \
 	hostpid.h \
+	idna.h \
+	idna-punycode.h \
 	imem.h \
 	ipwd.h \
 	iostream.h \
@@ -322,7 +407,6 @@ headers = \
 	process-stat.h \
 	process-title.h \
 	priorityq.h \
-	punycode.h \
 	randgen.h \
 	read-full.h \
 	restrict-access.h \
@@ -337,6 +421,7 @@ headers = \
 	sha1.h \
 	sha2.h \
 	sha3.h \
+	xxh64.h \
 	sleep.h \
 	sort.h \
 	stats-dist.h \
@@ -353,17 +438,24 @@ headers = \
 	unlink-directory.h \
 	unlink-old-files.h \
 	unichar.h \
+	unicode-break.h \
+	unicode-data-static.h \
+	unicode-data-types.h \
+	unicode-data-tables.h \
+	unicode-data.h \
+	unicode-transform.h \
 	uri-util.h \
 	utc-offset.h \
 	utc-mktime.h \
+	version.h \
 	wildcard-match.h \
 	write-full.h
 
-test_programs = test-lib
-noinst_PROGRAMS = $(test_programs)
+test_programs = test-lib test-cpu-limit
 
 test_lib_CPPFLAGS = \
-	-I$(top_srcdir)/src/lib-test
+	-I$(top_srcdir)/src/lib-test \
+	-DUCD_DIR=\"$(UCD_ABS_DIR)\"
 
 test_libs = \
 	../lib-test/libtest.la \
@@ -377,13 +469,13 @@ test_lib_SOURCES = \
 	test-base32.c \
 	test-base64.c \
 	test-bits.c \
+	test-bitmap.c \
 	test-bsearch-insert-pos.c \
 	test-buffer.c \
 	test-buffer-istream.c \
 	test-byteorder.c \
 	test-connection.c \
 	test-crc32.c \
-	test-cpu-limit.c \
 	test-data-stack.c \
 	test-env-util.c \
 	test-event-category-register.c \
@@ -403,6 +495,8 @@ test_lib_SOURCES = \
 	test-hash-method.c \
 	test-hmac.c \
 	test-hex-binary.c \
+	test-idna.c \
+	test-idna-punycode.c \
 	test-imem.c \
 	test-ioloop.c \
 	test-iso8601-date.c \
@@ -445,7 +539,6 @@ test_lib_SOURCES = \
 	test-primes.c \
 	test-printf-format-fix.c \
 	test-priorityq.c \
-	test-punycode.c \
 	test-random.c \
 	test-seq-range-array.c \
 	test-seq-set-builder.c \
@@ -460,21 +553,26 @@ test_lib_SOURCES = \
 	test-str-table.c \
 	test-time-util.c \
 	test-unichar.c \
+	test-unicode-break.c \
+	test-unicode-data.c \
+	test-unicode-nf.c \
+	test-unicode-casemap.c \
 	test-utc-mktime.c \
 	test-uri.c \
+	test-version.c \
 	test-wildcard-match.c
 
 test_headers = \
 	test-lib.h \
 	test-lib.inc
 
-test_lib_LDADD = $(test_libs) -lm
+test_lib_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_lib_DEPENDENCIES = $(test_libs)
 
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done
+test_cpu_limit_SOURCES = \
+	test-cpu-limit.c
+test_cpu_limit_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+test_cpu_limit_DEPENDENCIES = $(test_libs)
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)

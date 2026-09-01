@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "common.h"
 #include "ioloop.h"
@@ -178,7 +178,7 @@ master_fatal_callback(const struct failure_context *ctx,
 		/* write the error message to a file (we're chdired to
 		   base dir) */
 		path = t_strconcat(FATAL_FILENAME, NULL);
-		fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+		fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW, 0600);
 		if (fd != -1) {
 			VA_COPY(args2, args);
 			str = t_strdup_vprintf(format, args2);
@@ -339,7 +339,7 @@ static void create_pid_file(const char *path)
 
 	pid = t_strconcat(dec2str(getpid()), "\n", NULL);
 
-	fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
 	if (fd == -1)
 		i_fatal("open(%s) failed: %m", path);
 	if (write_full(fd, pid, strlen(pid)) < 0)
@@ -404,7 +404,7 @@ sig_settings_reload(const siginfo_t *si ATTR_UNUSED,
 
 	if (services->config->process_avail == 0) {
 		/* we can't reload config if there's no config process. */
-		if (service_process_create(services->config) == NULL) {
+		if (service_process_create(services->config, -1, NULL) == NULL) {
 			i_error("Can't reload configuration because "
 				"we couldn't create a config process");
 			i_sd_notify(0, "READY=1");
@@ -801,8 +801,19 @@ int main(int argc, char *argv[])
 
 #ifdef DEBUG
 	if (getenv("GDB") == NULL) {
-		fd_debug_verify_leaks(3, MASTER_CONFIG_FD - 1);
-		fd_debug_verify_leaks(MASTER_CONFIG_FD + 1, 1024);
+		const char *config_fd_env = getenv(DOVECOT_CONFIG_FD_ENV);
+		if (config_fd_env != NULL) {
+			int config_fd;
+			if (str_to_int(config_fd_env, &config_fd) < 0 ||
+				       config_fd <= 3 || config_fd >= 1024) {
+				i_fatal("'%s' is not valid number (in environment variable %s)",
+					config_fd_env, DOVECOT_CONFIG_FD_ENV);
+			}
+			fd_debug_verify_leaks(3, config_fd - 1);
+			fd_debug_verify_leaks(config_fd + 1, 1024);
+		} else {
+			fd_debug_verify_leaks(3, 1024);
+		}
 	}
 #endif
 	/* drop -- prefix from all --args. ugly, but the only way that it

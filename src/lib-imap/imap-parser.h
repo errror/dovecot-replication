@@ -38,6 +38,15 @@ enum imap_parser_error {
 	IMAP_PARSE_ERROR_LITERAL_TOO_BIG
 };
 
+struct imap_parser_params {
+	/* How many open lists ('(' chars) to allow before failing the parsing.
+	   0 means unlimited. This is mainly used to prevent excessive memory
+	   usage in imap-login process. In imap process there are many other
+	   ways to increase memory usage, so we let the max_line_size be the
+	   only limit. */
+	unsigned int list_count_limit;
+};
+
 struct imap_parser;
 
 /* Create new IMAP argument parser. output is used for sending command
@@ -53,7 +62,8 @@ struct imap_parser;
    2 * max_line_size. */
 struct imap_parser *
 imap_parser_create(struct istream *input, struct ostream *output,
-		   size_t max_line_size) ATTR_NULL(2);
+		   size_t max_line_size,
+		   const struct imap_parser_params *params);
 void imap_parser_ref(struct imap_parser *parser);
 void imap_parser_unref(struct imap_parser **parser);
 

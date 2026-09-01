@@ -34,13 +34,19 @@ enum login_proxy_failure_type {
 	LOGIN_PROXY_FAILURE_TYPE_PROTOCOL,
 	/* Authentication failed to backend. The LOGIN/AUTH command reply was
 	   already sent to the client. */
-	LOGIN_PROXY_FAILURE_TYPE_AUTH,
+	LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED,
+	/* Authentication failed to backend. The LOGIN/AUTH command reply was
+	   NOT sent to the client yet. */
+	LOGIN_PROXY_FAILURE_TYPE_AUTH_NOT_REPLIED,
 	/* Authentication failed with a temporary failure code. Attempting it
 	   again might work. */
 	LOGIN_PROXY_FAILURE_TYPE_AUTH_TEMPFAIL,
 	/* Authentication requests connecting to another host. The reason
 	   string contains the host (and optionally :port). */
 	LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT,
+	/* Authentication failed because user has reached some limit.
+	   The LOGIN/AUTH command reply was already sent to the client. */
+	LOGIN_PROXY_FAILURE_TYPE_AUTH_LIMIT_REACHED_REPLIED,
 };
 
 struct login_proxy_settings {
@@ -98,20 +104,29 @@ void login_proxy_redirect_finish(struct login_proxy *proxy,
 bool login_proxy_failed(struct login_proxy *proxy, struct event *event,
 			enum login_proxy_failure_type type, const char *reason);
 
+/* Handle SASL input in str, and write the SASL output to str. */
+int login_proxy_sasl_step(struct client *client, string_t *str);
+
 /* Return TRUE if host/port/destuser combination points to same as current
    connection. */
 bool login_proxy_is_ourself(const struct client *client, const char *host,
 		            const struct ip_addr *hostip,
 			    in_port_t port, const char *destuser);
 
+/* Halt input from proxy server early */
+void login_proxy_input_halt(struct login_proxy *proxy);
 /* Detach proxy from client. This is done after the authentication is
    successful and all that is left is the dummy proxying. */
 void login_proxy_detach(struct login_proxy *proxy);
 
 /* STARTTLS command was issued. */
 int login_proxy_starttls(struct login_proxy *proxy);
+/* Returns TRUE if proxying failed because of invalid SSL certificate. */
+bool login_proxy_failed_because_invalid_cert(struct login_proxy *proxy);
 /* MULTIPLEX input was started. */
 void login_proxy_multiplex_input_start(struct login_proxy *proxy);
+/* Returns TRUE if login_proxy_multiplex_input_start() has been called. */
+bool login_proxy_multiplex_input_started(struct login_proxy *proxy);
 
 void login_proxy_replace_client_iostream_pre(struct login_proxy *proxy);
 void login_proxy_replace_client_iostream_post(struct login_proxy *proxy,

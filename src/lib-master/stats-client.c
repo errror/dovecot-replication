@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -31,6 +31,7 @@ struct stats_client {
 };
 
 static struct connection_list *stats_clients;
+struct event_filter **stats_event_filter = NULL;
 
 static void stats_client_connect(struct stats_client *client);
 
@@ -77,7 +78,10 @@ stats_client_handshake(struct stats_client *client, const char *const *args)
 
 	event_filter_unref(&client->filter);
 	client->filter = filter;
-	event_set_global_debug_send_filter(client->filter);
+
+	if (stats_event_filter == NULL)
+		stats_event_filter = event_global_debug_send_filter_register();
+	*stats_event_filter = filter;
 	return 1;
 }
 
@@ -418,15 +422,18 @@ stats_client_init_unittest(buffer_t *buf, const char *filter)
 		stats_global_init();
 
 	client = i_new(struct stats_client, 1);
-	connection_init_client_unix(stats_clients, &client->conn, "(unit test)");
 	client->conn.output = o_stream_create_buffer(buf);
+	connection_init_client_unix(stats_clients, &client->conn, "(unit test)");
 	o_stream_set_no_error_handling(client->conn.output, TRUE);
 	client->handshaked = TRUE;
 
 	client->filter = event_filter_create();
 	if (!event_filter_import(client->filter, filter, &error))
 		i_panic("Failed to import unit test event filter: %s", error);
-	event_set_global_debug_send_filter(client->filter);
+
+	if (stats_event_filter == NULL)
+		stats_event_filter = event_global_debug_send_filter_register();
+	*stats_event_filter = client->filter;
 	return client;
 }
 
@@ -458,7 +465,12 @@ void stats_client_deinit(struct stats_client **_client)
 		stats_client_wait(client, STATS_CLIENT_DEINIT_WAIT);
 	}
 
+	if (stats_event_filter != NULL) {
+		i_assert(*stats_event_filter == client->filter);
+		*stats_event_filter = NULL;
+	}
 	event_filter_unref(&client->filter);
+
 	connection_deinit(&client->conn);
 	timeout_remove(&client->to_reconnect);
 	o_stream_unref(&client->conn.output);

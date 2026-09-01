@@ -1,4 +1,4 @@
-/* Copyright (c) 2019 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-stats-common.h"
 #include "array.h"
@@ -29,7 +29,7 @@ static void test_stats_metrics(void)
 	test_begin("stats metrics (event counting)");
 
 	/* register some stats */
-	test_init(settings_blob_1);
+	test_stats_init(settings_blob_1);
 
 	/* push event in */
 	struct event *event = event_create(NULL);
@@ -41,7 +41,7 @@ static void test_stats_metrics(void)
 	test_assert(get_stats_dist_field("test", STATS_DIST_COUNT) == 1);
 	test_assert(get_stats_dist_field("test", STATS_DIST_SUM) > 0);
 
-	test_deinit();
+	test_stats_deinit();
 	test_end();
 }
 
@@ -56,7 +56,7 @@ static void test_stats_metrics_filter(void)
 {
 	test_begin("stats metrics (filter)");
 
-	test_init(settings_blob_2);
+	test_stats_init(settings_blob_2);
 
 	/* check filter */
 	struct event_filter *filter =
@@ -88,7 +88,7 @@ static void test_stats_metrics_filter(void)
 	test_assert(get_stats_dist_field("test", STATS_DIST_COUNT) == 1);
 	test_assert(get_stats_dist_field("test", STATS_DIST_SUM) > 0);
 
-	test_deinit();
+	test_stats_deinit();
 	test_end();
 }
 
@@ -160,7 +160,7 @@ static const struct discrete_test discrete_tests[] = {
 		  "metric/test/group_by/sub_name/method/discrete/method=discrete",
 		  NULL },
 		3,
-		{ "apple", "bannana", "orange", },
+		{ "apple", "banana", "orange", },
 		{ "pie", "yoghurt", "cobbler", },
 	},
 	{
@@ -197,7 +197,7 @@ test_stats_metrics_group_by_discrete_real(const struct discrete_test *test,
 	const char *const *all_settings = t_strsplit(
 		t_strconcat(t_strarray_join(base_settings, " "), " ",
 			    t_strarray_join(test->settings_blob, " "), NULL), " ");
-	test_init(all_settings);
+	test_stats_init(all_settings);
 
 	for (i = 0; i < test->num_values; i++) {
 		for (j = 0; j < test->num_values; j++) {
@@ -249,7 +249,7 @@ test_stats_metrics_group_by_discrete_real(const struct discrete_test *test,
 		}
 	}
 
-	test_deinit();
+	test_stats_deinit();
 	test_end();
 }
 
@@ -261,7 +261,7 @@ static void test_stats_metrics_group_by_discrete(void)
 		test_stats_metrics_group_by_discrete_real(&discrete_tests[i], i);
 }
 
-#define QUANTIZED_TEST_VAL_COUNT	15
+#define QUANTIZED_TEST_VAL_COUNT	30
 struct quantized_test {
 	const char *const *settings_blob;
 	unsigned int num_inputs;
@@ -300,6 +300,87 @@ static const struct quantized_test quantized_tests[] = {
 		  { { 800, 900 }, 1 },
 		  { { 900, 1000 }, 2 },
 		  { { 1000, INTMAX_MAX }, 2 },
+		}
+	},
+	{
+		(const char *const []){
+		  "metric/test/group_by/foobar/method=linear",
+		  "metric/test/group_by/foobar/method/linear/method=linear",
+		  "metric/test/group_by/foobar/method/linear/min=500",
+		  "metric/test/group_by/foobar/method/linear/max=10000",
+		  "metric/test/group_by/foobar/method/linear/step=500",
+		  NULL },
+		26,
+		{
+			0, 50, 100, 101, 200, 201, 250, 301, 900, 901, 1000, 1001, 1500,
+			2000, 2001, 2200, 8000, 8001, 8200, 8500, 9000, 9001,
+			10000, 10001, 10500, 15000,
+		},
+		11,
+		21,
+		{ { { INTMAX_MIN, 500 }, 8 },
+		  { { 500, 1000 }, 3 },
+		  { { 1000, 1500 }, 2 },
+		  { { 1500, 2000 }, 1 },
+		  { { 2000, 2500 }, 2 },
+		  { { 2500, 3000 }, 0 },
+		  { { 3000, 3500 }, 0 },
+		  { { 3500, 4000 }, 0 },
+		  { { 4000, 4500 }, 0 },
+		  { { 4500, 5000 }, 0 },
+		  { { 5000, 5500 }, 0 },
+		  { { 5500, 6000 }, 0 },
+		  { { 6000, 6500 }, 0 },
+		  { { 6500, 7000 }, 0 },
+		  { { 7000, 7500 }, 0 },
+		  { { 7500, 8000 }, 1 },
+		  { { 8000, 8500 }, 3 },
+		  { { 8500, 9000 }, 1 },
+		  { { 9000, 9500 }, 1 },
+		  { { 9500, 10000 }, 1 },
+		  { { 10000, INTMAX_MAX }, 3 },
+		}
+	},
+	{
+		(const char *const []){
+		  "metric/test/group_by/foobar/method=linear",
+		  "metric/test/group_by/foobar/method/linear/method=linear",
+		  "metric/test/group_by/foobar/method/linear/min=500",
+		  "metric/test/group_by/foobar/method/linear/max=10000",
+		  "metric/test/group_by/foobar/method/linear/step=450",
+		  NULL },
+		26,
+		{
+			0, 50, 100, 101, 200, 201, 250, 301, 900, 901, 1000, 1001, 1500,
+			2000, 2001, 2200, 8000, 8001, 8200, 8500, 9000, 9001,
+			10000, 10001, 10500, 15000,
+		},
+		10,
+		24,
+		{ { { INTMAX_MIN, 500 }, 8 },
+		  { { 500, 950 }, 2 },
+		  { { 950, 1400 }, 2 },
+		  { { 1400, 1850 }, 1 },
+		  { { 1850, 2300 }, 3 },
+		  { { 2300, 2750 }, 0 },
+		  { { 2750, 3200 }, 0 },
+		  { { 3200, 3650 }, 0 },
+		  { { 3650, 4100 }, 0 },
+		  { { 4100, 4550 }, 0 },
+		  { { 4550, 5000 }, 0 },
+		  { { 5000, 5450 }, 0 },
+		  { { 5450, 5900 }, 0 },
+		  { { 5900, 6350 }, 0 },
+		  { { 6350, 6800 }, 0 },
+		  { { 6800, 7250 }, 0 },
+		  { { 7250, 7700 }, 0 },
+		  { { 7700, 8150 }, 2 },
+		  { { 8150, 8600 }, 2 },
+		  { { 8600, 9050 }, 2 },
+		  { { 9050, 9500 }, 0 },
+		  { { 9500, 9950 }, 0 },
+		  { { 9950, 10000 }, 1 },
+		  { { 10000, INTMAX_MAX }, 3 },
 		}
 	},
 	{
@@ -409,7 +490,7 @@ test_stats_metrics_group_by_quantized_real(const struct quantized_test *test,
 	const char *const *all_settings = t_strsplit(
 		t_strconcat(t_strarray_join(base_settings, " "), " ",
 			    t_strarray_join(test->settings_blob, " "), NULL), " ");
-	test_init(all_settings);
+	test_stats_init(all_settings);
 
 	struct event *event;
 
@@ -486,7 +567,7 @@ test_stats_metrics_group_by_quantized_real(const struct quantized_test *test,
 						      METRIC_VALUE_TYPE_BUCKET_INDEX);
 	}
 
-	test_deinit();
+	test_stats_deinit();
 	test_end();
 }
 

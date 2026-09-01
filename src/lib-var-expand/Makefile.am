@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libvar_expand.la
 
 # Squelch autoconf error about using .[ly] sources but not defining $(LEX)
@@ -11,7 +13,7 @@ YACC=/bin/false
 # and cleaner to make this rule ourselves instead of working around ylwrap
 # and yywrap's antiquated notion of what is happening.
 .l.c:
-	$(AM_V_GEN)$(FLEX) -o $@ $<
+	$(AM_V_GEN)$(FLEX) -8 -B -o $@ $<
 
 .y.c:
 	$(AM_V_GEN)$(BISON) -o $@ $<
@@ -19,6 +21,7 @@ YACC=/bin/false
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
+	-I$(top_srcdir)/src/lib-regex \
 	-Wno-error=unused-function \
 	-DVAR_EXPAND_MODULE_DIR=\"$(moduledir)\"
 
@@ -32,6 +35,7 @@ libvar_expand_la_SOURCES = \
 	expansion-filter-crypt.c \
 	expansion-program.c \
 	var-expand.c \
+	var-expand-split.c \
 	var-expand-parser.y \
 	var-expand-lexer.l
 
@@ -47,6 +51,7 @@ noinst_HEADERS = \
 
 headers = \
 	var-expand.h \
+	var-expand-split.h \
 	var-expand-private.h
 
 pkginc_libdir=$(pkgincludedir)
@@ -55,16 +60,39 @@ pkginc_lib_HEADERS = $(headers)
 test_programs = \
 	test-var-expand
 
-noinst_PROGRAMS = $(test_programs)
-
 test_libs = \
 	libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
-	../lib/liblib.la \
-	$(MODULE_LIBS)
+	../lib/liblib.la
 
 test_var_expand_SOURCE = test-var-expand.c
-test_var_expand_LDADD = $(test_libs)
+test_var_expand_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+
+if USE_FUZZER
+fuzz_programs = fuzz-var-expand fuzz-var-expand-import
+
+nodist_EXTRA_fuzz_var_expand_SOURCES = force-cxx-linking.cxx
+
+fuzz_var_expand_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_var_expand_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_var_expand_SOURCES = fuzz-var-expand.c
+fuzz_var_expand_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+fuzz_var_expand_DEPENDENCIES = libvar_expand.la
+
+fuzz_var_expand_import_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_var_expand_import_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_var_expand_import_SOURCES = fuzz-var-expand-import.c
+fuzz_var_expand_import_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+fuzz_var_expand_import_DEPENDENCIES = libvar_expand.la
+
+noinst_PROGRAMS += $(fuzz_programs)
+
+endif
+
+EXTRA_DIST = \
+	fuzz-var-expand.dict \
+	fuzz-var-expand-import.dict
 
 check-local:
 	for bin in $(test_programs); do \

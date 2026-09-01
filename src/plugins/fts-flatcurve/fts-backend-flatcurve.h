@@ -1,5 +1,4 @@
-/* Copyright (c) the Dovecot authors, based on code by Michael Slusarz.
- * See the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #ifndef FTS_FLATCURVE_BACKEND_H
 #define FTS_FLATCURVE_BACKEND_H
@@ -12,6 +11,8 @@
 
 struct flatcurve_fts_backend {
 	struct fts_backend backend;
+	/* MUST use fts_backend_flatcurve_set_mailbox_params() to set these
+	 * values. */
 	string_t *boxname, *db_path, *volatile_dir;
 
 	struct event *event;
@@ -58,6 +59,11 @@ struct flatcurve_fts_result {
 int
 fts_backend_flatcurve_set_mailbox(struct flatcurve_fts_backend *backend,
                                   struct mailbox *box, const char **error_r);
+void
+fts_backend_flatcurve_set_mailbox_params(struct flatcurve_fts_backend *backend,
+					 const char *box, const char *path,
+					 bool append_path_label,
+					 const char *volatile_dir);
 int
 fts_backend_flatcurve_close_mailbox(struct flatcurve_fts_backend *backend,
 				    const char **error_r);

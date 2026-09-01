@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -44,7 +44,7 @@ mail_search_arg_to_cmdline(string_t *dest, const struct mail_search_arg *arg)
 
 		new_arg = *arg;
 		new_arg.match_not = FALSE;
-		if (!mail_search_arg_to_imap(dest, &new_arg, &error))
+		if (!mail_search_arg_to_imap(dest, &new_arg, FALSE, &error))
 			i_unreached();
 		if (str_c(dest)[pos] == '(') {
 			str_insert(dest, pos+1, " ");
@@ -54,18 +54,20 @@ mail_search_arg_to_cmdline(string_t *dest, const struct mail_search_arg *arg)
 	}
 	case SEARCH_INTHREAD:
 		str_append(dest, "INTHREAD ");
-		imap_append_astring(dest, mail_thread_type_to_str(arg->value.thread_type));
+		imap_append_astring(
+			dest, mail_thread_type_to_str(arg->value.thread_type),
+			0);
 		str_append_c(dest, ' ');
 		mail_search_subargs_to_cmdline(dest, arg->value.subargs, " ");
 		break;
 	case SEARCH_MAILBOX:
 	case SEARCH_MAILBOX_GLOB:
 		str_append(dest, "MAILBOX ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		return;
 	case SEARCH_MAILBOX_GUID:
 		str_append(dest, "MAILBOX-GUID ");
-		imap_append_astring(dest, arg->value.str);
+		imap_append_astring(dest, arg->value.str, 0);
 		return;
 	case SEARCH_ALL:
 	case SEARCH_SEQSET:
@@ -89,7 +91,7 @@ mail_search_arg_to_cmdline(string_t *dest, const struct mail_search_arg *arg)
 	}
 	new_arg = *arg;
 	new_arg.match_not = FALSE;
-	if (!mail_search_arg_to_imap(dest, &new_arg, &error))
+	if (!mail_search_arg_to_imap(dest, &new_arg, FALSE, &error))
 		i_panic("mail_search_args_to_cmdline(): Missing handler: %s", error);
 }
 

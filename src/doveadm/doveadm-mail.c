@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -47,11 +47,6 @@ struct doveadm_mail_cmd_module_register
 	doveadm_mail_cmd_module_register = { 0 };
 char doveadm_mail_cmd_hide = '\0';
 
-bool doveadm_is_killed(void)
-{
-	return master_service_is_killed(master_service);
-}
-
 void doveadm_mail_failed_error(struct doveadm_mail_cmd_context *ctx,
 			       enum mail_error error)
 {
@@ -85,6 +80,7 @@ void doveadm_mail_failed_error(struct doveadm_mail_cmd_context *ctx,
 		break;
 	case MAIL_ERROR_INUSE:
 	case MAIL_ERROR_LIMIT:
+	case MAIL_ERROR_TOOBIG:
 		exit_code = DOVEADM_EX_NOTPOSSIBLE;
 		break;
 	case MAIL_ERROR_LOOKUP_ABORTED:
@@ -305,7 +301,8 @@ static int cmd_force_resync_box(struct doveadm_mail_cmd_context *_ctx,
 	struct force_resync_cmd_context *ctx =
 		container_of(_ctx, struct force_resync_cmd_context, ctx);
 
-	enum mailbox_flags flags = MAILBOX_FLAG_IGNORE_ACLS;
+	enum mailbox_flags flags =
+		MAILBOX_FLAG_IGNORE_ACLS | MAILBOX_FLAG_RAW_NAME;
 	struct mailbox *box;
 	int ret = 0;
 
@@ -582,6 +579,7 @@ doveadm_mail_all_users(struct doveadm_mail_cmd_context *ctx,
 		cctx->username = user;
 		T_BEGIN {
 			ret = doveadm_mail_next_user(ctx, &error);
+			doveadm_print_flush();
 			if (ret < 0)
 				e_error(ctx->cctx->event, "%s", error);
 			else if (ret == 0)

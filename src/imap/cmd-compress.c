@@ -1,10 +1,9 @@
-/* Copyright (c) 2010-2022 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "imap-commands.h"
 #include "istream.h"
 #include "ostream.h"
-#include "ostream-multiplex.h"
 #include "iostream-rawlog.h"
 #include "str.h"
 #include "strescape.h"
@@ -67,10 +66,14 @@ bool cmd_compress(struct client_command_context *cmd)
 		return TRUE;
 	}
 	int ret = compression_lookup_handler(t_str_lcase(mechanism), &handler);
-	if (ret <= 0) {
+	/* Only DEFLATE is advertised (RFC 4978) and accepted here. Other
+	   algorithms (e.g. zstd) can require far more memory to decompress,
+	   which especially matters now that imap-login can handle COMPRESS for
+	   proxied connections and an attacker could open many of them. */
+	if (ret <= 0 || strcmp(handler->name, "deflate") != 0) {
 		const char * tagline =
 			t_strdup_printf("NO %s compression mechanism",
-					ret == 0 ? "Unsupported" : "Unknown");
+					ret < 0 ? "Unknown" : "Unsupported");
 		client_send_tagline(cmd, tagline);
 		return TRUE;
 	}
@@ -89,13 +92,8 @@ bool cmd_compress(struct client_command_context *cmd)
 		/* Let imap-login process handle the COMPRESS. It's the one
 		   that will send the tagged reply to the client. */
 		client->compress_handler = handler;
-		if (client->side_channel_output == NULL) {
-			client->side_channel_output =
-				o_stream_multiplex_add_channel(
-					client->multiplex_output, 1);
-			o_stream_set_no_error_handling(
-				client->side_channel_output, TRUE);
-		}
+		if (client->side_channel_output == NULL)
+			client_create_side_channel_output(client);
 		string_t *str = t_str_new(64);
 		str_append(str, "compress\t");
 		str_append_tabescaped(str, handler->name);
@@ -147,7 +145,8 @@ bool cmd_compress(struct client_command_context *cmd)
 	o_stream_unref(&old_output);
 
 	if (client->pre_rawlog_input != NULL) {
-		(void)iostream_rawlog_create(client->set->rawlog_dir,
+		(void)iostream_rawlog_create(client->event, "rawlog_dir",
+					     client->set->rawlog_dir,
 					     &client->input, &client->output);
 		client->post_rawlog_input = client->input;
 		client->post_rawlog_output = client->output;

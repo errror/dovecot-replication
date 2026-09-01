@@ -61,8 +61,12 @@ pool_t buffer_get_pool(const buffer_t *buf) ATTR_PURE;
    current size, it is zero-filled up to that point (even if data_size==0). */
 void buffer_write(buffer_t *buf, size_t pos,
 		  const void *data, size_t data_size);
+void buffer_write_array(buffer_t *buf, size_t pos,
+			const void *data, size_t count, size_t size);
 /* Append data to buffer. */
 void buffer_append(buffer_t *buf, const void *data, size_t data_size);
+void buffer_append_array(buffer_t *buf, const void *data,
+			 size_t count, size_t size);
 /* Append character to buffer. */
 void buffer_append_c(buffer_t *buf, unsigned char chr);
 
@@ -70,6 +74,8 @@ void buffer_append_c(buffer_t *buf, unsigned char chr);
    the current buffer size, the gap is zero-filled. */
 void buffer_insert(buffer_t *buf, size_t pos,
 		   const void *data, size_t data_size);
+void buffer_insert_array(buffer_t *buf, size_t pos,
+			 const void *data, size_t count, size_t size);
 /* Delete data with the indicated size from the buffer at position pos. The
    deleted block may cross the current buffer size boundary, which is ignored.
  */
@@ -84,6 +90,9 @@ void buffer_replace(buffer_t *buf, size_t pos, size_t size,
 void buffer_write_zero(buffer_t *buf, size_t pos, size_t data_size);
 void buffer_append_zero(buffer_t *buf, size_t data_size);
 void buffer_insert_zero(buffer_t *buf, size_t pos, size_t data_size);
+/* Terminate the buffer with a NUL character after the buffer's used size.
+   The NUL will not be included in the used size. */
+void buffer_nul_terminate(buffer_t *buf);
 
 /* Copy data from buffer to another. The buffers may be same in which case
    it's internal copying, possibly with overlapping positions (ie. memmove()

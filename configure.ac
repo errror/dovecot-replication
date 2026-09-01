@@ -28,22 +28,21 @@ PKG_PROG_PKG_CONFIG
 ACLOCAL_AMFLAGS='-I $(top_srcdir)/m4'
 AC_SUBST(ACLOCAL_AMFLAGS)
 
+AM_ICONV
+
 AC_ARG_ENABLE(devel-checks,
-AS_HELP_STRING([--enable-devel-checks], [Enable some extra expensive checks for developers]),
+AS_HELP_STRING([--enable-devel-checks@<:@=fast@:>@], [Enable some extra expensive checks for developers (fast enables only some of them)]),
 	if test x$enableval = xyes; then
 		AC_DEFINE(DEBUG,, [Build with extra debugging checks])
+		AC_DEFINE(DEBUG_FAST,, [Build with extra fast debugging checks])
+	elif test x$enableval = xfast; then
+		AC_DEFINE(DEBUG_FAST,, [Build with extra fast debugging checks])
 	fi)
 
 AC_ARG_ENABLE(static-checker,
 AS_HELP_STRING([--enable-static-checker], [Enable code to be used when building with static code analyzer]),
 	if test x$enableval = xyes; then
 		AC_DEFINE(STATIC_CHECKER,, [Building with static code analyzer])
-	fi)
-
-AC_ARG_ENABLE(asserts,
-AS_HELP_STRING([--enable-asserts], [Enable asserts (default)]),
-	if test x$enableval = xno; then
-		AC_DEFINE(DISABLE_ASSERTS,, [Disable asserts])
 	fi)
 
 AC_ARG_ENABLE([pro-build],
@@ -70,6 +69,9 @@ AC_SUBST([DOVECOT_HAVE_MAIL_UTF8], $have_mail_utf8)
 AC_ARG_ENABLE(experimental-imap4rev2,
 AS_HELP_STRING([--enable-experimental-imap4rev2], [Enable experimental support for IMAP4REV2]),
 	AS_IF([test x$enableval = xyes], [
+		AS_IF([test x$have_mail_utf8 != xyes], [
+			AC_MSG_ERROR([--enable-experimental-mail-utf8 is required for --enable-experimental-imap4rev2])
+		])
 		AC_DEFINE([EXPERIMENTAL_IMAP4REV2],, [Build with IMAP4REV2 support])
 		experimental_capabilities="${experimental_capabilities} IMAP4REV2"
 		have_imap4rev2=yes
@@ -170,6 +172,11 @@ AC_ARG_WITH(icu,
 AS_HELP_STRING([--with-icu], [Build with libicu support (for lib-language normalization) (auto)]),
   want_icu=$withval,
   want_icu=auto)
+
+AC_ARG_WITH(pcre2,
+AS_HELP_STRING([--with-pcre2], [Build with libpcre2 support (for regular expression support) (auto)]),
+  want_pcre=$withval,
+  want_pcre=auto)
 
 AC_ARG_WITH(solr,
 AS_HELP_STRING([--with-solr], [Build with Solr full text search support]),
@@ -331,6 +338,9 @@ DC_DOVECOT_HARDENING
 DC_DOVECOT_FUZZER
 DC_DOVECOT_CFLAGS
 
+FUZZER_CFLAGS="$FUZZER_CFLAGS $AM_CFLAGS $BINARY_CFLAGS"
+FUZZER_LDFLAGS="$FUZZER_LDFLAGS $AM_LDFLAGS $BINARY_LDFLAGS"
+
 DOVECOT_NSL
 DOVECOT_LIBCAP
 
@@ -343,7 +353,7 @@ AC_CHECK_FUNCS(flock pread setproctitle setresgid \
 	       getmntinfo setpriority quotactl getmntent kqueue kevent \
 	       backtrace_symbols walkcontext dirfd clearenv \
 	       malloc_usable_size glob fallocate posix_fadvise \
-	       getpeereid getpeerucred inotify_init timegm)
+	       getpeereid getpeerucred inotify_init timegm memrchr)
 
 AC_CHECK_HEADERS([valgrind/valgrind.h])
 
@@ -353,11 +363,10 @@ DOVECOT_TYPEOF
 DOVECOT_IOLOOP
 DOVECOT_NOTIFY
 AS_CASE(
-   ["$notify"],
-   [none],   [BUILD_IMAP_HIBERNATE=0],
-   [kqueue], [BUILD_IMAP_HIBERNATE=0],
+   ["$have_notify"],
+   [none], [BUILD_IMAP_HIBERNATE=0],
    [BUILD_IMAP_HIBERNATE=1])
-AS_IF([test "$BUILD_IMAP_HIBERNATE"=1],
+AS_IF([test "$BUILD_IMAP_HIBERNATE" = 1],
       AC_DEFINE(BUILD_IMAP_HIBERNATE,, [Build with imap hibernate]))
 AM_CONDITIONAL([BUILD_IMAP_HIBERNATE], [test "$BUILD_IMAP_HIBERNATE" = 1])
 
@@ -584,12 +593,12 @@ LIBDOVECOT_LA_LIBS='\
 	$(top_builddir)/src/lib-mail/libmail.la \
 	$(top_builddir)/src/lib-sasl/libsasl.la \
 	$(top_builddir)/src/lib-auth/libauth.la \
-	$(top_builddir)/src/lib-otp/libotp.la \
 	$(top_builddir)/src/lib-auth-client/libauth-client.la \
 	$(top_builddir)/src/lib-charset/libcharset.la \
 	$(top_builddir)/src/lib-ssl-iostream/libssl_iostream.la \
 	$(top_builddir)/src/lib-dcrypt/libdcrypt.la \
 	$(top_builddir)/src/lib-json/libjson.la \
+	$(top_builddir)/src/lib-regex/libdregex.la \
 	$(top_builddir)/src/lib-test/libtest.la \
 	$(top_builddir)/src/lib/liblib.la'
 # This is used in dovecot-config, which is grepped in dovecot.m4,
@@ -600,23 +609,30 @@ LIBDOVECOT_LUA=''
 
 if test "$want_shared_libs" = "yes"; then
   LIBDOVECOT_DEPS='$(top_builddir)/src/lib-dovecot/libdovecot.la'
-  LIBDOVECOT="$LIBDOVECOT_DEPS \$(MODULE_LIBS)"
-  LIBDOVECOT_STORAGE_DEPS='$(top_builddir)/src/lib-storage/libdovecot-storage.la $(top_builddir)/src/lib-imap-storage/libimap-storage.la'
+  LIBDOVECOT="$LIBDOVECOT_DEPS \$(MODULE_LIBS) \$(LIBPCRE_LIBS)"
+  LIBDOVECOT_STORAGE_DEPS='$(top_builddir)/src/lib-dovecot-storage/libdovecot-storage.la'
   LIBDOVECOT_LOGIN='$(top_builddir)/src/login-common/libdovecot-login.la'
   LIBDOVECOT_LDA='$(top_builddir)/src/lib-lda/libdovecot-lda.la'
   if test $want_lua != no; then
     LIBDOVECOT_LUA='$(top_builddir)/src/lib-lua/libdovecot-lua.la'
   fi
+  if test $want_gssapi != no; then
+    LIBDOVECOT_GSSAPI='$(top_builddir)/src/lib-dovecot-gssapi/libdovecot-gssapi.la'
+  fi
 else
   LIBDOVECOT_DEPS="$LIBDOVECOT_LA_LIBS"
-  LIBDOVECOT="$LIBDOVECOT_DEPS \$(MODULE_LIBS)"
-  LIBDOVECOT_STORAGE_DEPS='$(top_builddir)/src/lib-storage/libstorage.la'
+  LIBDOVECOT="$LIBDOVECOT_DEPS \$(MODULE_LIBS) \$(LIBPCRE_LIBS)"
+  LIBDOVECOT_STORAGE_DEPS='$(top_builddir)/src/lib-imap-storage/libimap-storage.la $(top_builddir)/src/lib-storage/libstorage.la'
   LIBDOVECOT_LOGIN='$(top_builddir)/src/login-common/liblogin.la'
   LIBDOVECOT_LDA='$(top_builddir)/src/lib-lda/liblda.la'
   if test $want_lua != no; then
     LIBDOVECOT_LUA='$(top_builddir)/src/lib-lua/libdlua.la'
   fi
+  if test $want_gssapi != no; then
+    LIBDOVECOT_GSSAPI='$(top_builddir)/src/lib-auth/libauth-gssapi.la $(top_builddir)/src/lib-sasl/libsasl-gssapi.la'
+  fi
 fi
+LIBDOVECOT_GSSAPI_DEPS="$LIBDOVECOT_GSSAPI"
 if test $want_ldap != no; then
   LIBDOVECOT_LDAP='$(top_builddir)/src/lib-ldap/libdldap.la'
 else
@@ -631,7 +647,12 @@ LIBDOVECOT_LIBLANG='$(top_builddir)/src/lib-language/libdovecot-language.la'
 LIBDOVECOT_OPENSSL='$(top_builddir)/src/lib-ssl-iostream/libssl_iostream_openssl.la'
 LIBDOVECOT_OPENSSL_DEPS="$LIBDOVECOT_OPENSSL"
 
+LIBDOVECOT_TEST_LIBS="\$(LIBPCRE_LIBS_STATIC) \$(LIBPCRE_LIBS) \$(ZLIB_LIBS_STATIC) \$(ZLIB_LIBS) \$(MODULE_LIBS) \$(DLLIB) -lm"
+
 AC_SUBST(LIBDOVECOT)
+AC_SUBST(LIBPCRE_LIBS_STATIC)
+AC_SUBST(ZLIB_LIBS_STATIC)
+AC_SUBST(LIBDOVECOT_TEST_LIBS)
 AC_SUBST(LIBDOVECOT_LA_LIBS)
 AC_SUBST(LIBDOVECOT_DEPS)
 AC_SUBST(LIBDOVECOT_STORAGE)
@@ -648,6 +669,8 @@ AC_SUBST(LIBDOVECOT_LUA)
 AC_SUBST(LIBDOVECOT_LUA_DEPS)
 AC_SUBST(LIBDOVECOT_OPENSSL)
 AC_SUBST(LIBDOVECOT_OPENSSL_DEPS)
+AC_SUBST(LIBDOVECOT_GSSAPI)
+AC_SUBST(LIBDOVECOT_GSSAPI_DEPS)
 
 dnl **
 dnl ** SQL drivers
@@ -721,6 +744,7 @@ DOVECOT_WANT_STEMMER
 DOVECOT_WANT_TEXTCAT
 
 DOVECOT_WANT_ICU
+DOVECOT_WANT_PCRE
 
 DOVECOT_WANT_APPARMOR
 
@@ -773,9 +797,11 @@ SETTING_LINKED_FILES=`echo $libdovecot_c_files | $SED -e s,$srcdir/src,./src,g -
 AC_SUBST(SETTING_FILES)
 AC_SUBST(SETTING_LINKED_FILES)
 
-AM_CFLAGS="$AM_CFLAGS $EXTRA_CFLAGS"
-AM_CXXFLAGS="$AM_CXXFLAGS $EXTRA_CFLAGS"
+TEST_CFLAGS="-DTEST_DIR=\\\"\\\$(abs_top_builddir)/.test\\\""
+AM_CFLAGS="$AM_CFLAGS $TEST_CFLAGS $EXTRA_CFLAGS"
+AM_CXXFLAGS="$AM_CXXFLAGS $TEST_CFLAGS $EXTRA_CFLAGS"
 AC_SUBST([AM_CFLAGS])
+AC_SUBST([AM_LDFLAGS])
 AC_SUBST([AM_CXXFLAGS])
 BINARY_LDFLAGS="$PIE_LDFLAGS $RELRO_LDFLAGS"
 BINARY_CFLAGS="$PIE_CFLAGS"
@@ -787,7 +813,7 @@ NOPLUGIN_LDFLAGS="-no-undefined"
 if test "$with_gnu_ld" = yes; then
   NOPLUGIN_LDFLAGS="$NOPLUGIN_LDFLAGS -Wl,--as-needed"
 fi
-LDFLAGS="\$(NOPLUGIN_LDFLAGS) $LDFLAGS $EXTRA_LDFLAGS"
+LDFLAGS="\$(NOPLUGIN_LDFLAGS) $LDFLAGS $EXTRA_LDFLAGS $LTLIBICONV"
 AC_SUBST(NOPLUGIN_LDFLAGS)
 
 DC_CC_WRAPPER
@@ -843,13 +869,15 @@ src/lib-mail/Makefile
 src/lib-master/Makefile
 src/lib-login/Makefile
 src/lib-program-client/Makefile
-src/lib-otp/Makefile
 src/lib-dovecot/Makefile
+src/lib-dovecot-gssapi/Makefile
+src/lib-dovecot-storage/Makefile
 src/lib-sasl/Makefile
 src/lib-settings/Makefile
 src/lib-smtp/Makefile
 src/lib-ssl-iostream/Makefile
 src/lib-test/Makefile
+src/lib-regex/Makefile
 src/lib-storage/Makefile
 src/lib-storage/list/Makefile
 src/lib-storage/index/Makefile
@@ -862,6 +890,7 @@ src/lib-storage/index/dbox-multi/Makefile
 src/lib-storage/index/dbox-single/Makefile
 src/lib-storage/index/raw/Makefile
 src/lib-storage/index/shared/Makefile
+src/lib-storage-lua/Makefile
 src/lib-var-expand/Makefile
 src/lib-var-expand-crypt/Makefile
 src/anvil/Makefile
@@ -943,7 +972,10 @@ echo "userdbs ........ :$userdb"
 if test "$not_userdb" != ""; then
   echo "                 :$not_userdb"
 fi
-echo "AM_CFLAGS ...... : $AM_CFLAGS"
+echo "CFLAGS ......... : $AM_CFLAGS $CFLAGS $EXTRA_CFLAGS"
+echo "LDFLAGS ........ : $AM_LDFLAGS $LDFLAGS $EXTRA_LDFLAGS"
+echo "BINARY CFLAGS .. : $BINARY_CFLAGS"
+echo "BINARY LDFLAGS . : $BINARY_LDFLAGS"
 
 if test "$systemdsystemunitdir" != ""; then
   echo "SYSTEMD ........ : $systemdservicetype - $systemdsystemunitdir/dovecot.service";

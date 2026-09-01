@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libdldap.la
 
 AM_CPPFLAGS = \
@@ -36,6 +38,7 @@ headers = \
 noinst_HEADERS = \
 	ldap-connection-pool.h \
 	ldap-private.h \
+	ldap-sasl.h \
 	ldap-settings.h \
 	ldap-settings-parse.h
 
@@ -46,8 +49,3 @@ test_libs = \
 	../lib-test/libtest.la \
 	../lib-var-expand/libvar_expand.la \
 	../lib/liblib.la
-
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done

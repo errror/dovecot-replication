@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
@@ -844,7 +844,8 @@ cmd_dsync_ibc_stream_init(struct dsync_cmd_context *ctx,
 		o_stream_set_max_buffer_size(ctx->output, SIZE_MAX);
 	}
 	if (ctx->rawlog_path != NULL) {
-		iostream_rawlog_create_path(ctx->rawlog_path,
+		iostream_rawlog_create_path(ctx->ctx.cctx->event,
+					    "dsync rawlog", ctx->rawlog_path,
 					    &ctx->input, &ctx->output);
 	}
 	return dsync_ibc_init_stream(ctx->input, ctx->output,

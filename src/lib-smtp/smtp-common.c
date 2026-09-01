@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "smtp-common.h"
@@ -78,6 +78,11 @@ void smtp_proxy_data_merge(pool_t pool, struct smtp_proxy_data *dst,
 		dst->source_ip = src->source_ip;
 		if (src->source_port != 0)
 			dst->source_port = src->source_port;
+	}
+	if (src->dest_ip.family != 0) {
+		dst->dest_ip = src->dest_ip;
+		if (src->dest_port != 0)
+			dst->dest_port = src->dest_port;
 	}
 	if (src->helo != NULL && *src->helo != '\0')
 		dst->helo = p_strdup(pool, src->helo);

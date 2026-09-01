@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "test-lib.h"
@@ -43,10 +43,11 @@ static void test_program_success(void)
 
 	buffer_t *output = buffer_create_dynamic(default_pool, 16);
 	struct ostream *os = test_ostream_create(output);
+	o_stream_set_no_error_handling(os, TRUE);
 	program_client_set_output(pc, os);
 
 	test_assert(program_client_run(pc) == 1);
-	test_assert(strcmp(str_c(output), "hello world\n") == 0);
+	test_assert_strcmp(str_c(output), "hello world\n");
 
 	program_client_destroy(&pc);
 
@@ -73,10 +74,11 @@ static void test_program_io_sync(void)
 
 	buffer_t *output = buffer_create_dynamic(default_pool, 16);
 	struct ostream *os = test_ostream_create(output);
+	o_stream_set_no_error_handling(os, TRUE);
 	program_client_set_output(pc, os);
 
 	test_assert(program_client_run(pc) == 1);
-	test_assert(strcmp(str_c(output), pclient_test_io_string) == 0);
+	test_assert_strcmp(str_c(output), pclient_test_io_string);
 
 	program_client_destroy(&pc);
 
@@ -116,6 +118,7 @@ static void test_program_io_async(void)
 
 	buffer_t *output = buffer_create_dynamic(default_pool, 16);
 	struct ostream *os = test_ostream_create(output);
+	o_stream_set_no_error_handling(os, TRUE);
 	program_client_set_output(pc, os);
 
 	program_client_run_async(pc, test_program_io_async_callback, &ret);
@@ -123,7 +126,7 @@ static void test_program_io_async(void)
 	if (ret == -2)
 		io_loop_run(ioloop);
 
-	test_assert(strcmp(str_c(output), pclient_test_io_string) == 0);
+	test_assert_strcmp(str_c(output), pclient_test_io_string);
 
 	program_client_destroy(&pc);
 
@@ -151,10 +154,11 @@ static void test_program_failure(void)
 
 	buffer_t *output = buffer_create_dynamic(default_pool, 16);
 	struct ostream *os = test_ostream_create(output);
+	o_stream_set_no_error_handling(os, TRUE);
 	program_client_set_output(pc, os);
 
 	test_assert(program_client_run(pc) == 0);
-	test_assert(strcmp(str_c(output), "") == 0);
+	test_assert_strcmp(str_c(output), "");
 
 	program_client_destroy(&pc);
 
@@ -205,6 +209,8 @@ static void test_program_io_big(void)
 
 	buffer_t *output = buffer_create_dynamic(default_pool, 16);
 	struct ostream *os = test_ostream_create(output);
+	o_stream_set_no_error_handling(os, TRUE);
+
 	program_client_set_output(pc, os);
 
 	test_assert(program_client_run(pc) == 1);
@@ -261,6 +267,10 @@ int main(int argc, char *argv[])
 	};
 
 	lib_init();
+
+	/* Extend idle timeout with valgrind to avoid random failures. */
+	if (ON_VALGRIND)
+		pc_params.input_idle_timeout_msecs *= 2;
 
 	event = event_create(NULL);
 	while ((c = getopt(argc, argv, "D")) > 0) {

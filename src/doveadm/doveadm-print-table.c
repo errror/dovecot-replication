@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -133,6 +133,11 @@ static void doveadm_print_next(const char *value)
 	const struct doveadm_print_table_header *hdr;
 	int value_padded_len;
 
+	if (value[0] == '\0') {
+		/* It's more readable to see empty values as "-" in a table */
+		value = "-";
+	}
+
 	hdr = array_idx(&ctx->headers, ctx->hdr_idx);
 
 	value_padded_len = hdr->length + utf8_correction(value);
@@ -257,12 +262,12 @@ static void doveadm_print_table_deinit(void)
 }
 
 struct doveadm_print_vfuncs doveadm_print_table_vfuncs = {
-	"table",
+	.name = "table",
 
-	doveadm_print_table_init,
-	doveadm_print_table_deinit,
-	doveadm_print_table_header,
-	doveadm_print_table_print,
-	doveadm_print_table_print_stream,
-	doveadm_print_table_flush
+	.init = doveadm_print_table_init,
+	.deinit = doveadm_print_table_deinit,
+	.header = doveadm_print_table_header,
+	.print = doveadm_print_table_print,
+	.print_stream = doveadm_print_table_print_stream,
+	.flush = doveadm_print_table_flush,
 };

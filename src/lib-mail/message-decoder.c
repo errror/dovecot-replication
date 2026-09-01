@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -11,6 +11,7 @@
 #include "rfc2231-parser.h"
 #include "message-parser.h"
 #include "message-header-decode.h"
+#include "message-address.h"
 #include "message-decoder.h"
 
 struct message_decoder_context {
@@ -94,7 +95,7 @@ enum message_cte message_decoder_parse_cte(const struct message_header_line *hdr
 
 	rfc822_skip_lwsp(&parser);
 
-	/* Ensure we do not accidentically accept confused values like
+	/* Ensure we do not accidentally accept confused values like
 	   'base64 binary' or embedded NULs */
 	if (rfc822_parse_mime_token(&parser, value) == 1) {
 		rfc822_skip_lwsp(&parser);
@@ -180,8 +181,17 @@ static bool message_decode_header(struct message_decoder_context *ctx,
 	} T_END;
 
 	buffer_set_used_size(ctx->buf, 0);
-	message_header_decode_utf8(hdr->full_value, hdr->full_value_len,
-				   ctx->buf, ctx->normalizer);
+	if ((ctx->flags & MESSAGE_DECODER_FLAG_RAW_ADDRESS_HEADERS) != 0 &&
+	    message_header_is_address(hdr->name)) {
+		/* Pass the raw header value through unchanged so the caller
+		   can run message_address_parse() on the original bytes
+		   (encoded-words intact) rather than on a string that may
+		   contain RFC 5322 special characters after decoding. */
+		buffer_append(ctx->buf, hdr->full_value, hdr->full_value_len);
+	} else {
+		message_header_decode_utf8(hdr->full_value, hdr->full_value_len,
+					   ctx->buf, ctx->normalizer);
+	}
 	value_len = ctx->buf->used;
 
 	if (ctx->normalizer != NULL) {
@@ -224,11 +234,44 @@ static void translation_buf_decode(struct message_decoder_context *ctx,
 	memcpy(trans_buf + ctx->translation_size, *data, data_wanted);
 
 	orig_size = trans_size = ctx->translation_size + data_wanted;
-	(void)charset_to_utf8(ctx->charset_trans, trans_buf,
-			      &trans_size, ctx->buf2);
+	enum charset_result result =
+		charset_to_utf8(ctx->charset_trans, trans_buf,
+				&trans_size, ctx->buf2);
 
-	if (trans_size <= ctx->translation_size) {
-		/* need more data to finish the translation. */
+	if (trans_size > ctx->translation_size) {
+		/* more input was processed */
+	} else if (trans_size == ctx->translation_size &&
+		   result == CHARSET_RET_INCOMPLETE_INPUT) {
+		/* We get here at least with ISO-2022-JP:
+		   1. Incomplete sequence to change encoding state
+		   2. The final byte, which is found to be invalid.
+		   3. iconv() passes through the first two bytes instead of
+		      failing it as invalid input. The new byte starts a new
+		      incomplete encoding state.
+		   Handle this the same as if more input was processed. */
+	} else if (trans_size > 0) {
+		/* We get here when:
+		   1. Incomplete sequence has been sent to charset_to_utf8()
+		      previously, e.g. 3 bytes for a utf-32be character.
+		   2. We have 1 new byte to complete the character, which
+		      is found to be invalid.
+		   3. charset_to_utf8() internally skips 1 byte, hoping to find
+		      valid output from the next byte. But now we again have
+		      only 3 bytes left, so the input is incomplete to get
+		      forward.
+
+		   So we'll assert here that result is
+		   CHARSET_RET_INVALID_INPUT. Any other situation is not
+		   expected to happen. */
+		i_assert(result == CHARSET_RET_INVALID_INPUT);
+		trans_size = ctx->translation_size + 1;
+	} else {
+		/* We should get here only if we didn't get forward in our
+		   charset translation, i.e. we need more input to continue
+		   translation. */
+		i_assert(result == CHARSET_RET_INCOMPLETE_INPUT);
+		/* This assert triggers if translation_buf is too small and
+		   we can't get forward with the translation. */
 		i_assert(orig_size < CHARSET_MAX_PENDING_BUF_SIZE);
 		memcpy(ctx->translation_buf, trans_buf, orig_size);
 		ctx->translation_size = orig_size;
@@ -256,6 +299,10 @@ message_decode_body_init_charset(struct message_decoder_context *ctx,
 
 	if (ctx->binary_input)
 		return;
+
+	/* If some input was left untranslated in the previous MIME part,
+	   it needs to be discarded now so it won't affect the next part. */
+	ctx->translation_size = 0;
 
 	if (ctx->charset_trans != NULL && ctx->content_charset != NULL &&
 	    strcasecmp(ctx->content_charset, ctx->charset_trans_charset) == 0) {

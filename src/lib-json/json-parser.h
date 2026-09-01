@@ -25,7 +25,9 @@ enum json_parser_flags {
 	 */
 	JSON_PARSER_FLAG_NUMBERS_AS_STRING = BIT(3),
 	/* Allow Byte Order Mark at beginning of input */
-	JSON_PARSER_FLAG_ALLOW_BOM = BIT(4)
+	JSON_PARSER_FLAG_ALLOW_BOM = BIT(4),
+	/* Input is JSON string content rather than JSON text */
+	JSON_PARSER_FLAG_INPUT_IS_STRING_CONTENT = BIT(5),
 };
 
 struct json_parser_callbacks {
@@ -93,8 +95,10 @@ json_parser_error(struct json_parser *parser, const char *format, ...);
 void json_parser_interrupt(struct json_parser *parser);
 
 /* Returns -1 on error, 0 if parser is interrupted or needs more data,
-   or 1 if the complete JSON text is parsed. */
-int json_parse_more(struct json_parser *parser, const char **error_r);
+   or 1 if the complete JSON text is parsed. If at_end_r is not NULL, it will
+   be set to indicate whether the parser stopped at end of input. */
+int json_parse_more(struct json_parser *parser, bool *at_end_r,
+		    const char **error_r);
 
 /* Get the current location of the parser */
 void json_parser_get_location(struct json_parser *parser,
@@ -105,6 +109,21 @@ void json_parser_get_location(struct json_parser *parser,
    stream will buffer at most `max_buffer_size' bytes. */
 void json_parser_enable_string_stream(struct json_parser *parser,
 				      size_t threshold, size_t max_buffer_size);
+
+/* Like json_parser_enable_string_stream(), but for seekable input streams
+   exposes large string values as an i_stream_create_range() view into the
+   original input rather than buffering the decoded bytes.  Parsing is not
+   interrupted for these strings, so callers must not rely on the
+   JSON_PARSE_INTERRUPTED / json_parse_more() == 0 interlock; use
+   json_istream_read_tree_lazy_strings() which handles this correctly.
+   The delivered stream aliases the parser's own input stream: it must not
+   be read until the current json_parse_more() call has returned - reading
+   it any earlier (e.g. from inside the parse_value callback) corrupts the
+   parser's buffered position. */
+void json_parser_enable_lazy_string_stream(struct json_parser *parser,
+					   size_t threshold,
+					   size_t max_buffer_size);
+
 /* Disable parsing strings as a stream. */
 void json_parser_disable_string_stream(struct json_parser *parser);
 

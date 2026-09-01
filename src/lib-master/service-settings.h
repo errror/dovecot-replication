@@ -48,7 +48,6 @@ struct inet_listener_settings {
 	/* copied from master_settings: */
 	ARRAY_TYPE(const_string) listen;
 	bool ssl;
-	bool reuse_port;
 	bool haproxy;
 };
 ARRAY_DEFINE_TYPE(inet_listener_settings, struct inet_listener_settings *);
@@ -66,6 +65,7 @@ struct service_settings {
 	const char *chroot;
 
 	bool drop_priv_before_exec;
+	bool reuse_port;
 
 	unsigned int process_min_avail;
 	unsigned int process_limit;
@@ -89,7 +89,7 @@ struct service_settings {
 
 	/* -- flags that can be set internally -- */
 
-	/* process_limit must not be higher than 1 */
+	/* process_limit must not be greater than 1 */
 	bool process_limit_1:1;
 };
 ARRAY_DEFINE_TYPE(service_settings, struct service_settings *);

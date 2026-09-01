@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -45,9 +45,11 @@ struct http_transfer_chunked_istream {
 	uoff_t chunk_size, chunk_v_offset, chunk_pos;
 	uoff_t size, max_size;
 
+	struct http_header_limits hdr_limits;
 	struct http_header_parser *header_parser;
 
 	bool finished:1;
+	bool strict:1;
 };
 
 /* Chunk parser */
@@ -62,13 +64,11 @@ static inline const char *_chr_sanitize(unsigned char c)
 static int
 http_transfer_chunked_parse_size(struct http_transfer_chunked_istream *tcstream)
 {
-	uoff_t size = 0, prev;
+	uoff_t size = 0;
 
 	/* chunk-size     = 1*HEXDIG */
 
 	while (tcstream->cur < tcstream->end) {
-		prev = tcstream->chunk_size;
-
 		if (*tcstream->cur >= '0' && *tcstream->cur <= '9')
 			size = *tcstream->cur-'0';
 		else if (*tcstream->cur >= 'A' && *tcstream->cur <= 'F')
@@ -87,13 +87,13 @@ http_transfer_chunked_parse_size(struct http_transfer_chunked_istream *tcstream)
 			tcstream->parsed_chars = 0;
 			return 1;
 		}
-		tcstream->chunk_size <<= 4;
-		tcstream->chunk_size += size;
-		if (tcstream->chunk_size < prev) {
+		if (tcstream->chunk_size > (uoff_t)-1 >> 4) {
 			io_stream_set_error(&tcstream->istream.iostream,
 					    "Chunk size exceeds integer limit");
 			return -1;
 		}
+		tcstream->chunk_size <<= 4;
+		tcstream->chunk_size += size;
 		tcstream->parsed_chars++;
 		tcstream->cur++;
 	}
@@ -275,6 +275,11 @@ http_transfer_chunked_parse(struct http_transfer_chunked_istream *tcstream)
 				tcstream->cur++;
 				if (tcstream->cur >= tcstream->end)
 					return 0;
+			} else if (tcstream->strict) {
+				io_stream_set_error(
+					&tcstream->istream.iostream,
+					"Missing CR after chunk size");
+				return -1;
 			}
 			/* fall through */
 		case HTTP_CHUNKED_PARSE_STATE_LF:
@@ -300,6 +305,11 @@ http_transfer_chunked_parse(struct http_transfer_chunked_istream *tcstream)
 				tcstream->cur++;
 				if (tcstream->cur >= tcstream->end)
 					return 0;
+			} else if (tcstream->strict) {
+				io_stream_set_error(
+					&tcstream->istream.iostream,
+					"Missing CR after chunk data");
+				return -1;
 			}
 			/* fall through */
 		case HTTP_CHUNKED_PARSE_STATE_DATA_LF:
@@ -455,11 +465,15 @@ http_transfer_chunked_parse_trailer(
 	int ret;
 
 	if (tcstream->header_parser == NULL) {
+		enum http_header_parse_flags hdr_flags = 0;
+
+		if (tcstream->strict)
+			hdr_flags |= HTTP_HEADER_PARSE_FLAG_STRICT;
 		/* NOTE: trailer is currently ignored */
-		/* FIXME: limit trailer size */
 		tcstream->header_parser =
 			http_header_parser_init(tcstream->istream.parent,
-						NULL, 0);
+						&tcstream->hdr_limits,
+						hdr_flags);
 	}
 
 	while ((ret = http_header_parse_next_field(tcstream->header_parser,
@@ -532,12 +546,23 @@ http_transfer_chunked_istream_destroy(struct iostream_private *stream)
 }
 
 struct istream *
-http_transfer_chunked_istream_create(struct istream *input, uoff_t max_size)
+http_transfer_chunked_istream_create(struct istream *input, uoff_t max_size,
+	const struct http_header_limits *hdr_limits, bool strict)
 {
 	struct http_transfer_chunked_istream *tcstream;
 
 	tcstream = i_new(struct http_transfer_chunked_istream, 1);
 	tcstream->max_size = max_size;
+	tcstream->strict = strict;
+	if (hdr_limits != NULL)
+		tcstream->hdr_limits = *hdr_limits;
+
+	if (tcstream->hdr_limits.max_size == 0)
+		tcstream->hdr_limits.max_size = HTTP_TRANSFER_CHUNKED_DEFAULT_MAX_TRAILER_SIZE;
+	if (tcstream->hdr_limits.max_field_size == 0)
+		tcstream->hdr_limits.max_field_size = HTTP_TRANSFER_CHUNKED_DEFAULT_MAX_TRAILER_FIELD_SIZE;
+	if (tcstream->hdr_limits.max_fields == 0)
+		tcstream->hdr_limits.max_fields = HTTP_TRANSFER_CHUNKED_DEFAULT_MAX_TRAILER_FIELDS;
 
 	tcstream->istream.max_buffer_size =
 		input->real_stream->max_buffer_size;
@@ -550,7 +575,8 @@ http_transfer_chunked_istream_create(struct istream *input, uoff_t max_size)
 	tcstream->istream.istream.blocking = input->blocking;
 	tcstream->istream.istream.seekable = FALSE;
 	return i_stream_create(&tcstream->istream, input,
-			       i_stream_get_fd(input), 0);
+			       i_stream_get_fd(input),
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }
 
 /*

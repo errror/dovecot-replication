@@ -163,13 +163,15 @@ void db_ldap_get_attribute_names(pool_t pool,
 
 struct ldap_connection *db_ldap_init(struct event *event);
 void db_ldap_unref(struct ldap_connection **conn);
+void db_ldap_abort_all_requests(struct ldap_connection *conn);
 
 int db_ldap_connect(struct ldap_connection *conn);
 void db_ldap_connect_delayed(struct ldap_connection *conn);
 
 void db_ldap_enable_input(struct ldap_connection *conn, bool enable);
 
-const char *ldap_escape(const char *str, void *context);
+int ldap_dn_escape(const char *str, const char **output_r, void *context, const char **error_r);
+int ldap_escape(const char *str, const char **output_r, void *context, const char **error_r);
 const char *ldap_get_error(struct ldap_connection *conn);
 
 struct db_ldap_result_iterate_context *

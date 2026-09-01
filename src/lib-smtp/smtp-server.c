@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -63,6 +63,8 @@ struct smtp_server *smtp_server_init(const struct smtp_server_settings *set)
 	server->set.max_bad_commands = (set->max_bad_commands > 0 ?
 		set->max_bad_commands : SMTP_SERVER_DEFAULT_MAX_BAD_COMMANDS);
 	server->set.max_recipients = set->max_recipients;
+	i_assert(server->set.max_recipients != 0);
+
 	server->set.command_limits = set->command_limits;
 	server->set.max_message_size = set->max_message_size;
 

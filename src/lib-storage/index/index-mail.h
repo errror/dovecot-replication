@@ -2,6 +2,7 @@
 #define INDEX_MAIL_H
 
 #include "message-size.h"
+#include "message-part-data.h"
 #include "mail-cache.h"
 #include "mail-storage-private.h"
 
@@ -84,6 +85,7 @@ struct index_mail_data {
 	const char *envelope, *body, *bodystructure, *guid, *filename;
 	const char *from_envelope, *body_snippet;
 	struct message_part_envelope *envelope_data;
+	struct message_part_data_limits part_data_limits;
 
 	uint32_t cache_flags;
 	uint64_t modseq, pvt_modseq;
@@ -191,7 +193,8 @@ void index_mail_set_message_parts_corrupted(struct mail *mail, const char *error
 
 bool index_mail_want_parse_headers(struct index_mail *mail);
 void index_mail_parse_header_init(struct index_mail *mail,
-				  struct mailbox_header_lookup_ctx *headers)
+				  struct mailbox_header_lookup_ctx *headers,
+				  bool full_header_stream)
 	ATTR_NULL(2);
 void index_mail_parse_header(struct message_part *part,
 			     struct message_header_line *hdr,

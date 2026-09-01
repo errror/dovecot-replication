@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -30,6 +30,11 @@
 
 struct mail_user_module_register mail_user_module_register = { 0 };
 struct auth_master_connection *mail_user_auth_master_conn;
+
+static uoff_t mail_user_get_mail_max_size_base(struct mail_user *user ATTR_UNUSED)
+{
+	return UOFF_T_MAX;
+}
 
 static void mail_user_deinit_base(struct mail_user *user)
 {
@@ -99,6 +104,7 @@ mail_user_alloc(struct mail_storage_service_user *service_user)
 	event_set_ptr(user->event,
 		      SETTINGS_EVENT_VAR_EXPAND_CALLBACK_CONTEXT, user);
 
+	user->v.get_mail_max_size = mail_user_get_mail_max_size_base;
 	user->v.deinit = mail_user_deinit_base;
 	user->v.deinit_pre = mail_user_deinit_pre_base;
 	p_array_init(&user->module_contexts, user->pool, 5);
@@ -186,6 +192,11 @@ void mail_user_deinit(struct mail_user **user)
 	mail_user_unref(user);
 }
 
+uoff_t mail_user_get_mail_max_size(struct mail_user *user)
+{
+	return user->v.get_mail_max_size(user);
+}
+
 struct mail_user *mail_user_find(struct mail_user *user, const char *name)
 {
 	struct mail_namespace *ns;
@@ -230,8 +241,13 @@ mail_user_var_expand_func_home(const char *data ATTR_UNUSED, const char **value_
 	struct mail_user *user = context;
 
 	if (mail_user_get_home(user, value_r) <= 0) {
-		*error_r = "Setting used home directory (%h) but there is no "
-			"mail_home and userdb didn't return it";
+		if (user->nonexistent) {
+			/* Nonexistent shared user. Don't fail settings
+			   expansion due to this. */
+			*value_r = "";
+			return 0;
+		}
+		*error_r = "Setting used home directory (~/ or %{home}) but there is no mail_home and userdb didn't return it";
 		return -1;
 	}
 	return 0;
@@ -625,6 +641,7 @@ struct mail_user *mail_user_dup(struct mail_user *user)
 	user2->protocol = p_strdup(user2->pool, user->protocol);
 	user2->auth_mech = p_strdup(user2->pool, user->auth_mech);
 	user2->auth_token = p_strdup(user2->pool, user->auth_token);
+	user2->auth_token_session_pid = user->auth_token_session_pid;
 	user2->auth_user = p_strdup(user2->pool, user->auth_user);
 	user2->session_id = p_strdup(user2->pool, user->session_id);
 	user2->session_create_time = user->session_create_time;

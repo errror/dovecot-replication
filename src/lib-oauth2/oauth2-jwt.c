@@ -1,9 +1,10 @@
-/* Copyright (c) 2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
 #include "str.h"
 #include "strescape.h"
+#include "abnf.h"
 #include "hmac.h"
 #include "array.h"
 #include "hash-method.h"
@@ -115,9 +116,17 @@ get_time_field(const struct json_tree *tree, const char *key,
 	return -1;
 }
 
-/* Escapes '/' and '%' in identifier to %hex */
+/* Escapes '/' and '%' in identifier to %hex, and a whole-segment "." or
+   ".." to %2e[%2e] */
 static const char *escape_identifier(const char *identifier)
 {
+	/* A bare "." or ".." identifier would form a relative path component
+	   in the shared/<azp>/<alg>/<kid> dict key. */
+	if (strcmp(identifier, ".") == 0)
+		return "%2e";
+	if (strcmp(identifier, "..") == 0)
+		return "%2e%2e";
+
 	size_t pos = strcspn(identifier, "/%");
 
 	/* nothing to escape */
@@ -151,18 +160,21 @@ oauth2_lookup_hmac_key(const struct oauth2_settings *set, const char *azp,
 		       const buffer_t **hmac_key_r, const char **error_r)
 {
 	const char *base64_key;
-	const char *cache_key_id, *lookup_key;
+	const char *lookup_key;
 	int ret;
 
-	cache_key_id = t_strconcat(azp, ".", alg, ".", key_id, NULL);
-	if (oauth2_validation_key_cache_lookup_hmac_key(
-		set->key_cache, cache_key_id, hmac_key_r) == 0)
-		return 0;
-
-
-	/* do a synchronous dict lookup */
+	/* Use the same key for the cache and the dict lookup. It must be
+	   injective in (azp, alg, key_id): escape_identifier() escapes '/'
+	   within each segment, so the slash-joined path cannot collide across
+	   different field values. A dot-joined key could collide, since '.' is
+	   a valid unescaped character inside the attacker-controlled azp/kid. */
 	lookup_key = t_strconcat(DICT_PATH_SHARED, azp, "/", alg, "/", key_id,
 				 NULL);
+	if (oauth2_validation_key_cache_lookup_hmac_key(
+		set->key_cache, lookup_key, hmac_key_r) == 0)
+		return 0;
+
+	/* do a synchronous dict lookup */
 	struct dict_op_settings dict_set = {
 		.username = NULL,
 	};
@@ -171,7 +183,8 @@ oauth2_lookup_hmac_key(const struct oauth2_settings *set, const char *azp,
 		return -1;
 	} else if (ret == 0) {
 		*error_r = t_strdup_printf("%s key '%s' not found",
-					   alg, key_id);
+					   str_sanitize_utf8(alg, 32),
+					   str_sanitize_utf8(key_id, 128));
 		return -1;
 	}
 
@@ -182,7 +195,7 @@ oauth2_lookup_hmac_key(const struct oauth2_settings *set, const char *azp,
 		return -1;
 	}
 	oauth2_validation_key_cache_insert_hmac_key(set->key_cache,
-						    cache_key_id, key);
+						    lookup_key, key);
 	*hmac_key_r = key;
 	return 0;
 }
@@ -201,7 +214,8 @@ oauth2_validate_hmac(const struct oauth2_settings *set, const char *azp,
 	else if (strcmp(alg, "HS512") == 0)
 		method = hash_method_lookup("sha512");
 	else {
-		*error_r = t_strdup_printf("unsupported algorithm '%s'", alg);
+		*error_r = t_strdup_printf("unsupported algorithm '%s'",
+					   str_sanitize_utf8(alg, 32));
 		return -1;
 	}
 
@@ -236,17 +250,18 @@ oauth2_lookup_pubkey(const struct oauth2_settings *set, const char *azp,
 		     struct dcrypt_public_key **key_r, const char **error_r)
 {
 	const char *key_str;
-	const char *cache_key_id, *lookup_key;
+	const char *lookup_key;
 	int ret;
 
-	cache_key_id = t_strconcat(azp, ".", alg, ".", key_id, NULL);
+	/* Use the same key for the cache and the dict lookup; see the comment
+	   in oauth2_lookup_hmac_key() about why it must be slash-joined. */
+	lookup_key = t_strconcat(DICT_PATH_SHARED, azp, "/", alg, "/", key_id,
+				 NULL);
 	if (oauth2_validation_key_cache_lookup_pubkey(
-		set->key_cache, cache_key_id, key_r) == 0)
+		set->key_cache, lookup_key, key_r) == 0)
 		return 0;
 
 	/* do a synchronous dict lookup */
-	lookup_key = t_strconcat(DICT_PATH_SHARED, azp, "/", alg, "/", key_id,
-				 NULL);
 	struct dict_op_settings dict_set = {
 		.username = NULL,
 	};
@@ -255,7 +270,8 @@ oauth2_lookup_pubkey(const struct oauth2_settings *set, const char *azp,
 		return -1;
 	} else if (ret == 0) {
 		*error_r = t_strdup_printf("%s key '%s' not found",
-					   alg, key_id);
+					   str_sanitize_utf8(alg, 32),
+					   str_sanitize_utf8(key_id, 128));
 		return -1;
 	}
 
@@ -269,7 +285,7 @@ oauth2_lookup_pubkey(const struct oauth2_settings *set, const char *azp,
 	}
 
 	/* cache key */
-	oauth2_validation_key_cache_insert_pubkey(set->key_cache, cache_key_id,
+	oauth2_validation_key_cache_insert_pubkey(set->key_cache, lookup_key,
 						  pubkey);
 	*key_r = pubkey;
 	return 0;
@@ -311,7 +327,8 @@ oauth2_validate_rsa_ecdsa(const struct oauth2_settings *set,
 	} else if (strcmp(alg+2, "512") == 0) {
 		method = "sha512";
 	} else {
-		*error_r = t_strdup_printf("Unsupported algorithm '%s'", alg);
+		*error_r = t_strdup_printf("Unsupported algorithm '%s'",
+					   str_sanitize_utf8(alg, 32));
 		return -1;
 	}
 
@@ -353,7 +370,8 @@ oauth2_validate_signature(const struct oauth2_settings *set, const char *azp,
 						 error_r);
 	}
 
-	*error_r = t_strdup_printf("Unsupported algorithm '%s'", alg);
+	*error_r = t_strdup_printf("Unsupported algorithm '%s'",
+				   str_sanitize_utf8(alg, 32));
 	return -1;
 }
 
@@ -387,6 +405,9 @@ oauth2_jwt_copy_fields(ARRAY_TYPE(oauth2_field) *fields,
 
 			if (!json_node_is_singular(jnode)) {
 				root = array_append_space(&nodes);
+				/* array_append_space() may have reallocated the
+				   buffer, so refresh subroot to the new location. */
+				subroot = array_front(&nodes);
 				root->root = json_tree_node_get_child(tnode);
 				root->array = json_node_is_array(jnode);
 				if (jnode->name == NULL)
@@ -396,7 +417,7 @@ oauth2_jwt_copy_fields(ARRAY_TYPE(oauth2_field) *fields,
 				else
 					root->prefix = t_strconcat(jnode->name, "_", NULL);
 			} else {
-				struct oauth2_field *field;
+				struct oauth2_field *field = NULL, *field_iter;
 				const char *name;
 
 				if (subroot->array) {
@@ -405,11 +426,13 @@ oauth2_jwt_copy_fields(ARRAY_TYPE(oauth2_field) *fields,
 						name = t_strdup_until(subroot->prefix, name);
 					else
 						name = subroot->prefix;
-					array_foreach_modifiable(fields, field) {
-						if (strcmp(field->name, name) == 0)
+					array_foreach_modifiable(fields, field_iter) {
+						if (strcmp(field_iter->name, name) == 0) {
+							field = field_iter;
 							break;
+						}
 					}
-					if (field == NULL || field->name == NULL) {
+					if (field == NULL) {
 						field = array_append_space(fields);
 						field->name = p_strdup(pool, name);
 					}
@@ -499,16 +522,27 @@ oauth2_jwt_body_process(const struct oauth2_settings *set,
 	} else if (ret == 0 || iat == 0)
 		iat = t0;
 
-	if (nbf > t0) {
-		*error_r = "Token is not valid yet";
+	/* Token could have been just generated with a server where time is
+	   slightly newer than this server's time. Allow 1 second difference
+	   to avoid random failures due to token being into future. */
+	if (nbf > t0 + 1) {
+		*error_r = t_strdup_printf(
+			"Token is not valid yet (nbf=%"PRId64" > %"PRId64")",
+			nbf, t0 + 1);
 		return -1;
 	}
-	if (iat > t0) {
-		*error_r = "Token is issued in future";
+	if (iat > t0 + 1) {
+		*error_r = t_strdup_printf(
+			"Token is issued in future (iat=%"PRId64" > %"PRId64")",
+			iat, t0 + 1);
 		return -1;
 	}
-	if (exp < t0) {
-		*error_r = "Token has expired";
+	/* Allow using slightly expired token, in case client time isn't well
+	   synced. */
+	if (exp < t0 - set->token_expire_grace_secs) {
+		*error_r = t_strdup_printf(
+			"Token has expired (exp=%"PRId64" < %"PRId64" - grace %u)",
+			exp, t0, set->token_expire_grace_secs);
 		return -1;
 	}
 
@@ -561,7 +595,7 @@ oauth2_jwt_body_process(const struct oauth2_settings *set,
 		if (!check_scope(req_scope, got_scope)) {
 			*error_r = t_strdup_printf(
 				"configured scope '%s' missing from token scope '%s'",
-				req_scope, got_scope);
+				req_scope, str_sanitize_utf8(got_scope, 128));
 			return -1;
 		}
 	}
@@ -570,7 +604,10 @@ oauth2_jwt_body_process(const struct oauth2_settings *set,
 	const char *azp = get_field(tree, "azp", NULL);
 	if (azp == NULL)
 		azp = "default";
-	else
+	else if (abnf_contains_ascii_ctrl(azp)) {
+		*error_r = "'azp' field contains control characters";
+		return -1;
+	} else
 		azp = escape_identifier(azp);
 
 	if (oauth2_validate_signature(set, azp, alg, kid, blobs, error_r) < 0)
@@ -619,19 +656,40 @@ int oauth2_try_parse_jwt(const struct oauth2_settings *set,
 	/* it is now assumed to be a JWT token */
 	*is_jwt_r = TRUE;
 
+	/* 'kid' and 'azp' are attacker-controlled and end up both in the
+	   shared/<azp>/<alg>/<kid> dict key and in error messages written to
+	   the authentication log, where a LF would forge extra log lines.
+	   Control characters have no legitimate use in either field. */
 	if (kid == NULL)
 		kid = "default";
 	else if (*kid == '\0') {
 		*error_r = "'kid' field is empty";
 		return -1;
+	} else if (abnf_contains_ascii_ctrl(kid)) {
+		*error_r = "'kid' field contains control characters";
+		return -1;
 	} else {
 		kid = escape_identifier(kid);
 	}
 
-	/* parse body */
+	/* Parse body.
+
+	   NOTE: The body is parsed and its claims are validated before the
+	   signature is verified, i.e. an unauthenticated attacker can reach
+	   the JSON parser and the claim helpers with unsigned input. This is
+	   inherent to JWT as used here: the 'azp' claim needed to select the
+	   verification key lives in the body, so the body has to be parsed
+	   first. The signature check in oauth2_jwt_body_process() remains the
+	   only gate that grants access - nothing here is trusted before it
+	   passes. lib-json is fuzzed (see src/lib-json/fuzz-json-istream.c)
+	   for this reason. */
 	struct json_tree *body_tree;
 	buffer_t *body =
 		t_base64url_decode_str(BASE64_DECODE_FLAG_NO_PADDING, blobs[1]);
+	if (body->used == 0) {
+		*error_r = "Not a JWT token";
+		return -1;
+	}
 	if (oauth2_json_tree_build(body, &body_tree, error_r) == -1)
 		return -1;
 	ret = oauth2_jwt_body_process(set, alg, kid, fields, body_tree, blobs,

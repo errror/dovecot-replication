@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -144,8 +144,8 @@ update_change_info(const struct stat *st, struct file_change_info *change,
 
 		if (change->ctime == 0) {
 			/* First check, set last_change to file's change time.
-			   Use mtime instead if it's higher, but only if it's
-			   not higher than current time, because the mtime
+			   Use mtime instead if it's greater, but only if it's
+			   not greater than current time, because the mtime
 			   can also be used for keeping metadata. */
 			change_time = st->st_mtime <= now &&
 				(st->st_mtime > st->st_ctime || !check_ctime) ?
@@ -400,7 +400,7 @@ static int try_create_lock_excl(struct lock_info *lock_info, bool write_pid)
 {
 	int fd;
 
-	fd = open(lock_info->lock_path, O_RDWR | O_EXCL | O_CREAT, 0666);
+	fd = open(lock_info->lock_path, O_RDWR | O_EXCL | O_CREAT | O_NOFOLLOW, 0666);
 	if (fd == -1) {
 		if (errno == EEXIST)
 			return 0;

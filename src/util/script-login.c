@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "env-util.h"
@@ -7,6 +7,7 @@
 #include "restrict-access.h"
 #include "str.h"
 #include "strescape.h"
+#include "version.h"
 #include "settings-parser.h"
 #include "mail-storage-service.h"
 #include "master-interface.h"
@@ -26,7 +27,6 @@ static bool drop_to_userdb_privileges = FALSE;
 static void client_connected(struct master_service_connection *conn)
 {
 	enum mail_storage_service_flags flags =
-		MAIL_STORAGE_SERVICE_FLAG_ALLOW_ROOT |
 		MAIL_STORAGE_SERVICE_FLAG_NO_PLUGINS;
 	string_t *instr, *keys;
 	const char *const *args, *key, *value, *error, *version_line, *data_line;

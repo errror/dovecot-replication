@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "common.h"
 #include "array.h"
@@ -34,24 +34,6 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-static void service_reopen_inet_listeners(struct service *service)
-{
-	struct service_listener *const *listeners;
-	unsigned int i, count;
-	int old_fd;
-
-	listeners = array_get(&service->listeners, &count);
-	for (i = 0; i < count; i++) {
-		if (!listeners[i]->reuse_port || listeners[i]->fd == -1)
-			continue;
-
-		old_fd = listeners[i]->fd;
-		listeners[i]->fd = -1;
-		if (service_listener_listen(listeners[i]) < 0)
-			listeners[i]->fd = old_fd;
-	}
-}
-
 static int
 service_unix_pid_listener_get_path(struct service_listener *l, pid_t pid,
 				   string_t *path, const char **error_r)
@@ -69,13 +51,18 @@ service_unix_pid_listener_get_path(struct service_listener *l, pid_t pid,
 }
 
 static void
-service_dup_fds(struct service *service)
+service_dup_fds(struct service *service, unsigned int process_index,
+		int accepted_fd,
+		const struct service_listener *accepted_listener,
+		int *accepted_listener_fd_r)
 {
 	struct service_listener *const *listeners;
 	ARRAY_TYPE(dup2) dups;
 	string_t *listener_settings;
 	int fd = MASTER_LISTEN_FD_FIRST;
 	unsigned int i, count, socket_listener_count;
+
+	*accepted_listener_fd_r = -1;
 
 	/* stdin/stdout is already redirected to /dev/null. Other master fds
 	   should have been opened with fd_close_on_exec() so we don't have to
@@ -87,6 +74,12 @@ service_dup_fds(struct service *service)
         socket_listener_count = 0;
 	listeners = array_get(&service->listeners, &count);
 	t_array_init(&dups, count + 10);
+
+	if (accepted_fd != -1) {
+		/* we have a pre-accepted connection */
+		dup2_append(&dups, accepted_fd,
+			    MASTER_ACCEPTED_CLIENT_FD);
+	}
 
 	switch (service->type) {
 	case SERVICE_TYPE_LOG:
@@ -137,6 +130,15 @@ service_dup_fds(struct service *service)
 				}
 			}
 
+			/* The listeners array contains reuse_port=yes listeners
+			   for every process. Here we filter out the listeners
+			   not intended for this process. */
+			if (service->set->reuse_port &&
+			    listeners[i]->reuse_port_process_index != process_index)
+				continue;
+
+			if (listeners[i] == accepted_listener)
+				*accepted_listener_fd_r = fd;
 			dup2_append(&dups, listeners[i]->fd, fd++);
 
 			env_put(t_strdup_printf("SOCKET%d_SETTINGS",
@@ -315,6 +317,8 @@ service_process_setup_environment(struct service *service, unsigned int uid,
 		env_put(MASTER_SERVICE_COUNT_ENV,
 			dec2str(service->set->restart_request_count));
 	}
+	if (service->set->reuse_port)
+		env_put(MASTER_REUSE_PORT_ENV, "1");
 	env_put(MASTER_UID_ENV, dec2str(uid));
 	env_put(MY_HOSTNAME_ENV, my_hostname);
 	env_put(MY_HOSTDOMAIN_ENV, hostdomain);
@@ -360,7 +364,9 @@ static void service_process_status_timeout(struct service_process *process)
 	timeout_remove(&process->to_status);
 }
 
-struct service_process *service_process_create(struct service *service)
+struct service_process *
+service_process_create(struct service *service, int accepted_fd,
+		       const struct service_listener *accepted_listener)
 {
 	static unsigned int uid_counter = 0;
 	struct service_process *process;
@@ -383,6 +389,29 @@ struct service_process *service_process_create(struct service *service)
 	/* look this up before fork()ing so that it gets cached for all the
 	   future lookups. */
 	hostdomain = my_hostdomain();
+
+	unsigned int process_index = 0;
+	if (service->set->reuse_port) {
+		/* Figure out the process index number. Do this by scanning
+		   all the existing processes for the service and finding the
+		   first nonexistent index number. Note that retired processes
+		   are no longer listening, so their index must be reused. */
+		bool *seen_index = t_new(bool, service->process_limit);
+		struct service_process *p;
+		for (p = service->busy_processes; p != NULL; p = p->next) {
+			if (p->index < service->process_limit && !p->retired)
+				seen_index[p->index] = TRUE;
+		}
+		for (p = service->idle_processes_head; p != NULL; p = p->next) {
+			if (p->index < service->process_limit)
+				seen_index[p->index] = TRUE;
+		}
+		for (process_index = 0; process_index < service->process_limit; process_index++) {
+			if (!seen_index[process_index])
+				break;
+		}
+		i_assert(process_index < service->process_limit);
+	}
 
 	if (service->type == SERVICE_TYPE_ANVIL &&
 	    service_anvil_global->pid != 0) {
@@ -411,9 +440,15 @@ struct service_process *service_process_create(struct service *service)
 	}
 	if (pid == 0) {
 		/* child */
+		int accepted_listener_fd;
 		service_process_setup_environment(service, uid, hostdomain);
-		service_reopen_inet_listeners(service);
-		service_dup_fds(service);
+		service_dup_fds(service, process_index, accepted_fd, accepted_listener,
+				&accepted_listener_fd);
+		if (accepted_fd != -1) {
+			i_assert(accepted_listener_fd > 0);
+			env_put(DOVECOT_ACCEPTED_CLIENT_LISTENER_FD_ENV,
+				dec2str(accepted_listener_fd));
+		}
 		drop_privileges(service);
 		process_exec(service->executable);
 	}
@@ -424,21 +459,34 @@ struct service_process *service_process_create(struct service *service)
 	process->refcount = 1;
 	process->pid = pid;
 	process->uid = uid;
+	process->index = process_index;
 	process->create_time = ioloop_time;
 	if (process_forked) {
 		process->to_status =
 			timeout_add(SERVICE_FIRST_STATUS_TIMEOUT_SECS * 1000,
 				    service_process_status_timeout, process);
+	} else {
+		/* anvil process is being reused after config reload. Make sure
+		   last status update is not 0, since it has been already sent
+		   and CI testing relies on this. Other status fields might not
+		   be correct either, but hopefully anvil will soon do a status
+		   update that corrects them. */
+		process->last_status_update = ioloop_time;
 	}
 
-	process->available_count = service->client_limit;
-	process->idle_start = ioloop_time;
 	service->process_count_total++;
 	service->process_count++;
-	service->process_avail++;
-	service->process_idling++;
-	DLLIST2_APPEND(&service->idle_processes_head,
-		       &service->idle_processes_tail, process);
+	if (accepted_fd == -1) {
+		process->available_count = service->client_limit;
+		process->idle_start = ioloop_time;
+		service->process_avail++;
+		service->process_idling++;
+		DLLIST2_APPEND(&service->idle_processes_head,
+			       &service->idle_processes_tail, process);
+	} else {
+		i_assert(service->client_limit == 1);
+		DLLIST_PREPEND(&service->busy_processes, process);
+	}
 
 	service_list_ref(service->list);
 	hash_table_insert(service_pids, POINTER_CAST(process->pid), process);
@@ -487,9 +535,17 @@ void service_process_destroy(struct service_process *process)
 		service->process_avail--;
 		i_assert(service->process_idling <= service->process_avail);
 	}
+
+	if (process->retired) {
+		i_assert(service->retired_process_count > 0);
+		service->retired_process_count--;
+	}
 	i_assert(service->process_count > 0);
 	service->process_count--;
-	i_assert(service->process_avail <= service->process_count);
+
+	unsigned int active_process_count =
+		service_active_process_count(service);
+	i_assert(service->process_avail <= active_process_count);
 
 	timeout_remove(&process->to_status);
 	timeout_remove(&process->to_idle_kill);
@@ -499,7 +555,7 @@ void service_process_destroy(struct service_process *process)
 	process->destroyed = TRUE;
 	service_process_unref(process);
 
-	if (service->process_count < service->process_limit &&
+	if (active_process_count < service->process_limit &&
 	    service->type == SERVICE_TYPE_LOGIN)
 		service_login_notify(service, FALSE);
 

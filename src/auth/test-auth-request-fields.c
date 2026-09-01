@@ -1,4 +1,4 @@
-/* Copyright (c) 2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-auth.h"
 #include "auth-common.h"
@@ -44,18 +44,17 @@ static const struct test_auth_request_field auth_request_field_names[] = {
 	{ "userdb_uextrafield2", NULL, PREFIX"userextravalue2" },
 };
 
-static struct auth_request *
-test_auth_request_init(const struct mech_module *mech)
+static struct auth_request *test_auth_request_init(void)
 {
 	struct auth_request *request;
 	pool_t pool = pool_alloconly_create("test auth request", 1024);
 	request = p_new(pool, struct auth_request, 1);
 	request->pool = pool;
 	request->event = event_create(NULL);
-	request->mech = mech;
 	request->set = global_auth_settings;
 	request->refcount = 1;
 	p_array_init(&request->authdb_event, pool, 1);
+	auth_request_fields_alloc(request);
 	auth_request_fields_init(request);
 
 	/* fill out fields that are always exported */
@@ -73,8 +72,7 @@ static void test_auth_request_deinit(struct auth_request *request)
 
 static void test_auth_request_fields_list(void)
 {
-	struct auth_request *request =
-		test_auth_request_init(&mech_dovecot_token);
+	struct auth_request *request = test_auth_request_init();
 	string_t *exported = t_str_new(512);
 	for (unsigned int i = 0; i < N_ELEMENTS(auth_request_field_names); i++) {
 		const struct test_auth_request_field *test =
@@ -125,7 +123,7 @@ test_auth_request_export_cmp(struct auth_request *request,
 
 static void test_auth_request_fields_secured(void)
 {
-	struct auth_request *request = test_auth_request_init(NULL);
+	struct auth_request *request = test_auth_request_init();
 
 	test_assert(auth_request_import(request, "secured", ""));
 	test_assert(test_auth_request_export_cmp(request, "secured", ""));
@@ -143,16 +141,18 @@ static void test_auth_request_fields_secured(void)
 
 static void test_auth_request_export_import(void)
 {
-	struct auth_request *request_a = test_auth_request_init(mech_module_find("PLAIN"));
+	struct auth_request *request_a = test_auth_request_init();
 	string_t *exported_a = t_str_new(128);
 	string_t *exported_b = t_str_new(128);
 	request_a->passdb_success = TRUE;
-	auth_request_set_field(request_a, "event_brand with fun = \" values", "this = has _ fun \t values \"", "PLAIN");
+	auth_request_set_field(request_a, "event_brand with fun = \" values",
+			       "this = has _ fun \t values \"",
+			       SASL_MECH_NAME_PLAIN);
 	auth_request_export(request_a, exported_a);
 	test_auth_request_deinit(request_a);
 
 	/* then import it */
-	struct auth_request *request_b = test_auth_request_init(mech_module_find("PLAIN"));
+	struct auth_request *request_b = test_auth_request_init();
 	const char *const *args = t_strsplit_tabescaped(str_c(exported_a));
 	for (; *args != NULL; args++) {
 		const char *value = strchr(*args, '=');

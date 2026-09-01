@@ -10,12 +10,14 @@ Makefile.in
 *.gcda
 *.tmp
 .deps
+.dirstamp
 .libs
 .idea
 .directory
 compile_commands.json
 *~
 vgcore.*
+auth-token-secret.dat
 
 /configure
 /config.cache
@@ -25,9 +27,9 @@ vgcore.*
 /config.log
 /config.status
 /build-aux/config.sub
-/build-aux/config.rpath
 /build-aux/compile
 /build-aux/depcomp
+/build-aux/test-driver
 /dummy-config.h
 /dummy-config.h.in
 /fts-config.h
@@ -39,6 +41,7 @@ vgcore.*
 /stamp.h
 /stamp-h1
 /stamp-h2
+/build-aux/test-driver
 /build-aux/ylwrap
 /autom4te.cache
 /cc-wrapper.sh
@@ -48,10 +51,11 @@ vgcore.*
 /dovecot.service
 /README
 /INSTALL
-/version
+/version.txt
 /.cache
 /.dir-locals.el
 /.ropeproject
+/.test
 
 /aclocal.m4
 /m4/libtool.m4
@@ -64,6 +68,12 @@ src/**/test-*
 !src/**/test-*.c
 !src/**/test-*.h
 !src/**/test-*.inc
+
+src/**/fuzz-*
+!src/**/fuzz-*.c
+!src/**/fuzz-*.h
+!src/**/fuzz-*.inc
+!src/**/fuzz-*.dict
 
 doc/man/*.1
 doc/man/*.7
@@ -100,13 +110,11 @@ src/ipc/ipc
 src/lib/event-filter-lexer.c
 src/lib/event-filter-parser.c
 src/lib/event-filter-parser.h
-src/lib/unicodemap.c
-src/lib/UnicodeData.txt
+src/lib/unicode-data-tables.c
+src/lib/unicode-data-tables.h
+src/lib/unicode-data-types.c
+src/lib/unicode-data-types.h
 src/lib-compression/bench-compression
-src/lib-language/PropList.txt
-src/lib-language/WordBreakProperty.txt
-src/lib-language/word-boundary-data.c
-src/lib-language/word-break-data.c
 src/lib-dict-backend/dict-drivers-register.c
 src/lib-json/json-format
 src/lib-sql/sql-drivers-register.c
@@ -131,10 +139,7 @@ src/plugins/fts/xml2text
 src/plugins/quota/rquota_xdr.c
 src/plugins/quota/rquota.h
 src/plugins/quota/quota-status
-src/lib-imap/fuzz-imap-utf7
-src/lib-imap/fuzz-imap-bodystructure
-src/lib-mail/fuzz-message-parser
-src/lib-smtp/fuzz-smtp-server
 src/lib-var-expand/var-expand-parser.c
 src/lib-var-expand/var-expand-parser.h
 src/lib-var-expand/var-expand-lexer.c
+src/lib-sasl/ntlm_dummy

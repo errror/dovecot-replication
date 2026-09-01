@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 pkglibexecdir = $(libexecdir)/dovecot
 
 pkglibexec_PROGRAMS = imap
@@ -18,6 +20,8 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-compression \
 	-I$(top_srcdir)/src/lib-var-expand \
+	-I$(top_srcdir)/src/lib-auth-client \
+	-I$(top_srcdir)/src/lib-sasl \
 	$(BINARY_CFLAGS)
 
 imap_LDFLAGS = -export-dynamic \
@@ -85,6 +89,7 @@ common_sources = \
 	imap-list.c \
 	imap-master-client.c \
 	imap-notify.c \
+	imap-progress.c \
 	imap-search.c \
 	imap-search-args.c \
 	imap-settings.c \
@@ -108,11 +113,13 @@ headers = \
 	imap-list.h \
 	imap-master-client.h \
 	imap-notify.h \
+	imap-progress.h \
 	imap-search.h \
 	imap-search-args.h \
 	imap-settings.h \
 	imap-status.h \
 	imap-state.h \
+	imap-state-private.h \
 	imap-sync.h \
 	imap-sync-private.h \
 	imap-storage-callbacks.h
@@ -125,22 +132,22 @@ TEST_IMAP_CLIENT_HIBERNATE=test-imap-client-hibernate
 endif
 
 test_programs = \
-	test-imap-storage-callbacks \
+	test-imap-progress \
+	test-imap-state \
 	$(TEST_IMAP_CLIENT_HIBERNATE)
-noinst_PROGRAMS = $(test_programs)
 
-test_imap_storage_callbacks_SOURCES = \
-	test-imap-storage-callbacks.c \
-	imap-storage-callbacks.c
-test_imap_storage_callbacks_LDADD = $(imap_LDADD)
-test_imap_storage_callbacks_DEPENDENCIES = $(imap_DEPENDENCIES)
+test_imap_progress_SOURCES = \
+	test-imap-progress.c \
+	imap-progress.c
+test_imap_progress_LDADD = $(imap_LDADD)
+test_imap_progress_DEPENDENCIES = $(imap_DEPENDENCIES)
+
+test_imap_state_SOURCES = \
+	test-imap-state.c $(common_sources)
+test_imap_state_LDADD = $(imap_LDADD)
+test_imap_state_DEPENDENCIES = $(imap_DEPENDENCIES)
 
 test_imap_client_hibernate_SOURCES = \
 	test-imap-client-hibernate.c $(common_sources)
 test_imap_client_hibernate_LDADD = $(imap_LDADD)
 test_imap_client_hibernate_DEPENDENCIES = $(imap_DEPENDENCIES)
-
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done

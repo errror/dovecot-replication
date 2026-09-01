@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -58,7 +58,7 @@ static void quota_set_storage_error(struct quota_transaction_context *qt,
 	struct mail_storage *storage = box->storage;
 	switch (res) {
 	case QUOTA_ALLOC_RESULT_OVER_MAXSIZE:
-		mail_storage_set_error(storage, MAIL_ERROR_LIMIT, errstr);
+		mail_storage_set_error(storage, MAIL_ERROR_TOOBIG, errstr);
 		break;
 	case QUOTA_ALLOC_RESULT_OVER_QUOTA_LIMIT:
 	case QUOTA_ALLOC_RESULT_OVER_QUOTA_MAILBOX_LIMIT:
@@ -655,6 +655,12 @@ static void quota_user_deinit(struct mail_user *user)
 	quser->module_ctx.super.deinit(user);
 }
 
+static uoff_t quota_user_mail_max_size(struct mail_user *user)
+{
+	struct quota_user *quser = QUOTA_USER_CONTEXT_REQUIRE(user);
+	return quser->quota->set->quota_mail_size;
+}
+
 void quota_mail_user_created(struct mail_user *user)
 {
 	struct mail_user_vfuncs *v = user->vlast;
@@ -670,6 +676,7 @@ void quota_mail_user_created(struct mail_user *user)
 	quser = p_new(user->pool, struct quota_user, 1);
 	quser->module_ctx.super = *v;
 	user->vlast = &quser->module_ctx.super;
+	v->get_mail_max_size = quota_user_mail_max_size;
 	v->deinit = quota_user_deinit;
 	quser->quota = quota;
 

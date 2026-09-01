@@ -1,7 +1,8 @@
-/* Copyright (c) 2015-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
+#include "eacces-error.h"
 #include "safe-mkstemp.h"
 #include "mkdir-parents.h"
 #include "file-lock.h"
@@ -108,7 +109,12 @@ try_create_new(const char *path, const struct file_create_settings *set,
 		errno = orig_errno;
 	}
 	if (fd == -1) {
-		*error_r = t_strdup_printf("safe_mkstemp(%s) failed: %m", path);
+		if (errno == EACCES)
+			*error_r = eacces_error_get("safe_mkstemp", path);
+		else {
+			*error_r = t_strdup_printf(
+				"safe_mkstemp(%s) failed: %m", path);
+		}
 		return -1;
 	}
 
@@ -159,7 +165,7 @@ int file_create_locked(const char *path, const struct file_create_settings *set,
 	int fd, ret;
 
 	for (i = 0; i < MAX_RETRY_COUNT; i++) {
-		fd = open(path, O_RDWR);
+		fd = open(path, O_RDWR | O_NOFOLLOW);
 		if (fd != -1) {
 			ret = try_lock_existing(fd, path, set, lock_r, error_r);
 			if (ret > 0) {
@@ -170,6 +176,9 @@ int file_create_locked(const char *path, const struct file_create_settings *set,
 			i_close_fd(&fd);
 			if (ret < 0)
 				return -1;
+		} else if (errno == EACCES) {
+			*error_r = eacces_error_get("open", path);
+			return -1;
 		} else if (errno != ENOENT) {
 			*error_r = t_strdup_printf("open(%s) failed: %m", path);
 			return -1;

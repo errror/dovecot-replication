@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
@@ -44,7 +44,9 @@ oauth2_verify_plain(struct auth_request *request, const char *password,
 }
 
 static int
-oauth2_preinit(pool_t pool, struct event *event, struct passdb_module **module_r,
+oauth2_preinit(pool_t pool, struct event *event,
+	       const struct passdb_parameters *passdb_params ATTR_UNUSED,
+	       struct passdb_module **module_r,
 	       const char **error_r)
 {
 	struct oauth2_passdb_module *module;
@@ -53,7 +55,7 @@ oauth2_preinit(pool_t pool, struct event *event, struct passdb_module **module_r
 	if (db_oauth2_init(event, TRUE, &module->db, error_r) < 0)
 		return -1;
 	module->module.default_pass_scheme = "PLAIN";
-	module->module.default_cache_key = "%u";
+	module->module.default_cache_key = AUTH_CACHE_KEY_USER;
 	*module_r = &module->module;
 	return 0;
 }

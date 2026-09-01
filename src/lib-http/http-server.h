@@ -170,6 +170,9 @@ void http_server_response_abort_payload(struct http_server_response **resp);
 /* Get the parsed HTTP request information for this request. */
 const struct http_request *
 http_server_request_get(struct http_server_request *req);
+/* Returns the event for this request. */
+struct event *
+http_server_request_get_event(struct http_server_request *req);
 
 /* Reference a server request */
 void http_server_request_ref(struct http_server_request *req);
@@ -342,6 +345,12 @@ struct http_server_callbacks {
 	void (*handle_connect_request)(void *context,
 				       struct http_server_request *req,
 				       struct http_url *target);
+
+	/* Called once a request is finished (response is sent). This also
+	   catches requests that fail before the handle_request() callback is
+	   reached. */
+	void (*request_finished)(void *context,
+				 struct http_server_request *req);
 
 	/* Called once the connection is destroyed. */
 	void (*connection_destroy)(void *context, const char *reason);

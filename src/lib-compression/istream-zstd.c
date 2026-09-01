@@ -1,4 +1,4 @@
-/* Copyright (c) 2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 
@@ -175,15 +175,28 @@ static ssize_t i_stream_zstd_read(struct istream_private *stream)
 		zstream->output.pos = 0;
 		zstream->output.size = ZSTD_DStreamOutSize();
 
+		size_t old_input_pos = zstream->input.pos;
 		size_t zret = ZSTD_decompressStream(zstream->dstream, &zstream->output,
 						    &zstream->input);
 		if (ZSTD_isError(zret) != 0) {
 			i_stream_zstd_read_error(zstream, zret);
 			return -1;
 		}
+		if (zstream->input.pos == old_input_pos && zstream->output.pos == 0) {
+			io_stream_set_error(&zstream->istream.iostream,
+				"zstd.read(%s): decompressor made no progress",
+				i_stream_get_name(&zstream->istream.istream));
+			zstream->istream.istream.stream_errno = EIO;
+			return -1;
+		}
 		/* ZSTD magic number is 4 bytes, but it's only defined after v0.8 */
-		if (!zstream->hdr_read && zstream->input.size > 4)
-			zstream->hdr_read = TRUE;
+		if (!zstream->hdr_read) {
+			i_assert(zstream->istream.parent->v_offset >=
+				 zstream->istream.parent_start_offset);
+			if ((zstream->istream.parent->v_offset -
+			     zstream->istream.parent_start_offset) > 4)
+				zstream->hdr_read = TRUE;
+		}
 		zstream->remain = zret > 0;
 		buffer_set_used_size(zstream->data_buffer, zstream->output.pos);
 	}
@@ -262,7 +275,8 @@ i_stream_create_zstd(struct istream *input)
 	zstream->istream.istream.seekable = input->seekable;
 
 	return i_stream_create(&zstream->istream, input,
-			       i_stream_get_fd(input), 0);
+			       i_stream_get_fd(input),
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }
 
 #endif

@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 doveadm_moduledir = $(moduledir)/doveadm
 pkglibexecdir = $(libexecdir)/dovecot
 
@@ -46,9 +48,18 @@ libs = \
        ../lib-auth/libauth-crypt.la \
 	dsync/libdsync.la \
 	../lib-compression/libcompression.la
+gssapi_libs =
+gssapi_deps =
+if HAVE_GSSAPI
+if !GSSAPI_PLUGIN
+gssapi_libs += $(LIBDOVECOT_GSSAPI)
+gssapi_deps += $(LIBDOVECOT_GSSAPI_DEPS)
+endif
+endif
 
 doveadm_LDADD = \
 	$(libs) \
+	$(gssapi_libs) \
 	$(CRYPT_LIBS) \
 	$(LIBDOVECOT_STORAGE) \
 	$(LIBDOVECOT) \
@@ -58,11 +69,13 @@ doveadm_LDADD = \
 
 doveadm_DEPENDENCIES = \
 	$(libs) \
+	$(gssapi_deps) \
 	$(LIBDOVECOT_STORAGE_DEPS) \
 	$(LIBDOVECOT_DEPS)
 
 doveadm_server_LDADD = \
 	$(libs) \
+	$(gssapi_libs) \
 	$(LIBDOVECOT_STORAGE) \
 	$(LIBDOVECOT) \
 	$(BINARY_LDFLAGS) \
@@ -70,6 +83,7 @@ doveadm_server_LDADD = \
 
 doveadm_server_DEPENDENCIES = \
 	$(libs) \
+	$(gssapi_deps) \
 	$(LIBDOVECOT_STORAGE_DEPS) \
 	$(LIBDOVECOT_DEPS)
 
@@ -182,12 +196,9 @@ noinst_HEADERS = \
 test_programs = \
 	test-doveadm-cmd \
 	test-doveadm-util
-noinst_PROGRAMS = $(test_programs)
 
-test_libs = \
-	../lib-test/libtest.la \
-	../lib/liblib.la
-test_deps = $(noinst_LTLIBRARIES) $(test_libs)
+test_libs = $(LIBDOVECOT)
+test_deps = $(noinst_LTLIBRARIES) $(LIBDOVECOT_DEPS)
 
 test_doveadm_cmd_SOURCES = doveadm-cmd-parse.c test-doveadm-cmd-parse.c
 test_doveadm_cmd_LDADD = $(test_libs) $(MODULE_LIBS) $(LIBDOVECOT)
@@ -196,8 +207,3 @@ test_doveadm_cmd_DEPENDENCIES = $(test_deps)
 test_doveadm_util_SOURCES = doveadm-util.c test-doveadm-util.c
 test_doveadm_util_LDADD = $(test_libs) $(MODULE_LIBS)
 test_doveadm_util_DEPENDENCIES = $(test_deps)
-
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -15,30 +15,6 @@
 
 const char *imapc_command_state_names[] = {
 	"OK", "NO", "BAD", "(auth failed)", "(disconnected)"
-};
-
-const struct imapc_capability_name imapc_capability_names[] = {
-	{ "SASL-IR", IMAPC_CAPABILITY_SASL_IR },
-	{ "LITERAL+", IMAPC_CAPABILITY_LITERALPLUS },
-	{ "QRESYNC", IMAPC_CAPABILITY_QRESYNC },
-	{ "IDLE", IMAPC_CAPABILITY_IDLE },
-	{ "UIDPLUS", IMAPC_CAPABILITY_UIDPLUS },
-	{ "AUTH=PLAIN", IMAPC_CAPABILITY_AUTH_PLAIN },
-	{ "STARTTLS", IMAPC_CAPABILITY_STARTTLS },
-	{ "X-GM-EXT-1", IMAPC_CAPABILITY_X_GM_EXT_1 },
-	{ "CONDSTORE", IMAPC_CAPABILITY_CONDSTORE },
-	{ "NAMESPACE", IMAPC_CAPABILITY_NAMESPACE },
-	{ "UNSELECT", IMAPC_CAPABILITY_UNSELECT },
-	{ "ESEARCH", IMAPC_CAPABILITY_ESEARCH },
-	{ "WITHIN", IMAPC_CAPABILITY_WITHIN },
-	{ "QUOTA", IMAPC_CAPABILITY_QUOTA },
-	{ "ID", IMAPC_CAPABILITY_ID },
-	{ "SAVEDATE", IMAPC_CAPABILITY_SAVEDATE },
-	{ "METADATA", IMAPC_CAPABILITY_METADATA },
-
-	{ "IMAP4REV1", IMAPC_CAPABILITY_IMAP4REV1 },
-	{ "IMAP4REV2", IMAPC_CAPABILITY_IMAP4REV2 },
-	{ NULL, 0 }
 };
 
 unsigned int imapc_client_cmd_tag_counter = 0;
@@ -277,6 +253,14 @@ imapc_client_cmd(struct imapc_client *client,
 	return imapc_connection_cmd(conn, callback, context);
 }
 
+bool imapc_client_is_server_selected(struct imapc_client *client,
+				     const char *name)
+{
+	struct imapc_connection *conn = imapc_client_find_connection(client);
+	const char *conn_name = imapc_connection_get_selected_mailbox_name(conn);
+	return null_strcmp(conn_name, name) == 0;
+}
+
 static struct imapc_client_connection *
 imapc_client_get_unboxed_connection(struct imapc_client *client)
 {
@@ -351,7 +335,7 @@ void imapc_client_logout(struct imapc_client *client)
 }
 
 struct imapc_client_mailbox *
-imapc_client_mailbox_open(struct imapc_client *client,
+imapc_client_mailbox_open(struct imapc_client *client, const char *name,
 			  void *untagged_box_context)
 {
 	struct imapc_client_mailbox *box;
@@ -360,6 +344,7 @@ imapc_client_mailbox_open(struct imapc_client *client,
 	box = i_new(struct imapc_client_mailbox, 1);
 	box->client = client;
 	box->untagged_box_context = untagged_box_context;
+	box->name = i_strdup(name);
 	conn = imapc_client_get_unboxed_connection(client);
 	conn->box = box;
 	box->conn = conn->conn;
@@ -400,7 +385,7 @@ void imapc_client_mailbox_close(struct imapc_client_mailbox **_box)
 	box->closing = TRUE;
 
 	/* cancel any pending commands */
-	imapc_connection_unselect(box, FALSE);
+	imapc_connection_mailbox_closed(box, FALSE);
 
 	if (box->reconnecting) {
 		/* need to abort the reconnection so it won't try to access
@@ -421,6 +406,7 @@ void imapc_client_mailbox_close(struct imapc_client_mailbox **_box)
 
 	imapc_msgmap_deinit(&box->msgmap);
 	timeout_remove(&box->to_send_idle);
+	i_free(box->name);
 	i_free(box);
 }
 

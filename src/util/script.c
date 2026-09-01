@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2019 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,6 +8,7 @@
 #include "execv-const.h"
 #include "write-full.h"
 #include "restrict-access.h"
+#include "version.h"
 #include "master-interface.h"
 #include "master-service.h"
 
@@ -164,7 +165,7 @@ parse_input(ARRAY_TYPE(const_string)* envs, const char *const **args_r,
 			p = strchr(env, '=');
 			if (p == NULL)
 				i_fatal("invalid environment variable");
-			envname = t_strdup_until((**args_r)+4, p);
+			envname = t_strdup_until(env, p);
 
 			if (str_array_find(accepted_envs, envname))
 				array_push_back(envs, &env);

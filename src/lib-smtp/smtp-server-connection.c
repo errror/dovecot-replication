@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -66,6 +66,7 @@ static bool
 smtp_server_connection_check_pipeline(struct smtp_server_connection *conn)
 {
 	unsigned int pipeline = conn->command_queue_count;
+	struct smtp_server_command *cmd;
 
 	if (conn->command_queue_tail != NULL) {
 		i_assert(pipeline > 0);
@@ -80,6 +81,13 @@ smtp_server_connection_check_pipeline(struct smtp_server_connection *conn)
 			pipeline, conn->set.max_pipelined_commands);
 		return FALSE;
 	}
+
+	cmd = conn->command_queue_head;
+	while (cmd != NULL) {
+		if (cmd->pipeline_blocked)
+			return FALSE;
+		cmd = cmd->next;
+	}
 	return TRUE;
 }
 
@@ -91,27 +99,26 @@ void smtp_server_connection_input_halt(struct smtp_server_connection *conn)
 void smtp_server_connection_input_resume(struct smtp_server_connection *conn)
 {
 	struct smtp_server_command *cmd;
-	bool cmd_locked = FALSE;
 
 	if (conn->conn.io == NULL) {
 		/* Only resume when we actually can */
 		if (conn->input_locked || conn->input_broken ||
 			conn->disconnected)
 			return;
-		if (!smtp_server_connection_check_pipeline(conn))
-			return;
+		if (!smtp_server_connection_check_pipeline(conn)) {
+			i_assert(conn->command_queue_tail != NULL);
+			if (!conn->command_queue_tail->pipeline_blocked ||
+			    !smtp_server_connection_pending_command_data(conn))
+				return;
+		}
 
 		/* Is queued command still blocking input? */
 		cmd = conn->command_queue_head;
 		while (cmd != NULL) {
-			if (cmd->input_locked || cmd->pipeline_blocked) {
-				cmd_locked = TRUE;
-				break;
-			}
+			if (cmd->input_locked)
+				return;
 			cmd = cmd->next;
 		}
-		if (cmd_locked)
-			return;
 
 		/* Restore input handler */
 		connection_input_resume(&conn->conn);
@@ -160,7 +167,9 @@ smtp_server_connection_update_rawlog(struct smtp_server_connection *conn)
 			conn->rawlog_enabled = TRUE;
 	}
 	if (conn->rawlog_enabled) {
-		iostream_rawlog_create(conn->set.rawlog_dir,
+		/* FIXME: we don't know the setting name here */
+		iostream_rawlog_create(conn->event, "smtp server rawlog",
+				       conn->set.rawlog_dir,
 				       &conn->conn.input, &conn->conn.output);
 	}
 }
@@ -462,7 +471,8 @@ int smtp_server_connection_ssl_init(struct smtp_server_connection *conn)
 }
 
 static void
-smtp_server_connection_handle_input(struct smtp_server_connection *conn)
+smtp_server_connection_handle_input(struct smtp_server_connection *conn,
+				    bool pipeline_blocked)
 {
 	struct smtp_server_command *pending_command;
 	enum smtp_command_parse_error error_code;
@@ -484,14 +494,20 @@ smtp_server_connection_handle_input(struct smtp_server_connection *conn)
 	ret = 1;
 	while (!conn->closing && !conn->input_locked && ret != 0) {
 		while ((ret = smtp_command_parse_next(
-			conn->smtp_parser, &cmd_name, &cmd_params,
-			&error_code, &error)) > 0) {
+			conn->smtp_parser, pipeline_blocked,
+			&cmd_name, &cmd_params, &error_code, &error)) > 0) {
 
 			if (pending_command != NULL) {
 				/* Previous command is now fully read and ready
 				   to reply */
 				smtp_server_command_ready_to_reply(pending_command);
 				pending_command = NULL;
+			}
+
+			if (pipeline_blocked) {
+				e_debug(conn->event,
+					"Discarded remaining data for previous command");
+				break;
 			}
 
 			e_debug(conn->event, "Received new command: %s %s",
@@ -515,7 +531,10 @@ smtp_server_connection_handle_input(struct smtp_server_connection *conn)
 			if (conn->closing)
 				break;
 
-			if (!smtp_server_connection_check_pipeline(conn)) {
+			if (!smtp_server_connection_check_pipeline(conn))
+				pipeline_blocked = TRUE;
+			if (pipeline_blocked &&
+			    !smtp_command_parser_pending_data(conn->smtp_parser)) {
 				smtp_server_connection_input_halt(conn);
 				return;
 			}
@@ -600,6 +619,12 @@ smtp_server_connection_handle_input(struct smtp_server_connection *conn)
 			   reply */
 			smtp_server_command_ready_to_reply(pending_command);
 		}
+
+		if (pipeline_blocked &&
+		    !smtp_command_parser_pending_data(conn->smtp_parser)) {
+			smtp_server_connection_input_halt(conn);
+			return;
+		}
 	}
 }
 
@@ -667,9 +692,19 @@ static void smtp_server_connection_input(struct connection *_conn)
 	     ssl_iostream_is_handshaked(conn->ssl_iostream)))
 		smtp_server_connection_ready(conn);
 
+	bool pipeline_blocked = FALSE;
 	if (!smtp_server_connection_check_pipeline(conn)) {
-		smtp_server_connection_input_halt(conn);
-		return;
+		/* Check whether the last command in the queue is blocking the
+		   pipeline and whether it still has pending input data. In that
+		   case we read/discard that first to possibly unblock the
+		   pipeline. */
+		if (conn->command_queue_tail == NULL ||
+		    !conn->command_queue_tail->pipeline_blocked ||
+		    !smtp_server_connection_pending_command_data(conn)) {
+			smtp_server_connection_input_halt(conn);
+			return;
+		}
+		pipeline_blocked = TRUE;
 	}
 
 	smtp_server_connection_ref(conn);
@@ -677,7 +712,7 @@ static void smtp_server_connection_input(struct connection *_conn)
 	if (conn->callbacks != NULL &&
 	    conn->callbacks->conn_cmd_input_pre != NULL)
 		conn->callbacks->conn_cmd_input_pre(conn->context);
-	smtp_server_connection_handle_input(conn);
+	smtp_server_connection_handle_input(conn, pipeline_blocked);
 	if (conn->callbacks != NULL &&
 	    conn->callbacks->conn_cmd_input_post != NULL)
 		conn->callbacks->conn_cmd_input_post(conn->context);
@@ -734,7 +769,7 @@ void smtp_server_connection_cork(struct smtp_server_connection *conn)
 void smtp_server_connection_uncork(struct smtp_server_connection *conn)
 {
 	conn->corked = FALSE;
-	if (conn->conn.output != NULL) {
+	if (!conn->conn.output->closed) {
 		if (o_stream_uncork_flush(conn->conn.output) < 0) {
 			smtp_server_connection_handle_output_error(conn);
 			return;
@@ -916,8 +951,8 @@ smtp_server_connection_alloc(struct smtp_server *server,
 		if (set->max_bad_commands > 0) {
 			conn->set.max_bad_commands = set->max_bad_commands;
 		}
-		if (set->max_recipients > 0)
-			conn->set.max_recipients = set->max_recipients;
+		conn->set.max_recipients = set->max_recipients;
+		i_assert(server->set.max_recipients != 0);
 		smtp_command_limits_merge(&conn->set.command_limits,
 					  &set->command_limits);
 
@@ -1039,6 +1074,7 @@ static void smtp_server_connection_created(struct smtp_server_connection *conn)
 struct smtp_server_connection *
 smtp_server_connection_create(
 	struct smtp_server *server, int fd_in, int fd_out,
+	const struct ip_addr *local_ip, in_port_t local_port,
 	const struct ip_addr *remote_ip, in_port_t remote_port,
 	bool ssl_start, const struct smtp_server_settings *set,
 	const struct smtp_server_callbacks *callbacks, void *context)
@@ -1052,6 +1088,9 @@ smtp_server_connection_create(
 	conn->conn.event_parent = conn_event;
 	connection_init_server_ip(server->conn_list, &conn->conn, NULL,
 				  fd_in, fd_out, remote_ip, remote_port);
+	if (local_ip != NULL && local_ip->family != 0)
+		conn->conn.local_ip = *local_ip;
+	conn->conn.local_port = local_port;
 	conn->event = conn->conn.event;
 	smtp_server_connection_update_event(conn);
 	event_unref(&conn_event);
@@ -1069,6 +1108,7 @@ struct smtp_server_connection *
 smtp_server_connection_create_from_streams(
 	struct smtp_server *server,
 	struct istream *input, struct ostream *output,
+	const struct ip_addr *local_ip, in_port_t local_port,
 	const struct ip_addr *remote_ip, in_port_t remote_port,
 	const struct smtp_server_settings *set,
 	const struct smtp_server_callbacks *callbacks, void *context)
@@ -1084,6 +1124,9 @@ smtp_server_connection_create_from_streams(
 
 	conn = smtp_server_connection_alloc(server, set, fd_in, fd_out,
 					    callbacks, context);
+	if (local_ip != NULL && local_ip->family != 0)
+		conn->conn.local_ip = *local_ip;
+	conn->conn.local_port = local_port;
 	if (remote_ip != NULL && remote_ip->family != 0)
 		conn->conn.remote_ip = *remote_ip;
 	if (remote_port != 0)
@@ -1401,6 +1444,11 @@ void smtp_server_connection_close(struct smtp_server_connection **_conn,
 	smtp_server_connection_unref(&conn);
 }
 
+bool smtp_server_connection_is_closed(struct smtp_server_connection *conn)
+{
+	return conn->closed;
+}
+
 void smtp_server_connection_terminate(struct smtp_server_connection **_conn,
 				      const char *enh_code, const char *reason)
 {
@@ -1638,6 +1686,8 @@ void smtp_server_connection_get_proxy_data(struct smtp_server_connection *conn,
 	i_zero(proxy_data);
 	proxy_data->source_ip = conn->conn.remote_ip;
 	proxy_data->source_port = conn->conn.remote_port;
+	proxy_data->dest_ip = conn->conn.local_ip;
+	proxy_data->dest_port = conn->conn.local_port;
 	if (conn->proxy_helo != NULL)
 		proxy_data->helo = conn->proxy_helo;
 	else if (conn->helo.domain_valid)

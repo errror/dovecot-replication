@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "submission-common.h"
 #include "array.h"
@@ -221,6 +221,7 @@ client_create(int fd_in, int fd_out, struct event *event,
 	smtp_set.no_greeting = no_greeting;
 	smtp_set.debug = event_want_debug(client->event);
 	smtp_set.event_parent = event;
+	smtp_set.max_recipients = SET_UINT_UNLIMITED;
 
 	if ((workarounds & SUBMISSION_WORKAROUND_WHITESPACE_BEFORE_PATH) != 0) {
 		smtp_set.workarounds |=
@@ -236,7 +237,8 @@ client_create(int fd_in, int fd_out, struct event *event,
 	p_array_init(&client->module_contexts, client->pool, 5);
 
 	conn = client->conn = smtp_server_connection_create(smtp_server,
-		fd_in, fd_out, user->conn.remote_ip, user->conn.remote_port,
+		fd_in, fd_out, user->conn.local_ip, user->conn.local_port,
+		user->conn.remote_ip, user->conn.remote_port,
 		FALSE, &smtp_set, &smtp_callbacks, client);
 	smtp_server_connection_set_proxy_data(conn, proxy_data);
 	smtp_server_connection_login(conn, client->user->username, helo,

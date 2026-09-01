@@ -1,8 +1,10 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "hostpid.h"
 #include "login-common.h"
+#include "abnf.h"
 #include "array.h"
+#include "base64.h"
 #include "iostream.h"
 #include "istream.h"
 #include "ostream.h"
@@ -196,11 +198,11 @@ static bool client_auth_parse_args(const struct client *client, bool success,
 				reply_r->fail_code = client_auth_fail_code_lookup(value);
 			}
 		} else if (strcmp(key, "user") == 0) {
-			/* Usually this is already handled in sasl-server.c,
+			/* Usually this is already handled in sasl-proxy.c,
 			   but this needs to be saved when handling reauth. */
 			*username_r = value;
 		} else if (strcmp(key, "postlogin_socket") == 0) {
-			/* already handled in sasl-server.c */
+			/* already handled in sasl-proxy.c */
 		} else if (str_begins_with(key, "user_")) {
 			if (success) {
 				alt_username_set(&reply_r->alt_usernames,
@@ -353,9 +355,14 @@ static void proxy_input(struct client *client)
 			client_proxy_get_state(client), duration,
 			line == NULL ? "" : t_strdup_printf(
 				" - BUG: line not read: %s", line));
+
+		enum login_proxy_failure_type type =
+			login_proxy_failed_because_invalid_cert(client->login_proxy) ?
+			LOGIN_PROXY_FAILURE_TYPE_INTERNAL_CONFIG :
+			LOGIN_PROXY_FAILURE_TYPE_CONNECT;
 		login_proxy_failed(client->login_proxy,
 				   login_proxy_get_event(client->login_proxy),
-				   LOGIN_PROXY_FAILURE_TYPE_CONNECT, reason);
+				   type, reason);
 		return;
 	}
 
@@ -384,6 +391,7 @@ static void proxy_reset(struct client *client)
 static void
 proxy_redirect_reauth_callback(struct auth_client_request *request,
 			       enum auth_request_status status,
+			       const char *log_error,
 			       const char *data_base64 ATTR_UNUSED,
 			       const char *const *args, void *context)
 {
@@ -425,25 +433,23 @@ proxy_redirect_reauth_callback(struct auth_client_request *request,
 			/* Disconnect from the original backend */
 			login_proxy_failed(client->login_proxy,
 				login_proxy_get_event(client->login_proxy),
-				LOGIN_PROXY_FAILURE_TYPE_AUTH,
+				LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED,
 				t_strdup_printf("Redirected to %s", reply.proxy.host));
 			return;
 		}
 		error = "Redirect authentication is missing proxy or nologin field";
 		break;
 	case AUTH_REQUEST_STATUS_INTERNAL_FAIL:
-		error = "Internal authentication failure";
+		error = log_error;
 		break;
 	case AUTH_REQUEST_STATUS_FAIL:
 		if (!client_auth_parse_args(client, FALSE, TRUE, args,
 					    &reply, &username))
 			error = "Failed to parse auth reply";
-		else if (reply.reason == NULL || reply.reason[0] == '\0')
-			error = "Redirect authentication unexpectedly failed";
 		else
 			error = t_strdup_printf(
 				"Redirect authentication unexpectedly failed: %s",
-				reply.reason);
+				log_error);
 		break;
 	case AUTH_REQUEST_STATUS_ABORT:
 		if (client->login_proxy == NULL)
@@ -466,7 +472,7 @@ proxy_redirect_reauth(struct client *client, const char *destuser,
 
 	e_debug(client->event, "Reauthenticating user %s (redirect to %s:%u)",
 		destuser, host, port);
-	if (sasl_server_auth_request_info_fill(client, &info, &client_error) < 0) {
+	if (sasl_proxy_auth_request_info_fill(client, &info, &client_error) < 0) {
 		const char *error = t_strdup_printf(
 			"Unexpected failure on reauth: %s", client_error);
 		login_proxy_failed(client->login_proxy,
@@ -485,11 +491,11 @@ proxy_redirect_reauth(struct client *client, const char *destuser,
 		t_strdup_printf("destuser=%s", str_tabescape(destuser)),
 		t_strdup_printf("proxy_timeout=%u", connect_timeout_msecs),
 	};
-	info.mech = "EXTERNAL";
+	info.mech = SASL_MECH_NAME_EXTERNAL;
 	t_array_init(&info.extra_fields, N_ELEMENTS(extra_fields));
 	array_append(&info.extra_fields, extra_fields,
 		     N_ELEMENTS(extra_fields));
-	if (array_is_created(&client->forward_fields)) {
+	if (array_not_empty(&client->forward_fields)) {
 		array_append_zero(&client->forward_fields);
 		array_pop_back(&client->forward_fields);
 		info.forward_fields = array_front(&client->forward_fields);
@@ -561,6 +567,11 @@ void client_common_proxy_failed(struct client *client,
 
 	client->proxy_last_failure = type;
 	client->proxy_failed = TRUE;
+	if (client->login_proxy != NULL) {
+		i_free(client->proxy_last_host);
+		client->proxy_last_host = i_strdup(login_proxy_get_hostport(
+			client->login_proxy));
+	}
 	client_proxy_failed(client);
 }
 
@@ -741,10 +752,25 @@ client_auth_result(struct client *client, enum client_auth_result result,
 	o_stream_uncork(client->output);
 }
 
+static bool proxy_has_illegal_credentials(const struct client_auth_reply *reply)
+{
+	if (reply->proxy.username != NULL &&
+	    abnf_contains_ascii_ctrl(reply->proxy.username))
+		return TRUE;
+
+	if (reply->proxy.password != NULL &&
+	    abnf_contains_ascii_ctrl(reply->proxy.password))
+		return TRUE;
+
+	return FALSE;
+}
+
 static bool
 client_auth_handle_reply(struct client *client,
 			 const struct client_auth_reply *reply, bool success)
 {
+	const char *error;
+
 	if (array_count(&reply->alt_usernames) > 0) {
 		const char **alt;
 
@@ -755,6 +781,15 @@ client_auth_handle_reply(struct client *client,
 		client->alt_usernames = alt;
 	}
 
+	/* Refresh client settings to get mail user variable expanded. */
+	if (success && client_settings_reload(client, &error) < 0) {
+		e_error(client->event, "%s", error);
+		client_auth_result(client, CLIENT_AUTH_RESULT_TEMPFAIL, reply,
+				   AUTH_TEMP_FAILED_MSG);
+		client_auth_failed(client);
+		return TRUE;
+	}
+
 	if (reply->proxy.proxy) {
 		/* we want to proxy the connection to another server.
 		   don't do this unless authentication succeeded. with
@@ -763,6 +798,14 @@ client_auth_handle_reply(struct client *client,
 		   proxy host=.. [port=..] [destuser=..] pass=.. */
 		if (!success)
 			return FALSE;
+		if (proxy_has_illegal_credentials(reply)) {
+			client->last_auth_fail =
+				CLIENT_AUTH_FAIL_CODE_INVALID_CREDENTIALS;
+			client_auth_result(client, CLIENT_AUTH_RESULT_AUTHFAILED,
+					   reply, AUTH_FAILED_MSG);
+			client_auth_failed(client);
+			return TRUE;
+		}
 		if (proxy_start(client, reply) < 0)
 			client_auth_failed(client);
 		else {
@@ -861,23 +904,26 @@ void client_auth_respond(struct client *client, const char *response)
 		io_remove(&client->io);
 
 	if (strcmp(response, "*") == 0) {
-		sasl_server_auth_abort(client);
+		sasl_proxy_auth_abort(client, "Aborted by client");
 		return;
+	}
+
+	/* Only accept base64 */
+	for (size_t i = 0; response[i] != '\0'; i++) {
+		if (!base64_is_valid_char(response[i]) && response[i] != '=') {
+			client_auth_fail(client, "Invalid base64 in response");
+			return;
+		}
 	}
 
 	client->auth_client_continue_pending = FALSE;
 	client_set_auth_waiting(client);
-	sasl_server_auth_continue(client, response);
-}
-
-void client_auth_abort(struct client *client)
-{
-	sasl_server_auth_abort(client);
+	sasl_proxy_auth_continue(client, response);
 }
 
 void client_auth_fail(struct client *client, const char *text)
 {
-	sasl_server_auth_failed(client, text, NULL);
+	sasl_proxy_auth_failed(client, text, NULL);
 }
 
 int client_auth_read_line(struct client *client)
@@ -897,7 +943,8 @@ int client_auth_read_line(struct client *client)
 	}
 	if (client->auth_response == NULL)
 		client->auth_response = str_new(default_pool, I_MAX(i+1, 256));
-	if (str_len(client->auth_response) + i > LOGIN_MAX_AUTH_BUF_SIZE) {
+	if (i > LOGIN_MAX_AUTH_BUF_SIZE ||
+	    str_len(client->auth_response) > LOGIN_MAX_AUTH_BUF_SIZE - i) {
 		client_destroy(client, "Authentication response too large");
 		return -1;
 	}
@@ -945,11 +992,11 @@ void client_auth_send_challenge(struct client *client, const char *data)
 }
 
 static bool
-client_auth_reply_args(struct client *client, enum sasl_server_reply sasl_reply,
+client_auth_reply_args(struct client *client, enum sasl_proxy_reply sasl_reply,
 		       const char *data, const char *const *args,
 		       struct client_auth_reply *reply_r)
 {
-	bool success = sasl_reply == SASL_SERVER_REPLY_SUCCESS;
+	bool success = sasl_reply == SASL_PROXY_REPLY_SUCCESS;
 	const char *username;
 
 	timeout_remove(&client->to_auth_waiting);
@@ -976,20 +1023,20 @@ client_auth_reply_args(struct client *client, enum sasl_server_reply sasl_reply,
 }
 
 static void
-sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
+sasl_callback(struct client *client, enum sasl_proxy_reply sasl_reply,
 	      const char *data, const char *const *args)
 {
 	struct client_auth_reply reply;
 
 	i_assert(!client->destroyed ||
-		 sasl_reply == SASL_SERVER_REPLY_AUTH_ABORTED ||
-		 sasl_reply == SASL_SERVER_REPLY_MASTER_FAILED ||
-		 sasl_reply == SASL_SERVER_REPLY_MASTER_FAILED_LIMIT);
+		 sasl_reply == SASL_PROXY_REPLY_AUTH_ABORTED ||
+		 sasl_reply == SASL_PROXY_REPLY_MASTER_FAILED ||
+		 sasl_reply == SASL_PROXY_REPLY_MASTER_FAILED_LIMIT);
 
 	client->last_auth_fail = CLIENT_AUTH_FAIL_CODE_NONE;
 	i_zero(&reply);
 	switch (sasl_reply) {
-	case SASL_SERVER_REPLY_SUCCESS:
+	case SASL_PROXY_REPLY_SUCCESS:
 		if (!client_auth_reply_args(client, sasl_reply,
 					    data, args, &reply))
 			break;
@@ -999,13 +1046,13 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 				   &reply, NULL);
 		client_destroy_success(client, "Logged in");
 		break;
-	case SASL_SERVER_REPLY_AUTH_FAILED:
-	case SASL_SERVER_REPLY_AUTH_ABORTED:
+	case SASL_PROXY_REPLY_AUTH_FAILED:
+	case SASL_PROXY_REPLY_AUTH_ABORTED:
 		if (!client_auth_reply_args(client, sasl_reply,
 					    data, args, &reply))
 			break;
 
-		if (sasl_reply == SASL_SERVER_REPLY_AUTH_ABORTED) {
+		if (sasl_reply == SASL_PROXY_REPLY_AUTH_ABORTED) {
 			client_auth_result(client, CLIENT_AUTH_RESULT_ABORTED,
 				&reply, "Authentication aborted by client.");
 		} else if (data == NULL) {
@@ -1021,11 +1068,11 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 		if (!client->destroyed)
 			client_auth_failed(client);
 		break;
-	case SASL_SERVER_REPLY_MASTER_FAILED:
-	case SASL_SERVER_REPLY_MASTER_FAILED_LIMIT:
+	case SASL_PROXY_REPLY_MASTER_FAILED:
+	case SASL_PROXY_REPLY_MASTER_FAILED_LIMIT:
 		if (data == NULL)
 			;
-		else if (sasl_reply == SASL_SERVER_REPLY_MASTER_FAILED) {
+		else if (sasl_reply == SASL_PROXY_REPLY_MASTER_FAILED) {
 			/* authentication itself succeeded, we just hit some
 			   internal failure. */
 			client_auth_result(client, CLIENT_AUTH_RESULT_TEMPFAIL,
@@ -1054,7 +1101,7 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 		}
 		client_destroy(client, data);
 		break;
-	case SASL_SERVER_REPLY_CONTINUE:
+	case SASL_PROXY_REPLY_CONTINUE:
 		i_assert(client->v.auth_send_challenge != NULL);
 		client->v.auth_send_challenge(client, data);
 
@@ -1078,9 +1125,11 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 
 static int
 client_auth_begin_common(struct client *client, const char *mech_name,
-			 enum sasl_server_auth_flags auth_flags,
+			 enum sasl_proxy_auth_flags auth_flags,
 			 const char *init_resp)
 {
+	i_assert(!client->authenticating);
+
 	if (!client->connection_secured &&
 	    strcmp(client->ssl_server_set->ssl, "required") == 0) {
 		e_info(client->event_auth, "Login failed: "
@@ -1094,8 +1143,8 @@ client_auth_begin_common(struct client *client, const char *mech_name,
 
 	client_ref(client);
 	client->auth_initializing = TRUE;
-	sasl_server_auth_begin(client, mech_name, auth_flags,
-			       init_resp, sasl_callback);
+	sasl_proxy_auth_begin(client, mech_name, auth_flags,
+			      init_resp, sasl_callback);
 	client->auth_initializing = FALSE;
 	if (!client->authenticating)
 		return 1;
@@ -1116,7 +1165,7 @@ int client_auth_begin_private(struct client *client, const char *mech_name,
 			      const char *init_resp)
 {
 	return client_auth_begin_common(client, mech_name,
-					SASL_SERVER_AUTH_FLAG_PRIVATE,
+					SASL_PROXY_AUTH_FLAG_PRIVATE,
 					init_resp);
 }
 
@@ -1124,7 +1173,7 @@ int client_auth_begin_implicit(struct client *client, const char *mech_name,
 			       const char *init_resp)
 {
 	return client_auth_begin_common(client, mech_name,
-					SASL_SERVER_AUTH_FLAG_IMPLICIT,
+					SASL_PROXY_AUTH_FLAG_IMPLICIT,
 					init_resp);
 }
 
@@ -1176,5 +1225,6 @@ void clients_notify_auth_connected(void)
 			client->input_blocked = FALSE;
 			io_set_pending(client->io);
 		}
+		client_notify_auth_connected(client);
 	}
 }

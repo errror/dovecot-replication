@@ -1,10 +1,11 @@
-/* Copyright (c) 2017-2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
 #include "istream.h"
 #include "istream-failure-at.h"
 #include "test-common.h"
+#include "test-dir.h"
 
 #include "json-istream.h"
 
@@ -2924,7 +2925,7 @@ static void test_json_istream_read_stream(void)
 		case 1:
 			ret = json_istream_read_stream(
 				jinput, 0, IO_BLOCK_SIZE,
-				"/tmp/dovecot-test-json.", &jnode);
+				test_dir_prepend("json-test."), &jnode);
 			if (ret == 0)
 				continue;
 			if (ret < 0)
@@ -3035,7 +3036,7 @@ static void test_json_istream_read_stream(void)
 		case 3:
 			ret = json_istream_read_stream(
 				jinput, 0, IO_BLOCK_SIZE,
-				"/tmp/dovecot-test-json.", &jnode);
+				test_dir_prepend("json-test."), &jnode);
 			if (ret == 0)
 				continue;
 			if (ret < 0)
@@ -3813,7 +3814,7 @@ static void test_json_istream_error(void)
 	test_begin("json istream error - bad seekable string stream");
 
 	ret = json_istream_read_stream(jinput, 0, IO_BLOCK_SIZE,
-					"/tmp/dovecot-test-json.", &jnode);
+				       test_dir_prepend("json-test."), &jnode);
 	test_assert(ret != 0);
 	ret = json_istream_read(jinput, &jnode);	
 	error = json_istream_get_error(jinput);
@@ -3834,7 +3835,7 @@ static void test_json_istream_error(void)
 	test_begin("json istream error - string stream with bad end");
 
 	ret = json_istream_read_stream(jinput, 0, 16,
-					"/tmp/dovecot-test-json.", &jnode);
+				       test_dir_prepend("json-test."), &jnode);
 	test_out_reason_quiet("read success", ret > 0,
 			      json_istream_get_error(jinput));
 	test_assert(json_node_is_string(&jnode));
@@ -3855,6 +3856,230 @@ static void test_json_istream_error(void)
 	i_stream_unref(&input);
 }
 
+/* Regression test: json_parser_record_string_start() saves parser->loc
+   after readchar() already counted the not-yet-shifted character at
+   `cur' into it, but saves input_offset pointing at that same character.
+   A restart (triggered by seeking a streamed string value backward)
+   re-decodes that character, double-counting it into the column if the
+   saved loc wasn't adjusted to match.  Verified by comparing the reported
+   error column for the same malformed input parsed with vs. without a
+   triggering backward seek - they must match. */
+static void test_json_istream_restart_string_location(void)
+{
+	/* 31 'A's then an invalid UTF-8 sequence, as a bare top-level
+	   string value. */
+	const char *text =
+		"\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\xed\xa2\xab\"";
+	size_t text_len = strlen(text);
+	struct istream *input;
+	struct json_istream *jinput;
+	struct json_node jnode;
+	struct json_parser_location loc_norestart, loc_restart;
+	const unsigned char *data;
+	size_t size;
+	int ret;
+
+	test_begin("json parser restart preserves error location");
+
+	/* Baseline: parse straight through, no seek, small buffer so the
+	   value streams (matches the restart run's setup exactly). */
+	input = i_stream_create_from_data(text, text_len);
+	jinput = json_istream_create(input, 0, NULL, 0);
+	i_stream_unref(&input);
+
+	ret = json_istream_read_stream(jinput, 0, 8, NULL, &jnode);
+	test_assert(ret > 0);
+	if (ret > 0) {
+		struct istream *strm = jnode.value.content.stream;
+
+		while (i_stream_read_more(strm, &data, &size) > 0)
+			i_stream_skip(strm, size);
+		test_assert(strm->stream_errno != 0);
+	}
+	json_istream_get_location(jinput, &loc_norestart);
+	json_istream_unref(&jinput);
+
+	/* Same input, but read a little, then seek back to 0 (triggering a
+	   parser restart) before reading through to the same error. */
+	input = i_stream_create_from_data(text, text_len);
+	jinput = json_istream_create(input, 0, NULL, 0);
+	i_stream_unref(&input);
+
+	ret = json_istream_read_stream(jinput, 0, 8, NULL, &jnode);
+	test_assert(ret > 0);
+	if (ret > 0) {
+		struct istream *strm = jnode.value.content.stream;
+
+		test_assert(i_stream_read_more(strm, &data, &size) > 0);
+		i_stream_skip(strm, size);
+		i_stream_seek(strm, 0);
+
+		while (i_stream_read_more(strm, &data, &size) > 0)
+			i_stream_skip(strm, size);
+		test_assert(strm->stream_errno != 0);
+	}
+	json_istream_get_location(jinput, &loc_restart);
+	json_istream_unref(&jinput);
+
+	test_assert_cmp(loc_restart.column, ==, loc_norestart.column);
+
+	test_end();
+}
+
+/* The caller may keep a reference to a seekable value stream after taking
+   ownership of it with json_istream_skip(). Destroying the JSON istream must
+   sever the destroy callbacks it registered on that stream, or they fire with
+   a freed context once the caller drops its reference. */
+static void test_json_istream_destroy_value_stream(void)
+{
+	const char *text =
+		"\"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789\"";
+	struct istream *input, *val_input;
+	struct json_istream *jinput;
+	struct json_node jnode;
+	int ret;
+
+	test_begin("json istream destroy with referenced value stream");
+
+	input = test_istream_create_data(text, strlen(text));
+	/* A non-seekable source makes i_stream_create_seekable_path() produce
+	   a real seekable istream rather than short-circuiting to a concat
+	   istream, which is what gets the destroy callbacks registered. */
+	input->seekable = FALSE;
+	jinput = json_istream_create(input, 0, NULL, 0);
+
+	ret = json_istream_read_stream(jinput, 0, 16,
+				       test_dir_prepend("json-test."), &jnode);
+	test_out_reason_quiet("read success", ret > 0,
+			      json_istream_get_error(jinput));
+	test_assert(jnode.value.content_type == JSON_CONTENT_TYPE_STREAM);
+	test_assert(jnode.value.content.stream != NULL);
+	val_input = jnode.value.content.stream;
+	if (val_input != NULL)
+		i_stream_ref(val_input);
+
+	/* Take ownership of the value stream and drop the JSON istream while
+	   still holding it. */
+	json_istream_skip(jinput);
+	json_istream_destroy(&jinput);
+
+	i_stream_unref(&val_input);
+	i_stream_unref(&input);
+
+	test_end();
+}
+
+static void test_json_istream_finish_value_stream(void)
+{
+	const char *text =
+		"\"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789\"";
+	const unsigned char *data;
+	struct istream *input, *val_input;
+	struct json_istream *jinput;
+	struct json_node jnode;
+	const char *error;
+	size_t size;
+	int ret;
+
+	test_begin("json istream finish with referenced value stream");
+
+	input = test_istream_create_data(text, strlen(text));
+	input->seekable = FALSE;
+	jinput = json_istream_create(input, 0, NULL, 0);
+
+	ret = json_istream_read_stream(jinput, 0, 16,
+				       test_dir_prepend("json-test."), &jnode);
+	test_out_reason_quiet("read success", ret > 0,
+			      json_istream_get_error(jinput));
+	val_input = jnode.value.content.stream;
+	i_stream_ref(val_input);
+
+	json_istream_skip(jinput);
+	ret = json_istream_finish(&jinput, &error);
+	test_out_reason_quiet("finish", ret > 0, error);
+
+	i_stream_seek(val_input, 0);
+	while (i_stream_read_more(val_input, &data, &size) > 0)
+		i_stream_skip(val_input, size);
+
+	i_stream_unref(&val_input);
+	i_stream_unref(&input);
+
+	test_end();
+}
+
+/* A caller may pre-drain a streamed value fully - discovering a truncation
+   there - then skip() and keep parsing. json_istream_consumed_value_stream()
+   must close the parser-linked value stream on this path too, not only when
+   the seekable wrapper reaches genuine completion on its own: otherwise
+   parser->str_stream stays set and the very next json_parse_more() call,
+   made here by json_istream_read(), aborts on its entry assertion. */
+static void test_json_istream_truncated_value_stream(void)
+{
+	const char *text =
+		"\"012345678901234567890123456789"
+		"012345678901234567890123456789"
+		"012345678901234567890123456789"; /* no closing quote */
+	const unsigned char *data;
+	struct istream *input, *val_input;
+	struct json_istream *jinput;
+	struct json_node jnode;
+	const char *error;
+	size_t size;
+	int ret;
+
+	test_begin("json istream truncated value stream, then continue");
+
+	input = test_istream_create_data(text, strlen(text));
+	input->seekable = FALSE;
+	jinput = json_istream_create(input, 0, NULL, 0);
+
+	ret = json_istream_read_stream(jinput, 0, 16,
+				       test_dir_prepend("json-test."), &jnode);
+	test_out_reason_quiet("read success", ret > 0,
+			      json_istream_get_error(jinput));
+	val_input = jnode.value.content.stream;
+	i_stream_ref(val_input);
+
+	while (i_stream_read_more(val_input, &data, &size) > 0)
+		i_stream_skip(val_input, size);
+	test_assert(val_input->stream_errno == EPIPE);
+
+	json_istream_skip(jinput);
+
+	ret = json_istream_read(jinput, &jnode);
+	error = json_istream_get_error(jinput);
+	test_out_reason("read failure", ret < 0, error);
+	/* A real parse error must be set, not one of the generic fallback
+	   strings json_istream_get_error() uses when stream->error is
+	   NULL - that would mean the stream was merely closed without ever
+	   explaining why. */
+	test_assert(strcmp(error, "<closed>") != 0);
+	test_assert(strcmp(error, "<no error>") != 0);
+	test_assert(strcmp(error, "END-OF-INPUT") != 0);
+	test_assert(val_input->stream_errno == EPIPE);
+
+	i_stream_unref(&val_input);
+	json_istream_unref(&jinput);
+	i_stream_unref(&input);
+
+	test_end();
+}
+
 /*
  * Main
  */
@@ -3872,11 +4097,15 @@ int main(int argc, char *argv[])
 		test_json_istream_read_tree,
 		test_json_istream_read_into_tree,
 		test_json_istream_read_stream,
+		test_json_istream_destroy_value_stream,
+		test_json_istream_finish_value_stream,
+		test_json_istream_truncated_value_stream,
 		test_json_istream_tokens_buffer,
 		test_json_istream_tokens_trickle,
 		test_json_istream_skip_array,
 		test_json_istream_skip_object_fields,
 		test_json_istream_error,
+		test_json_istream_restart_string_location,
 		NULL
 	};
 
@@ -3890,5 +4119,6 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	test_dir_init("json-istream");
 	return test_run(test_functions);
 }

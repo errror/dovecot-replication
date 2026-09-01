@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -12,7 +12,7 @@
 #include "maildir-uidlist.h"
 #include "maildir-keywords.h"
 #include "maildir-sync.h"
-#include "index-mail.h"
+#include "maildir-mail.h"
 
 #include <sys/stat.h>
 
@@ -447,7 +447,7 @@ static int maildir_create_shared(struct mailbox *box)
 
 	old_mask = umask(0);
 	path = t_strconcat(path, "/dovecot-shared", NULL);
-	fd = open(path, O_WRONLY | O_CREAT, perm->file_create_mode);
+	fd = open(path, O_WRONLY | O_CREAT | O_NOFOLLOW, perm->file_create_mode);
 	umask(old_mask);
 
 	if (fd == -1) {
@@ -510,20 +510,38 @@ maildir_mailbox_update(struct mailbox *box, const struct mailbox_update *update)
 static int maildir_create_maildirfolder_file(struct mailbox *box)
 {
 	const struct mailbox_permissions *perm;
-	const char *path;
+	const char *path, *box_path, *root_dir;
 	mode_t old_mask;
-	int fd;
+	int fd, ret;
 
 	/* Maildir++ spec wants that maildirfolder named file is created for
 	   all subfolders. Do this only with Maildir++ layout. */
 	if (strcmp(box->list->name, MAILBOX_LIST_NAME_MAILDIRPLUSPLUS) != 0)
 		return 0;
+
+	ret = mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_MAILBOX,
+				  &box_path);
+	if (ret <= 0)
+		return ret;
+
+	/* Never create the marker in the mail root directory itself - it's
+	   not a child Maildir and the marker there breaks quota et al.
+	   INBOX is the root only with the default mail_inbox_path;
+	   otherwise it's a normal child mailbox that needs the marker. */
+	root_dir = mailbox_list_get_root_forced(box->list,
+						MAILBOX_LIST_PATH_TYPE_MAILBOX);
+
+	/* Only create the file if the box_path starts with root_dir,
+	   but is not root_dir. */
+	if (strcmp(box_path, root_dir) == 0 ||
+	    !str_begins_with(box_path, root_dir))
+		return 0;
+
 	perm = mailbox_get_permissions(box);
 
-	path = t_strconcat(mailbox_get_path(box),
-			   "/"MAILDIR_SUBFOLDER_FILENAME, NULL);
+	path = t_strconcat(box_path, "/"MAILDIR_SUBFOLDER_FILENAME, NULL);
 	old_mask = umask(0);
-	fd = open(path, O_CREAT | O_WRONLY, perm->file_create_mode);
+	fd = open(path, O_CREAT | O_WRONLY | O_NOFOLLOW, perm->file_create_mode);
 	umask(old_mask);
 	if (fd != -1) {
 		/* ok */
@@ -614,8 +632,7 @@ static void maildir_mailbox_close(struct mailbox *box)
 		timeout_remove(&mbox->keep_lock_to);
 	}
 
-	if (mbox->flags_view != NULL)
-		mail_index_view_close(&mbox->flags_view);
+	mail_index_view_close(&mbox->flags_view);
 	if (mbox->keywords != NULL)
 		maildir_keywords_deinit(&mbox->keywords);
 	if (mbox->uidlist != NULL)
@@ -639,12 +656,20 @@ static void maildir_notify_changes(struct mailbox *box)
 }
 
 static bool
-maildir_is_internal_name(struct mailbox_list *list ATTR_UNUSED,
+maildir_is_internal_name(struct mailbox_list *list,
 			 const char *name)
 {
-	return strcmp(name, "cur") == 0 ||
-		strcmp(name, "new") == 0 ||
-		strcmp(name, "tmp") == 0;
+	struct maildir_mailbox_list_context *mlist =
+		MODULE_CONTEXT(list, maildir_mailbox_list_module);
+
+	if (strcmp(name, "cur") == 0 ||
+	    strcmp(name, "new") == 0 ||
+	    strcmp(name, "tmp") == 0)
+		return TRUE;
+
+	if (mlist->module_ctx.super.is_internal_name != NULL)
+		return mlist->module_ctx.super.is_internal_name(list, name);
+	return FALSE;
 }
 
 static void maildir_storage_add_list(struct mail_storage *storage ATTR_UNUSED,
@@ -696,6 +721,22 @@ static enum mail_flags maildir_get_private_flags_mask(struct mailbox *box)
 			mbox->_private_flags_mask = MAIL_SEEN;
 	}
 	return mbox->_private_flags_mask;
+}
+
+static struct mail *
+maildir_mail_alloc(struct mailbox_transaction_context *t,
+		   enum mail_fetch_field wanted_fields,
+		   struct mailbox_header_lookup_ctx *wanted_headers)
+{
+	struct maildir_mail *mail;
+	pool_t pool;
+
+	pool = pool_alloconly_create("mail", 2048);
+	mail = p_new(pool, struct maildir_mail, 1);
+
+	index_mail_init(&mail->imail, t, wanted_fields,
+			wanted_headers, pool, NULL);
+	return &mail->imail.mail.mail;
 }
 
 bool maildir_is_backend_readonly(struct maildir_mailbox *mbox)
@@ -763,7 +804,7 @@ struct mailbox maildir_mailbox = {
 		index_transaction_commit,
 		index_transaction_rollback,
 		maildir_get_private_flags_mask,
-		index_mail_alloc,
+		maildir_mail_alloc,
 		index_storage_search_init,
 		index_storage_search_deinit,
 		index_storage_search_next_nonblock,

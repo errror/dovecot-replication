@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /*
    There are various different mailbox names here. Here's an example assuming
@@ -26,6 +26,19 @@
     - this is generated from remote_name
     - separator is changed from / to .
     - storage_name_escape_character=% and fs_list separator . are escaped
+
+   Lossless round-trip across all four name forms is guaranteed when
+   mailbox_list_visible_escape_char is set: invalid mUTF-7 bytes in
+   remote_name are escaped as <visible_escape_char><hex> in vname, and
+   imap_escaped_utf8_to_utf7() emits the original raw byte from those
+   escapes (without the "&" -> "&-" mUTF-7 re-encoding) when going back
+   to the wire.
+
+   With mailbox_list_visible_escape_char unset and mailbox_list_utf8=no,
+   mailboxes whose remote names are invalid mUTF-7 are not accessible -
+   their vname falls through to the raw mUTF-7 form, and a subsequent
+   SELECT would re-encode literal '&' as "&-", producing a name the
+   remote server does not recognise.
 */
 
 #include "lib.h"
@@ -192,6 +205,34 @@ imap_list_flag_parse(const char *str, enum mailbox_info_flags *flag_r)
 	return FALSE;
 }
 
+/* Escape a remote IMAP name into a mailbox_list name. The remote name is
+   split by the remote IMAP separator and each hierarchy part is escaped
+   separately, the same way mailbox_list_default_get_storage_name() does for
+   vnames. */
+static const char *
+imapc_list_escape_remote_name(const char *remote_name, char root_sep,
+			      char list_sep, char escape_char)
+{
+	string_t *dest = t_str_new(128);
+	const char *p;
+	bool first_part = TRUE;
+
+	for (;;) {
+		p = root_sep == '\0' ? NULL : strchr(remote_name, root_sep);
+		if (!first_part)
+			str_append_c(dest, list_sep);
+		mailbox_list_escape_name_params_to_str(dest,
+			p == NULL ? remote_name :
+			t_strdup_until(remote_name, p),
+			list_sep, escape_char, "", first_part);
+		if (p == NULL)
+			break;
+		remote_name = p + 1;
+		first_part = FALSE;
+	}
+	return str_c(dest);
+}
+
 static const char *
 imapc_list_remote_to_storage_name(struct imapc_mailbox_list *list,
 				  const char *remote_name)
@@ -199,10 +240,9 @@ imapc_list_remote_to_storage_name(struct imapc_mailbox_list *list,
 	/* typically mailbox_list_escape_name() is used to escape vname into
 	   a list name. but we want to convert remote IMAP name to a list name,
 	   so we need to use the remote IMAP separator. */
-	return mailbox_list_escape_name_params(remote_name, "",
-		list->root_sep,
+	return imapc_list_escape_remote_name(remote_name, list->root_sep,
 		mailbox_list_get_hierarchy_sep(&list->list),
-		list->list.mail_set->mailbox_list_storage_escape_char[0], "");
+		list->list.mail_set->mailbox_list_storage_escape_char[0]);
 }
 
 static const char *
@@ -217,7 +257,7 @@ const char *
 imapc_list_storage_to_remote_name(struct imapc_mailbox_list *list,
 				  const char *storage_name)
 {
-	return mailbox_list_unescape_name_params(storage_name, "",
+	return mailbox_list_unescape_name_params(storage_name,
 		list->root_sep, mailbox_list_get_hierarchy_sep(&list->list),
 		list->list.mail_set->mailbox_list_storage_escape_char[0]);
 }
@@ -503,9 +543,9 @@ imapc_list_storage_to_fs_name(struct imapc_mailbox_list *list,
 		return NULL;
 
 	remote_name = imapc_list_storage_to_remote_name(list, storage_name);
-	return mailbox_list_escape_name_params(remote_name, "",
-		list->root_sep, mailbox_list_get_hierarchy_sep(fs_list),
-		fs_list->mail_set->mailbox_list_storage_escape_char[0], "");
+	return imapc_list_escape_remote_name(remote_name, list->root_sep,
+		mailbox_list_get_hierarchy_sep(fs_list),
+		fs_list->mail_set->mailbox_list_storage_escape_char[0]);
 }
 
 static const char *
@@ -518,7 +558,7 @@ imapc_list_fs_to_storage_name(struct imapc_mailbox_list *list,
 	if (fs_name == NULL)
 		return NULL;
 
-	remote_name = mailbox_list_unescape_name_params(fs_name, "",
+	remote_name = mailbox_list_unescape_name_params(fs_name,
 			list->root_sep,
 			mailbox_list_get_hierarchy_sep(fs_list),
 			fs_list->mail_set->mailbox_list_storage_escape_char[0]);
@@ -659,6 +699,17 @@ static int imapc_list_refresh(struct imapc_mailbox_list *list)
 	return ctx.ret;
 }
 
+static bool imapc_list_has_existing_children(struct mailbox_node *node)
+{
+	for (node = node->children; node != NULL; node = node->next) {
+		if ((node->flags & MAILBOX_NONEXISTENT) == 0)
+			return TRUE;
+		if (imapc_list_has_existing_children(node))
+			return TRUE;
+	}
+	return FALSE;
+}
+
 static void
 imapc_list_build_match_tree(struct imapc_mailbox_list_iterate_context *ctx)
 {
@@ -677,7 +728,13 @@ imapc_list_build_match_tree(struct imapc_mailbox_list_iterate_context *ctx)
 
 	iter = mailbox_tree_iterate_init(list->mailboxes, NULL, 0);
 	while ((node = mailbox_tree_iterate_next(iter, &vname)) != NULL) {
-		update_ctx.leaf_flags = node->flags;
+		/* We'll build our own children flags */
+		update_ctx.leaf_flags = node->flags &
+			ENUM_NEGATE(MAILBOX_CHILDREN | MAILBOX_NOCHILDREN);
+		if (imapc_list_has_existing_children(node))
+			update_ctx.leaf_flags |= MAILBOX_CHILDREN;
+		else
+			update_ctx.leaf_flags |= MAILBOX_NOCHILDREN;
 		mailbox_list_iter_update(&update_ctx, vname);
 	}
 	mailbox_tree_iterate_deinit(&iter);
@@ -688,7 +745,6 @@ imapc_list_iter_init(struct mailbox_list *_list, const char *const *patterns,
 		     enum mailbox_list_iter_flags flags)
 {
 	struct imapc_mailbox_list *list = (struct imapc_mailbox_list *)_list;
-	struct mailbox_list_iterate_context *_ctx;
 	struct imapc_mailbox_list_iterate_context *ctx;
 	pool_t pool;
 	const char *ns_root_name;
@@ -700,16 +756,6 @@ imapc_list_iter_init(struct mailbox_list *_list, const char *const *patterns,
 		ret = imapc_list_refresh(list);
 
 	list->iter_count++;
-
-	if ((flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0) {
-		/* we're listing only subscriptions. just use the cached
-		   subscriptions list. */
-		_ctx = mailbox_list_subscriptions_iter_init(_list, patterns,
-							    flags);
-		if (ret < 0)
-			_ctx->failed = TRUE;
-		return _ctx;
-	}
 
 	/* if we've already failed, make sure we don't call
 	   mailbox_list_get_hierarchy_sep(), since it clears the error */
@@ -795,9 +841,6 @@ imapc_list_iter_next(struct mailbox_list_iterate_context *_ctx)
 	if (_ctx->failed)
 		return NULL;
 
-	if ((_ctx->flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0)
-		return mailbox_list_subscriptions_iter_next(_ctx);
-
 	do {
 		node = mailbox_tree_iterate_next(ctx->iter, &vname);
 		if (node == NULL)
@@ -842,9 +885,6 @@ static int imapc_list_iter_deinit(struct mailbox_list_iterate_context *_ctx)
 		list->refreshed_mailboxes = FALSE;
 		list->refreshed_subscriptions = FALSE;
 	}
-
-	if ((_ctx->flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0)
-		return mailbox_list_subscriptions_iter_deinit(_ctx);
 
 	mailbox_tree_iterate_deinit(&ctx->iter);
 	mailbox_tree_deinit(&ctx->tree);
@@ -938,14 +978,8 @@ imapc_list_delete_mailbox(struct mailbox_list *_list, const char *name)
 	imapc_command_set_flags(cmd, IMAPC_COMMAND_FLAG_RETRIABLE);
 	if (!imapc_command_connection_is_selected(cmd))
 		imapc_command_abort(&cmd);
-	else {
-		imapc_command_set_flags(cmd, IMAPC_COMMAND_FLAG_SELECT);
-		if ((capa & IMAPC_CAPABILITY_UNSELECT) != 0)
-			imapc_command_sendf(cmd, "UNSELECT");
-		else
-			imapc_command_sendf(cmd, "SELECT \"~~~\"");
-		imapc_simple_run(&ctx, &cmd);
-	}
+	else if (imapc_server_unselect(list->client) < 0)
+		return -1;
 
 	cmd = imapc_list_simple_context_init(&ctx, list);
 	imapc_command_set_flags(cmd, IMAPC_COMMAND_FLAG_RETRIABLE);

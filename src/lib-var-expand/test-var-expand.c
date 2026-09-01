@@ -1,11 +1,13 @@
-/* Copyright (c) 2024 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
+#include "array.h"
 #include "test-common.h"
 #include "cpu-count.h"
 #include "str.h"
 #include "hostpid.h"
 #include "var-expand-private.h"
+#include "var-expand-split.h"
 #include "expansion.h"
 #include "dovecot-version.h"
 #include "time-util.h"
@@ -26,6 +28,22 @@ struct var_expand_test {
 /* Run with -b to set TRUE */
 static bool do_bench = FALSE;
 
+static void test_assert_program_equal(const char *prog, int idx, const char *file, long long line)
+{
+	struct var_expand_program *program;
+	const char *error;
+	if (var_expand_program_create(prog, &program, &error) < 0) {
+		test_assert_failed_idx(error, file, line, idx);
+		return;
+	}
+	const char *str = var_expand_program_to_string(program);
+	var_expand_program_free(&program);
+	test_assert_strcmp_idx(prog, str, idx);
+}
+
+#define test_assert_program_equal_idx(prog, idx) \
+	test_assert_program_equal((prog), (idx), __FILE__, __LINE__);
+
 static void run_var_expand_tests(const struct var_expand_params *params,
 				 const struct var_expand_test tests[],
 				 size_t test_count)
@@ -44,10 +62,12 @@ static void run_var_expand_tests(const struct var_expand_params *params,
 			test_assert_idx(error != NULL, i);
 			test_assert_idx(dest->used == 0,i );
 			if (test->ret < 0) {
-				i_assert(test->out != NULL && *test->out != '\0');
+				i_assert(test->out != NULL);
 				const char *match = strstr(error, test->out);
 				test_assert_idx(match != NULL, i);
-				if (match == NULL) {
+				if (*test->out == '\0')
+					i_debug("unexpected error '%s'", error);
+				else if (match == NULL) {
 					i_debug("error '%s' does not contain '%s'",
 						error, test->out);
 				}
@@ -74,7 +94,7 @@ static void run_var_expand_tests(const struct var_expand_params *params,
 }
 
 static void test_var_expand_builtin_filters(void) {
-	test_begin("var_expand(buildin filters)");
+	test_begin("var_expand(builtin filters)");
 
 	const struct var_expand_table table[] = {
 		{ .key = "first", .value = "hello", },
@@ -95,6 +115,15 @@ static void test_var_expand_builtin_filters(void) {
 	};
 
 	const struct var_expand_test tests[] = {
+		/* syntax */
+		{ .in = "%{}", .out = "", .ret = 0 },
+		{
+			.in = "%{",
+			.out = "expecting CCBRACE or PIPE or NAME",
+			.ret = -1
+		},
+		{ .in = "%{\\", .out = "Premature program end", .ret = -1 },
+		{ .in = "hello%{}world", .out = "helloworld", .ret = 0 },
 		/* basic lookup */
 		{ .in = "%{first}", .out = "hello", .ret = 0 },
 		{ .in = "%{lookup('first')}", .out = "hello", .ret = 0 },
@@ -168,6 +197,7 @@ static void test_var_expand_builtin_filters(void) {
 		{ .in = "%{encoded | unhexlify}", .out = "68656c6c6f", .ret = 0 },
 		{ .in = "%{three | hexlify(4)}", .out = "0033", .ret = 0 },
 		{ .in = "%{hexlify(fail=1)}", .out = "hexlify: Unsupported key 'fail'", .ret = -1 },
+		{ .in = "%{encoded | hexlify(900)}", .out = "hexlify: Excessive padding", .ret = -1 },
 		/* hex */
 		{ .in = "%{three | hex | unhex}", .out = "3", .ret = 0 },
 		{ .in = "%{uidvalidity | hex | unhex}", .out = "1727121943", .ret = 0 },
@@ -175,6 +205,8 @@ static void test_var_expand_builtin_filters(void) {
 		{ .in = "%{uidvalidity | hex(2)}",  .out = "17", .ret = 0 },
 		{ .in = "%{uidvalidity | hex(-2)}",  .out = "66", .ret = 0 },
 		{ .in = "%{uidvalidity | hex }", .out = "66f1ca17", .ret = 0 },
+		{ .in = "%{uidvalidity | hex(257) }", .out = "hex: Excessive padding", .ret = -1 },
+		{ .in = "%{uidvalidity | hex(-257) }", .out = "hex: Excessive padding", .ret = -1 },
 		/* base64 */
 		{ .in = "%{first | base64}", .out = "aGVsbG8=", .ret = 0 },
 		{ .in = "%{first | base64 | unbase64 | text}", .out = "hello", .ret = 0 },
@@ -183,11 +215,16 @@ static void test_var_expand_builtin_filters(void) {
 		{ .in = "%{unbase64(0)}", .out = "unbase64: Too many positional parameters", .ret = -1 },
 		{ .in = "%{unbase64(fail=1)}", .out = "unbase64: Unsupported key 'fail'", .ret = -1 },
 		{ .in = "%{first | base64(pad=0)}", .out = "aGVsbG8", .ret = 0 },
+		/* test boolean parameters */
+		{ .in = "%{first | base64(pad='yes')}", .out = "base64: 'yes' is not a number", .ret = -1 },
+		{ .in = "%{first | base64(pad=-5)}", .out = "base64: '-5' is not 0 or 1", .ret = -1 },
 		/* weird syntax to avoid trigraph ignored */
 		{ .in = "%{literal('<<?""?""?>>') | base64(url=1)}", .out = "PDw_Pz8-Pg==", .ret = 0 },
 		{ .in = "%{literal('<<?""?""?>>') | base64(pad=0,url=1)}", .out = "PDw_Pz8-Pg", .ret = 0 },
 		/* truncate */
-		{ .in = "%{first | truncate(3)}", .out = "hel", .ret = 0 },
+		{ .in = "%{first | truncate(4)}", .out = "hell", .ret = 0 },
+		{ .in = "%{first | truncate(5)}", .out = "hello", .ret = 0 },
+		{ .in = "%{first | truncate(6)}", .out = "hello", .ret = 0 },
 		{ .in = "%{first | truncate(three)}", .out = "hel", .ret = 0 },
 		{ .in = "%{first | truncate(bits=7)}", .out = "4", .ret = 0 },
 		{ .in = "%{truncate}", .out = "truncate: Missing parameter", .ret = -1 },
@@ -196,8 +233,13 @@ static void test_var_expand_builtin_filters(void) {
 		{ .in = "%{truncate(3)}", .out = "truncate: No value to truncate", .ret = -1 },
 		/* ldap dn */
 		{ .in = "cn=%{first},ou=%{domain | ldap_dn}", .out = "cn=hello,ou=test,dc=dovecot,dc=org", .ret = 0 },
+#ifdef HAVE_LIBPCRE
 		/* regexp */
+		{ .in = "%{literal('hello world') | regexp('(.*) (.*)', '$2 $1')}", .out = "world hello" },
 		{ .in = "%{literal('hello world') | regexp('(.*) (.*)', '\\\\2 \\\\1')}", .out = "world hello" },
+		{ .in = "%{literal('hello world') | regexp('(.*) (.*)', '\\\\\\\\2 \\\\\\\\1')}", .out = "\\2 \\1" },
+		{ .in = "%{literal('hello world') | regexp('(.*) (.*)', '\\\\\\\\\\\\2 \\\\\\\\\\\\1')}", .out = "\\world \\hello" },
+#endif
 		/* index */
 		{ .in = "%{user | index('@',0)}", .out = "user", .ret = 0 },
 		{ .in = "%{user | username}", .out = "user", .ret = 0 },
@@ -214,6 +256,7 @@ static void test_var_expand_builtin_filters(void) {
 		{ .in = "%{user | index('@',-1)}", .out = "domain", .ret = 0 },
 		{ .in = "%{user | username(0)}", .out = "username: Too many positional parameters", .ret = -1 },
 		{ .in = "%{user | domain(0)}", .out = "domain: Too many positional parameters", .ret = -1 },
+		{ .in = "%{user | index('',0)}", .out = "Empty separator", .ret = -1 },
 		{ .in = "%{literal('hello@') | domain }", .out = "", .ret = 0 },
 		{ .in = "%{literal('@hello') | username }", .out = "", .ret = 0 },
 		{ .in = "%{literal('@') | domain }", .out = "", .ret = 0 },
@@ -245,6 +288,8 @@ static void test_var_expand_builtin_filters(void) {
 		{ .in = "%{first | md5 % 30 | hex(-4) }", .out = "1600", .ret = 0 },
 		{ .in = "%{\xce\xb8}", .out = "is theta", .ret = 0 },
 		{ .in = "%{\xff\xfe\xff}", .out = "Invalid UTF-8 string", .ret = -1 },
+		/* escape filter without escape_func */
+		{ .in = "%{first | escape}", .out = "No escape function available", .ret = -1 },
 	};
 
 	const struct var_expand_params params = {
@@ -278,8 +323,29 @@ static void test_var_expand_math(void) {
 		{ .in = "%{literal('31') | unhexlify | text * 5}", .out = "5", .ret = 0 },
 		{ .in = "%{literal('31') | unhex * 5}", .out = "245", .ret = 0 },
 		{ .in = "%{port % 5}", .out = "3", .ret = 0 },
-		{ .in = "%{port / 0}", .out = "calculate: Division by zero", .ret = -1 },
-		{ .in = "%{port % 0}", .out = "calculate: Modulo by zero", .ret = -1 },
+		{ .in = "%{port / 0}",
+		  .out = "calculate: Division must be by positive integer",
+		  .ret = -1 },
+		{ .in = "%{port % 0}",
+		  .out = "calculate: Modulo must be by positive integer",
+		  .ret = -1 },
+		{ .in = "%{port / -1}",
+		  .out = "calculate: Division must be by positive integer",
+		  .ret = -1 },
+		{ .in = "%{port % -1}",
+		  .out = "calculate: Modulo must be by positive integer",
+		  .ret = -1 },
+		{ .in = "%{literal('-9223372036854775808') / -1}",
+		  .out = "calculate: Division must be by positive integer",
+		  .ret = -1 },
+		{ .in = "%{literal('-9223372036854775808') % -1}",
+		  .out = "calculate: Modulo must be by positive integer",
+		  .ret = -1 },
+		{ .in = "%{third | sha256 % 0}", .out = "calculate: Binary modulo must be positive integer", .ret = -1 },
+		/* multiple programs, first fails */
+		{ .in = "%{failure} %{port}", .out = "Unknown variable 'failure'", .ret = -1 },
+		/* second fails */
+		{ .in = "%{port} %{failure}", .out = "Unknown variable 'failure'", .ret = -1 },
 	};
 
 	const struct var_expand_params params = {
@@ -342,6 +408,7 @@ static void test_var_expand_if(void)
 		{ .in = "%{literal('a') | if('!*', '*a*', 'yes', 'no')}", .out = "no", .ret = 0 },
 		{ .in = "%{literal('a') | if('!*', '*b*', 'yes', 'no')}", .out = "yes", .ret = 0 },
 		{ .in = "%{literal('a') | if('!*', '*', 'yes', 'no')}", .out = "no", .ret = 0 },
+#ifdef HAVE_LIBPCRE
 		{ .in = "%{literal('a') | if('~', 'a', 'yes', 'no')}", .out = "yes", .ret = 0 },
 		{ .in = "%{literal('a') | if('~', 'b', 'yes', 'no')}", .out = "no", .ret = 0 },
 		{ .in = "%{literal('a') | if('~', '.*a.*', 'yes', 'no')}", .out = "yes", .ret = 0 },
@@ -354,6 +421,7 @@ static void test_var_expand_if(void)
 		{ .in = "%{literal('a') | if('!~', '.*', 'yes', 'no')}", .out = "no", .ret = 0 },
 		{ .in = "%{literal('this is test') | if('~', '^test', 'yes', 'no')}", .out = "no", .ret = 0 },
 		{ .in = "%{literal('this is test') | if('~', '.*test', 'yes', 'no')}", .out = "yes", .ret = 0 },
+#endif
 		/* variable expansion */
 		{ .in = "%{alpha | if('eq', alpha, 'yes', 'no')}", .out = "yes", .ret = 0 },
 		{ .in = "%{alpha | if('eq', beta, 'yes', 'no')}", .out = "no", .ret = 0 },
@@ -362,8 +430,6 @@ static void test_var_expand_if(void)
 		{ .in = "%{one | if('eq', one, one, two)}", .out = "1", .ret = 0 },
 		{ .in = "%{one | if('gt', two, one, two)}", .out = "2", .ret = 0 },
 		{ .in = "%{evil1 | if('eq', ';\\', \\':', evil2, 'no')}", .out = ";test;", .ret = 0 },
-		/* FIXME: add inner if support? */
-/*		{ "%{if;%{if;%{one};eq;1;1;0};eq;%{if;%{two};eq;2;2;3};yes;no}", "no", 1 }, */
 		/* Errors */
 		{ .in = "%{if('gt', two, one, two)}", .out = "if: Missing parameters", .ret = -1 },
 		{ .in = "%{if(1, '', 1, 'yes', 'no')}", .out = "if: Unsupported comparator ''", .ret = -1 },
@@ -375,6 +441,108 @@ static void test_var_expand_if(void)
 		{ .in = "%{if(1, '==', 1, 'yes', 'no', 'maybe')}", .out = "if: Too many positional parameters", .ret = -1 },
 		{ .in = "%{if(fail=1)}", .out = "if: Unsupported key 'fail'", .ret = -1 },
 		{ .in = "%{alpha|if('==', two, one, two)}", .out = "if: Input is not a number", .ret = -1 },
+	};
+
+	const struct var_expand_params params = {
+		.table = table,
+	};
+
+	run_var_expand_tests(&params, tests, N_ELEMENTS(tests));
+
+	test_end();
+}
+
+/* This basically uses the same things if does, so we can do slightly relaxed
+   testing */
+static void test_var_expand_switch(void)
+{
+	test_begin("var_expand(switch)");
+
+	const struct var_expand_table table[] = {
+		{ .key = "alpha", .value = "alpha" },
+		{ .key = "beta", .value = "beta" },
+		{ .key = "one", .value = "1" },
+		{ .key = "two", .value = "2" },
+		{ .key = "evil1", .value = ";', ':" },
+		{ .key = "evil2", .value = ";test;" },
+		VAR_EXPAND_TABLE_END
+	};
+
+	const struct var_expand_test tests[] = {
+		{
+			.in = "%{switch(alpha, \"eq\", alpha, \"yes\", beta, \"no\", one, \"other\", two)}",
+			.out = "yes",
+			.ret = 0,
+		},
+		{
+			.in = "%{beta | switch(\"eq\", alpha, \"yes\", beta, \"no\", one, \"other\", two)}",
+			.out = "no",
+			.ret = 0,
+		},
+		{
+			.in = "%{one | switch(\"eq\", alpha, \"yes\", beta, \"no\", one, \"other\", two)}",
+			.out = "other",
+			.ret = 0,
+		},
+		{
+			.in = "%{evil2 | switch(\"eq\", alpha, \"yes\", beta, \"no\", one, \"other\", two)}",
+			.out = "2",
+			.ret = 0,
+		},
+		{
+			.in = "%{one | switch(\"==\", 1, 2, 2, 3, 3, 4, -1)}",
+			.out = "2",
+			.ret = 0,
+		},
+		/* No match, no default */
+		{
+			.in = "%{literal('0') | switch(\"==\", 1, 2, 2, 3, 3, 4)}",
+			.out = "switch: No default value provided",
+			.ret = -1,
+		},
+		/* No match, missing variable */
+		{
+			.in = "%{literal('0') | switch(\"==\", 1, 2, 2, 3, 3, 4, four)}",
+			.out = "switch: in condition #3: Unknown variable 'four'",
+			.ret = -1,
+		},
+		/* No match, no default, but fix with default filter */
+		{
+			.in = "%{literal('0') | switch(\"==\", 1, 2, 2, 3, 3, 4) | default}",
+			.out = "",
+			.ret = 0,
+		},
+		/* Errors */
+		{
+			.in = "%{one | switch(\"==\", 1)}",
+			.out = "switch: At least one condition-value pair is required",
+			.ret = -1,
+		},
+		{
+			.in = "%{switch}",
+			.out = "switch: Missing parameters",
+			.ret = -1,
+		},
+		{
+			.in = "%{switch(\"==\")}",
+			.out = "switch: Missing parameters",
+			.ret = -1,
+		},
+		{
+			.in = "%{switch(alpha, \"==\")}",
+			.out = "switch: At least one condition-value pair is required",
+			.ret = -1,
+		},
+		{
+			.in = "%{alpha | switch(\"==\")}",
+			.out = "switch: At least one condition-value pair is required",
+			.ret = -1,
+		},
+		{
+			.in = "%{switch(alpha, \"eq\", \"default\")}",
+			.out = "switch: At least one condition-value pair is required",
+			.ret = -1,
+		},
 	};
 
 	const struct var_expand_params params = {
@@ -586,7 +754,8 @@ static void test_var_expand_tables_arr(void)
 	test_end();
 }
 
-static const char *test_escape(const char *str, void *context)
+static int test_escape(const char *str, const char **output_r,
+		       void *context, const char **error_r ATTR_UNUSED)
 {
 	const char *escape_chars = context;
 	string_t *dest = t_str_new(strlen(str) + 2);
@@ -601,7 +770,8 @@ static const char *test_escape(const char *str, void *context)
 		}
 	}
 	str_append_c(dest, '\'');
-	return str_c(dest);
+	*output_r = str_c(dest);
+	return 0;
 }
 
 static void test_var_expand_escape(void)
@@ -611,6 +781,7 @@ static void test_var_expand_escape(void)
 		{ .key = "escape", .value = "'hello' \"world\"", },
 		{ .key = "first", .value = "bobby" },
 		{ .key = "nasty", .value = "\';-- SELECT * FROM bobby.tables" },
+		{ .key = "feisty", .value = "' OR '1'='1" },
 		VAR_EXPAND_TABLE_END
 	};
 
@@ -631,6 +802,7 @@ static void test_var_expand_escape(void)
 		{ .in = "no variables", .out = "no variables", .ret = 0 },
 		{ .in = "%{literal('hello')}", .out = "'hello'", .ret = 0 },
 		{ .in = "hello\\tworld", .out = "hello\\tworld", .ret = 0 },
+		{ .in = "%%%%%%%%%%%%%%%%%%", .out = "%%%%%%%%%%%%%%%%%%", .ret = 0 },
 		{ .in = "%{literal('hello\r\n\tworld')}", .out = "'hello\r\n\tworld'", .ret = 0 },
 		/* Hello */
 		{ .in = "\\110\\145\\154\\154\\157", .out = "\\110\\145\\154\\154\\157", .ret = 0},
@@ -653,6 +825,24 @@ static void test_var_expand_escape(void)
 		{ .in = "%{literal(\"\\\"\\\\hello\\\\world\\\"\")}", .out = "'\"\\hello\\world\"'", .ret = 0 },
 		/* Unsupported escape sequence */
 		{ .in = "%{literal('\\z')}", .out = "Invalid character escape", .ret = -1 },
+#define STR10(x) x x x x x x x x x x
+#define STR100(x) STR10(x) STR10(x) STR10(x) STR10(x) STR10(x) STR10(x) STR10(x) STR10(x) STR10(x) STR10(x)
+		/* Too long content */
+		{
+			.in = STR100("0123456789012345678901234567890123456789"
+				     "0123456789012345678901234567890123456789"
+				     "01234567890123456789"),
+			.out = "Program size exceeds maximum of 8192 bytes",
+			.ret = -1,
+		},
+		/* safe filter */
+		{ .in = "%{feisty}", "'\\' OR \\'1\\'=\\'1'", .ret = 0 },
+		{ .in = "%{clean|safe} and %{feisty}", "hello world and '\\' OR \\'1\\'=\\'1'", .ret = 0 },
+		{ .in = "%{clean|safe|upper}", .out = "safe filter must be last in the filter chain", .ret = -1 },
+		/* escape filter */
+		{ .in = "%{clean | escape}", .out = "'\\'hello world\\''", .ret = 0 },
+		{ .in = "%{clean | escape | safe}", .out = "'hello world'", .ret = 0 },
+		{ .in = "%{clean | escape | concat(' world') | safe}", .out = "'hello world' world", .ret = 0 },
 	};
 
 	const struct var_expand_params params = {
@@ -1088,9 +1278,9 @@ static void test_var_expand_export_import(void)
 		{ "\x01literal", "Missing end of string" },
 		{ "\x03literal", "Unknown input" },
 		{ "\x02literal\x01", "Premature end of data" },
-		{ "\x02literal\x01text\x01", "Unsupported parameter type" },
+		{ "\x02literal\x01text\x01", "Premature end of data" },
 		{ "\x02literal\x01\x01stext\t", "Missing end of string" },
-		{ "\x02literal\x01\x01i\xa1", "Unknown number" },
+		{ "\x02literal\x01\x01i\xa1", "Too short number" },
 		{ "\x02literal\x01\x01i\xab\xf0\t", "Missing parameter end" },
 		{
 			"\x02literal\x01\x01i\xab\xf0\xf0\xf0\xf0\xf0\xf0\xf0\xf0\xf0\xf0",
@@ -1098,7 +1288,7 @@ static void test_var_expand_export_import(void)
 		},
 		{ "\x02literal\x01\x01stext\r", "Missing parameter end" },
 		{ "\x02literal\x01\x01stext\r\t", "Missing statement end" },
-		{ "\x02literal\x01\x01stext\r\t\t", "Missing variables end" },
+		{ "\x02literal\x01\x01stext\r\t\t", "Premature end of data" },
 	};
 
 	for(size_t i = 0; i < N_ELEMENTS(test_cases_err); i++) {
@@ -1112,7 +1302,7 @@ static void test_var_expand_export_import(void)
 			continue;
 		}
 
-		test_assert_strcmp(error, t->error);
+		test_assert_strcmp_idx(error, t->error, i);
 	}
 
 	test_end();
@@ -1189,6 +1379,245 @@ static void test_var_expand_bench(void)
 	test_end();
 }
 
+static void test_var_expand_split(void)
+{
+	test_begin("var_expand_split");
+	pool_t pool = pool_datastack_create();
+	const struct var_expand_params params = {
+		.table = (const struct var_expand_table[]) {
+			{ .key = "login", .value = "user" },
+			{ .key = "host", .value = "localhost" },
+			{ .key = "user", .value = "remote user" },
+			VAR_EXPAND_TABLE_END
+		},
+		.providers = NULL,
+	};
+
+	const char *prog =
+		"ssh -l%{login} -- %{host} doveadm dsync-server "
+		"-u%{user | upper | lower}";
+	ARRAY_TYPE(const_expansion_program) parts = ARRAY_INIT;
+	const char *const *template;
+	const char *const *ptr;
+	const char *template2;
+	struct var_expand_program *program;
+	const char *error;
+
+	var_expand_program_create(prog, &program, &error);
+
+	const char *placeholder = ";";
+	t_array_init(&parts, 8);
+	var_expand_program_split(pool, program, placeholder, " ", &template, &parts);
+
+	/* expand the split program */
+	unsigned int i = 0;
+	string_t *result = t_str_new(32);
+
+	for (ptr = template; *ptr != NULL; ptr++) {
+		if (*ptr == placeholder) {
+			const struct var_expand_program *p =
+				array_idx_elem(&parts, i++);
+			var_expand_program_execute_one(result, p, &params, &error);
+		} else {
+			str_append(result, *ptr);
+		}
+		if (ptr[1] != NULL)
+			str_append_c(result, ':');
+	}
+
+	test_assert_strcmp("ssh:-l:user:--:localhost:doveadm:dsync-server:"
+			   "-u:remote user", str_c(result));
+
+	array_free(&parts);
+	t_array_init(&parts, 8);
+	var_expand_program_template(pool, program, placeholder, &template2, &parts);
+
+	test_assert_strcmp("ssh -l; -- ; doveadm dsync-server -u;", template2);
+
+	var_expand_program_free(&program);
+
+	test_end();
+}
+
+static void test_var_expand_timestamp(void)
+{
+	test_begin("var_expand(timestamp)");
+
+	const struct var_expand_table table[] = {
+		{ .key = "ts", .value = "1749379200" },
+		{ .key = "tsfrac", .value = "1749379200.123456789" },
+		{ .key = "tsms", .value = "1700000000.5" },
+		{ .key = "epoch", .value = "0" },
+		{ .key = "bigsec", .value = "10000000000" },
+		{ .key = "tslong", .value = "1749379200.1234567891" },
+		{ .key = "ms", .value = "1700000000500" },
+		{ .key = "ns", .value = "1749379200123456789" },
+		{ .key = "word", .value = "hello" },
+		VAR_EXPAND_TABLE_END
+	};
+
+	const struct var_expand_test tests[] = {
+		/* epoch unit conversion */
+		{ .in = "%{ts | epoch}", .out = "1749379200", .ret = 0 },
+		{ .in = "%{ts | epoch('s')}", .out = "1749379200", .ret = 0 },
+		{ .in = "%{tsfrac | epoch}", .out = "1749379200", .ret = 0 },
+		{ .in = "%{tsfrac | epoch('s')}", .out = "1749379200", .ret = 0 },
+		{ .in = "%{tsfrac | epoch('ms')}", .out = "1749379200123", .ret = 0 },
+		{ .in = "%{tsfrac | epoch('us')}", .out = "1749379200123456", .ret = 0 },
+		{ .in = "%{tsfrac | epoch('ns')}", .out = "1749379200123456789", .ret = 0 },
+		/* fraction longer than ns precision is truncated */
+		{ .in = "%{tslong | epoch('ns')}", .out = "1749379200123456789", .ret = 0 },
+		/* fraction shorter than ns precision is zero-padded */
+		{ .in = "%{tsms | epoch('ms')}", .out = "1700000000500", .ret = 0 },
+		{ .in = "%{tsms | epoch('ns')}", .out = "1700000000500000000", .ret = 0 },
+		/* named unit parameter */
+		{ .in = "%{tsfrac | epoch(unit='ms')}", .out = "1749379200123", .ret = 0 },
+		/* epoch zero */
+		{ .in = "%{epoch | epoch('ns')}", .out = "0", .ret = 0 },
+		/* large seconds value: 's' is fine, but scaling overflows */
+		{ .in = "%{bigsec | epoch('s')}", .out = "10000000000", .ret = 0 },
+		{ .in = "%{bigsec | epoch('ns')}",
+		  .out = "out of range for unit 'ns'", .ret = -1 },
+		/* epoch errors */
+		{ .in = "%{ts | epoch('bogus')}",
+		  .out = "Unsupported unit 'bogus' for 'epoch'", .ret = -1 },
+		{ .in = "%{word | epoch('s')}",
+		  .out = "Invalid timestamp 'hello'", .ret = -1 },
+		{ .in = "%{ts2 | epoch('s')}", .out = "Unknown variable 'ts2'",
+		  .ret = -1 },
+		/* from_epoch: integer in a unit -> canonical sec.frac */
+		{ .in = "%{ts | from_epoch}", .out = "1749379200.000000000",
+		  .ret = 0 },
+		{ .in = "%{ts | from_epoch('s')}", .out = "1749379200.000000000",
+		  .ret = 0 },
+		{ .in = "%{ms | from_epoch('ms')}", .out = "1700000000.500000000",
+		  .ret = 0 },
+		{ .in = "%{ns | from_epoch('ns')}", .out = "1749379200.123456789",
+		  .ret = 0 },
+		{ .in = "%{ms | from_epoch(unit='ms')}",
+		  .out = "1700000000.500000000", .ret = 0 },
+		/* from_epoch round-trips with epoch */
+		{ .in = "%{ns | from_epoch('ns') | epoch('ns')}",
+		  .out = "1749379200123456789", .ret = 0 },
+		/* from_epoch errors */
+		{ .in = "%{ms | from_epoch('bogus')}",
+		  .out = "Unsupported unit 'bogus' for 'from_epoch'", .ret = -1 },
+		{ .in = "%{word | from_epoch('ms')}",
+		  .out = "Invalid timestamp 'hello'", .ret = -1 },
+		{ .in = "%{from_epoch('ms')}",
+		  .out = "from_epoch: No value to convert from epoch", .ret = -1 },
+		/* date formatting, default timezone is UTC */
+		{ .in = "%{ts | date('%Y-%m-%d %H:%M:%S')}",
+		  .out = "2025-06-08 10:40:00", .ret = 0 },
+		{ .in = "%{ts | date('%Y-%m-%d %H:%M:%S', 'utc')}",
+		  .out = "2025-06-08 10:40:00", .ret = 0 },
+		{ .in = "%{ts | date('%Y-%m-%d %H:%M:%S', 'gmt')}",
+		  .out = "2025-06-08 10:40:00", .ret = 0 },
+		{ .in = "%{ts | date(format='%H:%M', tz='utc')}",
+		  .out = "10:40", .ret = 0 },
+		{ .in = "%{epoch | date('%Y-%m-%d %H:%M:%S')}",
+		  .out = "1970-01-01 00:00:00", .ret = 0 },
+		/* fractional seconds are ignored by date */
+		{ .in = "%{tsms | date('%Y-%m-%d %H:%M:%S')}",
+		  .out = "2023-11-14 22:13:20", .ret = 0 },
+		/* from_epoch feeds date */
+		{ .in = "%{ms | from_epoch('ms') | date('%Y-%m-%d %H:%M:%S')}",
+		  .out = "2023-11-14 22:13:20", .ret = 0 },
+		/* date errors */
+		{ .in = "%{ts | date}", .out = "date: Missing date format",
+		  .ret = -1 },
+		{ .in = "%{ts | date('%H', 'mars')}",
+		  .out = "Unsupported timezone 'mars' for 'date'", .ret = -1 },
+		{ .in = "%{date('%H')}", .out = "date: No value to format as date",
+		  .ret = -1 },
+		/* chaining with other filters */
+		{ .in = "%{ts | date('%Y') | upper}", .out = "2025", .ret = 0 },
+		/* ISO 8601 / RFC 3339 formatting (UTC -> 'Z') */
+		{ .in = "%{ts | iso8601}", .out = "2025-06-08T10:40:00Z", .ret = 0 },
+		{ .in = "%{ts | iso8601('utc')}", .out = "2025-06-08T10:40:00Z",
+		  .ret = 0 },
+		{ .in = "%{ts | iso8601(tz='gmt')}", .out = "2025-06-08T10:40:00Z",
+		  .ret = 0 },
+		{ .in = "%{epoch | iso8601}", .out = "1970-01-01T00:00:00Z",
+		  .ret = 0 },
+		/* fractional seconds are ignored */
+		{ .in = "%{tsms | iso8601}", .out = "2023-11-14T22:13:20Z",
+		  .ret = 0 },
+		/* iso8601 errors */
+		{ .in = "%{ts | iso8601('mars')}",
+		  .out = "Unsupported timezone 'mars' for 'iso8601'", .ret = -1 },
+		{ .in = "%{iso8601}",
+		  .out = "iso8601: No value to format as ISO 8601", .ret = -1 },
+	};
+
+	const struct var_expand_params params = {
+		.table = table,
+	};
+
+	run_var_expand_tests(&params, tests, N_ELEMENTS(tests));
+
+	/* %{time:unix} returns the current time as <seconds>.<nanoseconds>;
+	   only the format can be checked deterministically. */
+	string_t *dest = t_str_new(64);
+	const char *error;
+	test_assert(var_expand(dest, "%{time:unix}", &params, &error) == 0);
+
+	const char *str = str_c(dest);
+	const char *dot = strchr(str, '.');
+	test_assert(dot != NULL);
+	if (dot != NULL) {
+		/* 9-digit nanosecond part */
+		test_assert(strlen(dot + 1) == 9);
+		intmax_t sec;
+		test_assert(str_to_intmax(t_strdup_until(str, dot), &sec) == 0);
+		/* sanity: after 2020-01-01 */
+		test_assert(sec > 1577836800);
+	}
+
+	/* %{time:unix} must round-trip through the epoch filter */
+	str_truncate(dest, 0);
+	test_assert(var_expand(dest, "%{time:unix | epoch('ms')}", &params,
+			       &error) == 0);
+	intmax_t msec;
+	test_assert(str_to_intmax(str_c(dest), &msec) == 0);
+
+	str_free(&dest);
+
+	test_end();
+}
+
+static void test_var_expand_to_string(void)
+{
+	const char *const test_cases[] = {
+		"%{hello}",
+		"%{literal('hello')}'",
+		"%{literal('\\'hello\\'')}",
+		"simple",
+		"simple %{test} case",
+		"%{complex | upper | lower | truncate(5)}",
+		"%{test | func(a=1, b='2', c=t)}",
+		"%{hello | sha256 % 4}",
+		"%{hello % 4}",
+	};
+	for (size_t i = 0; i < N_ELEMENTS(test_cases); i++)
+		test_assert_program_equal_idx(test_cases[i], i);
+
+	const char *template_2 = "%{only} %{first} %{program}";
+	struct var_expand_program *program;
+	const char *error;
+	test_assert_program_equal_idx(template_2, 0);
+
+	if (var_expand_program_create(template_2, &program, &error) < 0) {
+		test_assert_failed(error, __FILE__, __LINE__);
+		return;
+	}
+
+	const char *first = var_expand_program_to_string_one(program);
+	test_assert_strcmp(first, "%{only}");
+
+	var_expand_program_free(&program);
+}
+
 int main(int argc, char *const argv[])
 {
 	void (*const tests[])(void) = {
@@ -1196,6 +1625,7 @@ int main(int argc, char *const argv[])
 		test_var_expand_builtin_filters,
 		test_var_expand_math,
 		test_var_expand_if,
+		test_var_expand_switch,
 		test_var_expand_providers,
 		test_var_expand_provider_arr,
 		test_var_expand_tables_arr,
@@ -1207,7 +1637,10 @@ int main(int argc, char *const argv[])
 		test_var_expand_perc,
 		test_var_expand_set_copy,
 		test_var_expand_generate,
+		test_var_expand_timestamp,
 		test_var_expand_export_import,
+		test_var_expand_split,
+		test_var_expand_to_string,
 		test_var_expand_bench,
 		NULL
 	};

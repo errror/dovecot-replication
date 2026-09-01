@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -223,4 +223,24 @@ void imap_write_capability(string_t *dest, const ARRAY_TYPE(const_string) *capab
 			str_append_c(dest, ' ');
 		str_append(dest, str_c(cap_str));
 	}
+}
+
+bool imap_reply_begins(const char *line, const char *prefix,
+		       const char **suffix_r)
+{
+	const char *suffix;
+
+	if (!str_begins_icase(line, prefix, &suffix))
+		return FALSE;
+	if (suffix[0] == '\0') {
+		if (suffix_r != NULL)
+			*suffix_r = suffix;
+		return TRUE;
+	}
+	if (suffix[0] == ' ') {
+		if (suffix_r != NULL)
+			*suffix_r = suffix + 1;
+		return TRUE;
+	}
+	return FALSE;
 }

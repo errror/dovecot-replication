@@ -1,9 +1,10 @@
-/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "ioloop.h"
 #include "hash.h"
+#include "llist.h"
 #include "str.h"
 #include "time-util.h"
 #include "settings.h"
@@ -11,6 +12,28 @@
 #include "sql-api-private.h"
 
 #include <time.h>
+
+struct sql_query_result_delayed {
+	struct sql_query_result_delayed *prev, *next;
+
+	struct sql_db *db;
+	struct timeout *to;
+
+	struct sql_result *result;
+	sql_query_callback_t *callback;
+	void *context;
+};
+
+struct sql_commit_result_delayed {
+	struct sql_commit_result_delayed *prev, *next;
+
+	struct sql_db *db;
+	struct timeout *to;
+
+	char *error;
+	sql_commit_callback_t *callback;
+	void *context;
+};
 
 struct event_category event_category_sql = {
 	.name = "sql",
@@ -39,6 +62,65 @@ const struct setting_parser_info sql_setting_parser_info = {
 
 struct sql_db_module_register sql_db_module_register = { 0 };
 ARRAY_TYPE(sql_drivers) sql_drivers;
+
+static void sql_query_delayed_callback(struct sql_query_result_delayed *cb);
+static void sql_commit_delayed_callback(struct sql_commit_result_delayed *cb);
+
+struct sql_result_error {
+	struct sql_result result;
+	char *error;
+};
+
+static void sql_result_error_free(struct sql_result *_result)
+{
+	struct sql_result_error *result =
+		container_of(_result, struct sql_result_error, result);
+	i_free(result->error);
+	i_free(result);
+}
+
+static int sql_result_error_next_row(struct sql_result *result ATTR_UNUSED)
+{
+	return -1;
+}
+
+static const char *
+sql_result_error_get_error(struct sql_result *_result)
+{
+	struct sql_result_error *result =
+		container_of(_result, struct sql_result_error, result);
+	return result->error;
+}
+
+static const struct sql_result_vfuncs sql_result_error_vfuncs = {
+	.free = sql_result_error_free,
+	.next_row = sql_result_error_next_row,
+	.get_error = sql_result_error_get_error,
+};
+
+static struct sql_result *sql_result_new_error(const char *error)
+{
+	struct sql_result_error *result = i_new(struct sql_result_error, 1);
+	result->result.v = sql_result_error_vfuncs;
+	result->result.failed = TRUE;
+	result->result.refcount = 1;
+	result->error = i_strdup(error);
+	return &result->result;
+}
+
+static void
+sql_query_callback_delayed(struct sql_db *db, struct sql_result *result,
+			   sql_query_callback_t *callback, void *context)
+{
+	struct sql_query_result_delayed *cb =
+		i_new(struct sql_query_result_delayed, 1);
+	cb->db = db;
+	cb->result = result;
+	cb->callback = callback;
+	cb->context = context;
+	cb->to = timeout_add_short(0, sql_query_delayed_callback, cb);
+	DLLIST_PREPEND(&db->query_delayed_list, cb);
+}
 
 void sql_drivers_init_without_drivers(void)
 {
@@ -228,15 +310,26 @@ int sql_connect(struct sql_db *db)
 	return db->v.connect(db);
 }
 
+static void sql_call_delayed_callbacks(struct sql_db *db)
+{
+	/* flush any pending results */
+	while (db->query_delayed_list != NULL)
+		sql_query_delayed_callback(db->query_delayed_list);
+	while (db->commit_delayed_list != NULL)
+		sql_commit_delayed_callback(db->commit_delayed_list);
+}
+
 void sql_disconnect(struct sql_db *db)
 {
 	timeout_remove(&db->to_reconnect);
+	sql_call_delayed_callbacks(db);
 	db->v.disconnect(db);
 }
 
-const char *sql_escape_string(struct sql_db *db, const char *string)
+int sql_escape_string(struct sql_db *db, const char *string,
+		      const char **output_r, const char **error_r)
 {
-	return db->v.escape_string(db, string);
+	return db->v.escape_string(db, string, output_r, error_r);
 }
 
 const char *sql_escape_blob(struct sql_db *db,
@@ -250,11 +343,26 @@ void sql_exec(struct sql_db *db, const char *query)
 	db->v.exec(db, query);
 }
 
+static void sql_query_delayed_callback(struct sql_query_result_delayed *cb)
+{
+	timeout_remove(&cb->to);
+	DLLIST_REMOVE(&cb->db->query_delayed_list, cb);
+	cb->callback(cb->result, cb->context);
+	sql_result_unref(cb->result);
+	i_free(cb);
+}
+
 #undef sql_query
 void sql_query(struct sql_db *db, const char *query,
 	       sql_query_callback_t *callback, void *context)
 {
-	db->v.query(db, query, callback, context);
+	if (db->v.query != NULL) {
+		db->v.query(db, query, callback, context);
+		return;
+	}
+
+	sql_query_callback_delayed(db, sql_query_s(db, query),
+				   callback, context);
 }
 
 struct sql_result *sql_query_s(struct sql_db *db, const char *query)
@@ -283,52 +391,98 @@ default_sql_statement_init_prepared(struct sql_prepared_statement *stmt)
 
 const char *sql_statement_get_log_query(struct sql_statement *stmt)
 {
+	const char *query, *error;
 	if (stmt->no_log_expanded_values)
 		return stmt->query_template;
-	return sql_statement_get_query(stmt);
+	if (sql_statement_get_query(stmt, &query, &error) < 0)
+		return stmt->query_template;
+	return query;
 }
 
-const char *sql_statement_get_query(struct sql_statement *stmt)
+int sql_statement_get_query(struct sql_statement *stmt,
+			    const char **query_r, const char **error_r)
 {
-	string_t *query = t_str_new(128);
+	string_t *query = str_new(default_pool, 128);
 	const char *const *args;
-	unsigned int i, args_count, arg_pos = 0;
+	const bool *need_escaping_flags;
+	unsigned int args_count, need_escaping_count, arg_pos = 0;
+	const char *p0, *p1;
 
 	args = array_get(&stmt->args, &args_count);
-
-	for (i = 0; stmt->query_template[i] != '\0'; i++) {
-		if (stmt->query_template[i] == '?') {
-			if (arg_pos >= args_count ||
-			    args[arg_pos] == NULL) {
-				i_panic("lib-sql: Missing bind for arg #%u in statement: %s",
-					arg_pos, stmt->query_template);
-			}
-			str_append(query, args[arg_pos++]);
-		} else {
-			str_append_c(query, stmt->query_template[i]);
+	need_escaping_flags = array_get(&stmt->args_need_escaping, &need_escaping_count);
+	p0 = stmt->query_template;
+	while ((p1 = strchr(p0, '?')) != NULL) {
+		/* append until ? */
+		str_append_max(query, p0, (p1 - p0));
+		if (arg_pos >= args_count ||
+		    args[arg_pos] == NULL) {
+			i_panic("lib-sql: Missing bind for arg #%u in statement: %s",
+				arg_pos, stmt->query_template);
 		}
+		if (arg_pos < need_escaping_count && need_escaping_flags[arg_pos]) {
+			const char *escaped;
+
+			/* Escape in a nested data stack frame so the
+			   driver's temporary escape buffer is freed
+			   immediately. The escaped value is appended to the
+			   heap-allocated query before the frame is popped. */
+			T_BEGIN {
+				if (sql_escape_string(stmt->db, args[arg_pos],
+						      &escaped, error_r) < 0)
+					escaped = NULL;
+				else {
+					str_append_c(query, '\'');
+					str_append(query, escaped);
+					str_append_c(query, '\'');
+				}
+			} T_END_PASS_STR_IF(escaped == NULL, error_r);
+			if (escaped == NULL) {
+				str_free(&query);
+				return -1;
+			}
+		} else {
+			str_append(query, args[arg_pos]);
+		}
+		arg_pos++;
+		p0 = p1 + 1;
 	}
+	str_append(query, p0);
+
 	if (arg_pos != args_count) {
 		i_panic("lib-sql: Too many bind args (%u) for statement: %s",
 			args_count, stmt->query_template);
 	}
-	return str_c(query);
+	*query_r = t_strdup(str_c(query));
+	str_free(&query);
+	return 0;
 }
 
 static void
 default_sql_statement_query(struct sql_statement *stmt,
 			    sql_query_callback_t *callback, void *context)
 {
-	sql_query(stmt->db, sql_statement_get_query(stmt),
-		  callback, context);
+	const char *query, *error;
+	if (sql_statement_get_query(stmt, &query, &error) < 0) {
+		sql_query_callback_delayed(stmt->db,
+					   sql_result_new_error(error),
+					   callback, context);
+		pool_unref(&stmt->pool);
+		return;
+	}
+	sql_query(stmt->db, query, callback, context);
 	pool_unref(&stmt->pool);
 }
 
 static struct sql_result *
 default_sql_statement_query_s(struct sql_statement *stmt)
 {
-	struct sql_result *result =
-		sql_query_s(stmt->db, sql_statement_get_query(stmt));
+	const char *query, *error;
+	if (sql_statement_get_query(stmt, &query, &error) < 0) {
+		struct sql_result *result = sql_result_new_error(error);
+		pool_unref(&stmt->pool);
+		return result;
+	}
+	struct sql_result *result = sql_query_s(stmt->db, query);
 	pool_unref(&stmt->pool);
 	return result;
 }
@@ -337,8 +491,14 @@ static void default_sql_update_stmt(struct sql_transaction_context *ctx,
 				    struct sql_statement *stmt,
 				    unsigned int *affected_rows)
 {
-	ctx->db->v.update(ctx, sql_statement_get_query(stmt),
-			  affected_rows);
+	const char *query, *error;
+	if (sql_statement_get_query(stmt, &query, &error) < 0) {
+		if (ctx->failed_error == NULL)
+			ctx->failed_error = i_strdup(error);
+		pool_unref(&stmt->pool);
+		return;
+	}
+	ctx->db->v.update(ctx, query, affected_rows);
 	pool_unref(&stmt->pool);
 }
 
@@ -366,6 +526,9 @@ void sql_prepared_statement_unref(struct sql_prepared_statement **_prep_stmt)
 {
 	struct sql_prepared_statement *prep_stmt = *_prep_stmt;
 
+	if (prep_stmt == NULL)
+		return;
+
 	*_prep_stmt = NULL;
 
 	i_assert(prep_stmt->refcount > 0);
@@ -377,6 +540,7 @@ sql_statement_init_fields(struct sql_statement *stmt, struct sql_db *db)
 {
 	stmt->db = db;
 	p_array_init(&stmt->args, stmt->pool, 8);
+	p_array_init(&stmt->args_need_escaping, stmt->pool, 8);
 }
 
 struct sql_statement *
@@ -435,10 +599,10 @@ void sql_statement_set_no_log_expanded_values(struct sql_statement *stmt,
 void sql_statement_bind_str(struct sql_statement *stmt,
 			    unsigned int column_idx, const char *value)
 {
-	const char *escaped_value =
-		p_strdup_printf(stmt->pool, "'%s'",
-				sql_escape_string(stmt->db, value));
-	array_idx_set(&stmt->args, column_idx, &escaped_value);
+	const char *value_dup = p_strdup(stmt->pool, value);
+	array_idx_set(&stmt->args, column_idx, &value_dup);
+	bool needs_escaping = TRUE;
+	array_idx_set(&stmt->args_need_escaping, column_idx, &needs_escaping);
 
 	if (stmt->db->v.statement_bind_str != NULL)
 		stmt->db->v.statement_bind_str(stmt, column_idx, value);
@@ -494,23 +658,39 @@ void sql_statement_query(struct sql_statement **_stmt,
 			 sql_query_callback_t *callback, void *context)
 {
 	struct sql_statement *stmt = *_stmt;
-
 	*_stmt = NULL;
-	if (stmt->db->v.statement_query != NULL)
-		stmt->db->v.statement_query(stmt, callback, context);
-	else
-		default_sql_statement_query(stmt, callback, context);
+
+	T_BEGIN {
+		if (stmt->db->v.statement_query != NULL)
+			stmt->db->v.statement_query(stmt, callback, context);
+		else if (stmt->db->v.statement_query_s != NULL) {
+			struct sql_db *db = stmt->db;
+			struct sql_query_result_delayed *cb =
+				i_new(struct sql_query_result_delayed, 1);
+			cb->db = db;
+			cb->callback = callback;
+			cb->context = context;
+			cb->result = sql_statement_query_s(&stmt);
+			cb->to = timeout_add_short(0, sql_query_delayed_callback, cb);
+			DLLIST_PREPEND(&db->query_delayed_list, cb);
+		} else
+			default_sql_statement_query(stmt, callback, context);
+	} T_END;
 }
 
 struct sql_result *sql_statement_query_s(struct sql_statement **_stmt)
 {
 	struct sql_statement *stmt = *_stmt;
+	struct sql_result *result;
 
 	*_stmt = NULL;
-	if (stmt->db->v.statement_query_s != NULL)
-		return stmt->db->v.statement_query_s(stmt);
-	else
-		return default_sql_statement_query_s(stmt);
+	T_BEGIN {
+		if (stmt->db->v.statement_query_s != NULL)
+			result = stmt->db->v.statement_query_s(stmt);
+		else
+			result = default_sql_statement_query_s(stmt);
+	} T_END;
+	return result;
 }
 
 void sql_result_ref(struct sql_result *result)
@@ -755,14 +935,54 @@ void sql_transaction_set_non_atomic(struct sql_transaction_context *ctx)
 	ctx->non_atomic = TRUE;
 }
 
+static void sql_commit_delayed_callback(struct sql_commit_result_delayed *cb)
+{
+	struct sql_commit_result result = {
+		.error = cb->error,
+	};
+	timeout_remove(&cb->to);
+	DLLIST_REMOVE(&cb->db->commit_delayed_list, cb);
+	cb->callback(&result, cb->context);
+	i_free(cb->error);
+	i_free(cb);
+}
+
+static void
+sql_commit_schedule_delayed(struct sql_db *db, const char *error,
+			    sql_commit_callback_t *callback, void *context)
+{
+	struct sql_commit_result_delayed *cb = i_new(struct sql_commit_result_delayed, 1);
+	cb->db = db;
+	cb->error = i_strdup(error);
+	cb->callback = callback;
+	cb->context = context;
+	cb->to = timeout_add_short(0, sql_commit_delayed_callback, cb);
+	DLLIST_PREPEND(&db->commit_delayed_list, cb);
+}
+
 #undef sql_transaction_commit
 void sql_transaction_commit(struct sql_transaction_context **_ctx,
 			    sql_commit_callback_t *callback, void *context)
 {
 	struct sql_transaction_context *ctx = *_ctx;
-
+	struct sql_db *db = ctx->db;
 	*_ctx = NULL;
-	ctx->db->v.transaction_commit(ctx, callback, context);
+
+	if (ctx->failed_error != NULL) {
+		sql_commit_schedule_delayed(db, ctx->failed_error, callback, context);
+		i_free(ctx->failed_error);
+		ctx->db->v.transaction_rollback(ctx);
+		return;
+	}
+
+	if (ctx->db->v.transaction_commit != NULL) {
+		ctx->db->v.transaction_commit(ctx, callback, context);
+		return;
+	}
+
+	const char *error = NULL;
+	ctx->db->v.transaction_commit_s(ctx, &error);
+	sql_commit_schedule_delayed(db, error, callback, context);
 }
 
 int sql_transaction_commit_s(struct sql_transaction_context **_ctx,
@@ -771,6 +991,12 @@ int sql_transaction_commit_s(struct sql_transaction_context **_ctx,
 	struct sql_transaction_context *ctx = *_ctx;
 
 	*_ctx = NULL;
+	if (ctx->failed_error != NULL) {
+		*error_r = t_strdup(ctx->failed_error);
+		i_free(ctx->failed_error);
+		ctx->db->v.transaction_rollback(ctx);
+		return -1;
+	}
 	return ctx->db->v.transaction_commit_s(ctx, error_r);
 }
 
@@ -779,6 +1005,7 @@ void sql_transaction_rollback(struct sql_transaction_context **_ctx)
 	struct sql_transaction_context *ctx = *_ctx;
 
 	*_ctx = NULL;
+	i_free(ctx->failed_error);
 	ctx->db->v.transaction_rollback(ctx);
 }
 
@@ -793,10 +1020,12 @@ void sql_update_stmt(struct sql_transaction_context *ctx,
 	struct sql_statement *stmt = *_stmt;
 
 	*_stmt = NULL;
-	if (ctx->db->v.update_stmt != NULL)
-		ctx->db->v.update_stmt(ctx, stmt, NULL);
-	else
-		default_sql_update_stmt(ctx, stmt, NULL);
+	T_BEGIN {
+		if (ctx->db->v.update_stmt != NULL)
+			ctx->db->v.update_stmt(ctx, stmt, NULL);
+		else
+			default_sql_update_stmt(ctx, stmt, NULL);
+	} T_END;
 }
 
 void sql_update_get_rows(struct sql_transaction_context *ctx, const char *query,
@@ -812,10 +1041,12 @@ void sql_update_stmt_get_rows(struct sql_transaction_context *ctx,
 	struct sql_statement *stmt = *_stmt;
 
 	*_stmt = NULL;
-	if (ctx->db->v.update_stmt != NULL)
-		ctx->db->v.update_stmt(ctx, stmt, affected_rows);
-	else
-		default_sql_update_stmt(ctx, stmt, affected_rows);
+	T_BEGIN {
+		if (ctx->db->v.update_stmt != NULL)
+			ctx->db->v.update_stmt(ctx, stmt, affected_rows);
+		else
+			default_sql_update_stmt(ctx, stmt, affected_rows);
+	} T_END;
 }
 
 void sql_db_set_state(struct sql_db *db, enum sql_db_state state)
@@ -867,12 +1098,13 @@ sql_query_finished_event(struct sql_db *db, struct event *event, const char *que
 			 bool success, int *duration_r)
 {
 	long long diff;
-	struct timeval tv;
+	struct timeval tv, tv2;
 	event_get_create_time(event, &tv);
+	i_gettimeofday(&tv2);
 	struct event_passthrough *e = event_create_passthrough(event)->
 			set_name(SQL_QUERY_FINISHED)->
 			add_str("query_first_word", t_strcut(query, ' '));
-	diff = timeval_diff_msecs(&ioloop_timeval, &tv);
+	diff = timeval_diff_msecs(&tv2, &tv);
 
 	if (!success) {
 		db->failed_queries++;
@@ -900,6 +1132,7 @@ void sql_wait(struct sql_db *db)
 {
 	if (db->v.wait != NULL)
 		db->v.wait(db);
+	sql_call_delayed_callbacks(db);
 }
 
 

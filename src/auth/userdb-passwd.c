@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "userdb.h"
@@ -9,7 +9,6 @@
 #include "ipwd.h"
 #include "time-util.h"
 
-#define USER_CACHE_KEY "%u"
 #define PASSWD_SLOW_WARN_MSECS (10*1000)
 #define PASSWD_SLOW_MASTER_WARN_MSECS 50
 #define PASSDB_SLOW_MASTER_WARN_COUNT_INTERVAL 100
@@ -218,14 +217,16 @@ static int passwd_iterate_deinit(struct userdb_iterate_context *_ctx)
 	return ret;
 }
 
-static int passwd_preinit(pool_t pool, struct event *event ATTR_UNUSED,
-			  struct userdb_module **module_r,
-			  const char **error_r ATTR_UNUSED)
+static int
+passwd_preinit(pool_t pool, struct event *event ATTR_UNUSED,
+	       const struct userdb_parameters *userdb_params ATTR_UNUSED,
+	       struct userdb_module **module_r,
+	       const char **error_r ATTR_UNUSED)
 {
 	struct passwd_userdb_module *module =
 		p_new(pool, struct passwd_userdb_module, 1);
 
-	module->module.default_cache_key = USER_CACHE_KEY;
+	module->module.default_cache_key = AUTH_CACHE_KEY_USER;
 	*module_r = &module->module;
 	return 0;
 }

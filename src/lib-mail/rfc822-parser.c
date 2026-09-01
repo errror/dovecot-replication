@@ -1,9 +1,10 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
-#include "punycode.h"
 #include "strescape.h"
+#include "idna.h"
+#include "idna-punycode.h"
 #include "rfc822-parser.h"
 
 /*
@@ -413,34 +414,6 @@ rfc822_parse_domain_literal(struct rfc822_parser_context *ctx, string_t *str)
 	return -1;
 }
 
-void rfc822_decode_punycode(const char *input, size_t len, string_t *result)
-{
-	string_t *decoded = t_str_new(64);
-	const char *pos = input;
-	const char *end = CONST_PTR_OFFSET(input, len);
-
-	while (pos < end) {
-		const char *value;
-		const char *delim = strchr(pos, '.');
-		if (delim == NULL)
-			delim = end;
-		if (str_begins(pos, "xn--", &value)) {
-			str_truncate(decoded, 0);
-			if (punycode_decode(value, delim - value, result) < 0)
-				/* Consider it as data */
-				str_append_data(result, pos, delim - pos + 1);
-			else if (*delim == '.')
-				str_append_c(result, *delim);
-		} else {
-			/* No punycode prefix */
-			str_append_data(result, pos, delim - pos + 1);
-		}
-		pos = delim + 1;
-	}
-	if (pos < end)
-		str_append_data(result, pos, end - pos);
-}
-
 int rfc822_parse_domain(struct rfc822_parser_context *ctx, string_t *str)
 {
 	/*
@@ -458,16 +431,21 @@ int rfc822_parse_domain(struct rfc822_parser_context *ctx, string_t *str)
 	if (*ctx->data == '[')
 		return rfc822_parse_domain_literal(ctx, str);
 	else {
+#ifdef EXPERIMENTAL_MAIL_UTF8
+		size_t start_pos = str_len(str);
+#endif
 		int ret = rfc822_parse_dot_atom(ctx, str);
 #ifdef EXPERIMENTAL_MAIL_UTF8
-		if (ret == 0) {
-			size_t start_pos = str_len(str);
-			string_t *u = t_str_new(64);
-			const char *data = t_strndup(str_data(str) + start_pos,
-						     str_len(str) - start_pos);
-			rfc822_decode_punycode(data, strlen(data), u);
+		if (ret < 0)
+			return -1;
+
+		const char *domain = str_c(str) + start_pos, *domain_unicode;
+		const char *error;
+
+		if (idna_process_domain_name(domain, 0, &domain_unicode, NULL,
+					     &error) == 0) {
 			str_truncate(str, start_pos);
-			str_append_str(str, u);
+			str_append(str, domain_unicode);
 		}
 #endif
 		return ret;

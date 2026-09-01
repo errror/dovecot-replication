@@ -1,4 +1,4 @@
-/* Copyright (c) 2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "dict.h"
@@ -12,6 +12,12 @@ struct mail_dict_cmd_context {
 	int64_t inc_diff;
 	enum dict_iterate_flags iter_flags;
 };
+
+#define WITH_USER_EVENT_START STMT_START { \
+	struct event *orig_event = cctx->ctx.cctx->set_event; \
+	cctx->ctx.cctx->set_event = cctx->ctx.cur_mail_user->event;
+
+#define WITH_USER_EVENT_END cctx->ctx.cctx->set_event = orig_event; } STMT_END
 
 static void cmd_mail_dict_get_init(struct doveadm_mail_cmd_context *_cctx)
 {
@@ -31,7 +37,9 @@ static int cmd_mail_dict_get_run(struct doveadm_mail_cmd_context *_cctx,
 	struct mail_dict_cmd_context *cctx =
 		container_of(_cctx, struct mail_dict_cmd_context, ctx);
 
+	WITH_USER_EVENT_START;
 	doveadm_dict_get(_cctx->cctx, cctx->key);
+	WITH_USER_EVENT_END;
 	return 0;
 }
 
@@ -62,7 +70,9 @@ static int cmd_mail_dict_set_run(struct doveadm_mail_cmd_context *_cctx,
 	struct mail_dict_cmd_context *cctx =
 		container_of(_cctx, struct mail_dict_cmd_context, ctx);
 
+	WITH_USER_EVENT_START;
 	doveadm_dict_set(_cctx->cctx, cctx->key, cctx->value);
+	WITH_USER_EVENT_END;
 	return 0;
 }
 
@@ -91,7 +101,9 @@ static int cmd_mail_dict_unset_run(struct doveadm_mail_cmd_context *_cctx,
 	struct mail_dict_cmd_context *cctx =
 		container_of(_cctx, struct mail_dict_cmd_context, ctx);
 
+	WITH_USER_EVENT_START;
 	doveadm_dict_unset(_cctx->cctx, cctx->key);
+	WITH_USER_EVENT_END;
 	return 0;
 }
 
@@ -123,7 +135,9 @@ static int cmd_mail_dict_inc_run(struct doveadm_mail_cmd_context *_cctx,
 	struct mail_dict_cmd_context *cctx =
 		container_of(_cctx, struct mail_dict_cmd_context, ctx);
 
+	WITH_USER_EVENT_START;
 	doveadm_dict_inc(_cctx->cctx, cctx->key, cctx->inc_diff);
+	WITH_USER_EVENT_END;
 	return 0;
 }
 
@@ -164,7 +178,9 @@ static int cmd_mail_dict_iter_run(struct doveadm_mail_cmd_context *_cctx,
 	struct mail_dict_cmd_context *cctx =
 		container_of(_cctx, struct mail_dict_cmd_context, ctx);
 
+	WITH_USER_EVENT_START;
 	doveadm_dict_iter(_cctx->cctx, cctx->iter_flags, cctx->prefix);
+	WITH_USER_EVENT_END;
 	return 0;
 }
 

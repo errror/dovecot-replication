@@ -1,10 +1,12 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /* @UNSAFE: whole file */
 
 #include "lib.h"
 #include "hash.h"
 #include "primes.h"
+#include "randgen.h"
+#include "xxh64.h"
 
 #include <ctype.h>
 
@@ -57,6 +59,8 @@ enum hash_table_operation{
 	HASH_TABLE_OP_UPDATE,
 	HASH_TABLE_OP_RESIZE
 };
+
+uint64_t hash_iv;
 
 static bool hash_table_resize(struct hash_table *table, bool grow);
 
@@ -519,42 +523,32 @@ void hash_table_copy(struct hash_table *dest, struct hash_table *src)
 	hash_table_thaw(dest);
 }
 
-/* a char* hash function from ASU -- from glib */
-unsigned int ATTR_NO_SANITIZE_INTEGER
-str_hash(const char *p)
+void hash_init(void)
 {
-	const unsigned char *s = (const unsigned char *)p;
-	unsigned int g, h = 0;
-
-	while (*s != '\0') {
-		h = (h << 4) + *s;
-		if ((g = h & 0xf0000000UL) != 0) {
-			h = h ^ (g >> 24);
-			h = h ^ g;
-		}
-		s++;
-	}
-
-	return h;
+	random_fill(&hash_iv, sizeof(hash_iv));
 }
 
-/* a char* hash function from ASU -- from glib */
-unsigned int ATTR_NO_SANITIZE_INTEGER
-strcase_hash(const char *p)
+unsigned int str_hash(const char *p)
 {
-	const unsigned char *s = (const unsigned char *)p;
-	unsigned int g, h = 0;
+	return xxh64_to_32(xxh64_data(p, strlen(p), hash_iv));
+}
 
-	while (*s != '\0') {
-		h = (h << 4) + i_toupper(*s);
-		if ((g = h & 0xf0000000UL) != 0) {
-			h = h ^ (g >> 24);
-			h = h ^ g;
-		}
-		s++;
+unsigned int str_stable_hash(const char *p)
+{
+	return xxh64_to_32(xxh64_data(p, strlen(p), 0));
+}
+
+unsigned int strcase_hash(const char *p)
+{
+	struct xxh64_context ctx;
+	unsigned char c;
+
+	xxh64_init(&ctx, hash_iv);
+	while (*p != '\0') {
+		c = (unsigned char)i_toupper(*p++);
+		xxh64_loop(&ctx, &c, 1);
 	}
-
-	return h;
+	return xxh64_to_32(xxh64_result(&ctx));
 }
 
 unsigned int ATTR_NO_SANITIZE_INTEGER

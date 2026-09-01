@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -15,6 +15,7 @@
 #include "master-service.h"
 #include "istream-dot.h"
 #include "test-common.h"
+#include "test-dir.h"
 #include "test-subprocess.h"
 
 #include "smtp-address.h"
@@ -163,6 +164,9 @@ static void test_host_lookup_failed(void)
 static void test_server_connection_refused(unsigned int index ATTR_UNUSED)
 {
 	i_close_fd(&fd_listen);
+
+	/* notify client that the listen socket is closed */
+	test_subprocess_notify_signal_send_parent(SIGHUP);
 }
 
 /* client */
@@ -172,6 +176,11 @@ test_client_connection_refused(const struct smtp_submit_settings *submit_set)
 {
 	const char *error = NULL;
 	int ret;
+
+	/* wait until the server closed the listen socket, so that connecting
+	   fails with ECONNREFUSED instead of ending up in the listen backlog */
+	test_subprocess_notify_signal_wait(SIGHUP,
+					   TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 
 	ret = test_client_smtp_send_simple_port(submit_set, test_message1,
 						bind_ports[0], &error);
@@ -191,6 +200,7 @@ static void test_connection_refused(void)
 
 	test_begin("connection refused");
 	test_expect_errors(1);
+	test_subprocess_notify_signal_reset(SIGHUP);
 	test_run_client_server(&smtp_submit_set,
 			       test_client_connection_refused,
 			       test_server_connection_refused, 1);
@@ -1150,7 +1160,7 @@ static void test_data_disconnect(void)
 
 /* server */
 
-enum _data_timout_state {
+enum _data_timeout_state {
 	DATA_TIMEOUT_STATE_EHLO = 0,
 	DATA_TIMEOUT_STATE_MAIL_FROM,
 	DATA_TIMEOUT_STATE_RCPT_TO,
@@ -1158,20 +1168,20 @@ enum _data_timout_state {
 	DATA_TIMEOUT_STATE_FINISH
 };
 
-struct _data_timout_server {
-	enum _data_timout_state state;
+struct _data_timeout_server {
+	enum _data_timeout_state state;
 };
 
-static void test_data_timout_input(struct server_connection *conn)
+static void test_data_timeout_input(struct server_connection *conn)
 {
-	struct _data_timout_server *ctx;
+	struct _data_timeout_server *ctx;
 	const char *line;
 
 	if (conn->context == NULL) {
-		ctx = p_new(conn->pool, struct _data_timout_server, 1);
+		ctx = p_new(conn->pool, struct _data_timeout_server, 1);
 		conn->context = (void*)ctx;
 	} else {
-		ctx = (struct _data_timout_server *)conn->context;
+		ctx = (struct _data_timeout_server *)conn->context;
 	}
 
 	for (;;) {
@@ -1217,24 +1227,24 @@ static void test_data_timout_input(struct server_connection *conn)
 	}
 }
 
-static void test_data_timout_init(struct server_connection *conn)
+static void test_data_timeout_init(struct server_connection *conn)
 {
 	o_stream_nsend_str(
 		conn->conn.output,
 		"220 testserver ESMTP Testfix (Debian/GNU)\r\n");
 }
 
-static void test_server_data_timout(unsigned int index)
+static void test_server_data_timeout(unsigned int index)
 {
-	test_server_init = test_data_timout_init;
-	test_server_input = test_data_timout_input;
+	test_server_init = test_data_timeout_init;
+	test_server_input = test_data_timeout_input;
 	test_server_run(index);
 }
 
 /* client */
 
 static bool
-test_client_data_timout(const struct smtp_submit_settings *submit_set)
+test_client_data_timeout(const struct smtp_submit_settings *submit_set)
 {
 	time_t time;
 	const char *error = NULL;
@@ -1264,8 +1274,8 @@ static void test_data_timeout(void)
 	test_begin("data timeout");
 	test_expect_errors(1);
 	test_run_client_server(&smtp_submit_set,
-			       test_client_data_timout,
-			       test_server_data_timout, 1);
+			       test_client_data_timeout,
+			       test_server_data_timeout, 1);
 	test_end();
 }
 
@@ -1938,10 +1948,10 @@ static void server_connection_accept(void *context ATTR_UNUSED)
 
 	/* accept new client */
 	fd = net_accept(fd_listen, NULL, NULL);
-	if (fd == -1)
+	if (fd == -1) {
+		if (!NET_ACCEPT_ENOCONN(errno))
+			i_fatal("test server: accept() failed: %m");
 		return;
-	if (fd == -2) {
-		i_fatal("test server: accept() failed: %m");
 	}
 
 	server_connection_init(fd);
@@ -2002,7 +2012,9 @@ static int test_open_server_fd(in_port_t *bind_port)
 
 static void test_tmp_dir_init(void)
 {
-	tmp_dir = i_strdup_printf("/tmp/dovecot-test-smtp-client.%s.%s",
+	static unsigned int seq = 0;
+
+	tmp_dir = i_strdup_printf("%s/test-%u.%s.%s", test_dir_get(), seq++,
 				  dec2str(time(NULL)), dec2str(getpid()));
 }
 
@@ -2189,7 +2201,11 @@ int main(int argc, char *argv[])
 	}
 
 	master_service_init_finish(master_service);
-	test_subprocesses_init(debug);
+
+	test_init();
+	event_set_forced_debug(test_event, debug);
+	test_dir_init("smtp-submit");
+	test_subprocesses_init();
 
 	/* listen on localhost */
 	i_zero(&bind_ip);
@@ -2198,7 +2214,6 @@ int main(int argc, char *argv[])
 
 	ret = test_run(test_functions);
 
-	test_subprocesses_deinit();
 	main_deinit();
 	master_service_deinit(&master_service);
 

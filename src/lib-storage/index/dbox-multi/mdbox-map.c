@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -872,7 +872,8 @@ mdbox_map_file_try_append(struct mdbox_map_append_context *ctx,
 		if (errno != ENOENT)
 			e_error(event, "stat(%s) failed: %m", file->cur_path);
 		/* the file was unlinked between opening and locking it. */
-	} else if (st.st_size != rec->offset + rec->size &&
+	} else if (rec->size != 0 &&
+		   st.st_size != rec->offset + rec->size &&
 		   /* check if there's any garbage at the end of file.
 		      note that there may be valid messages added by another
 		      session before we locked it (but after we refreshed
@@ -1049,6 +1050,11 @@ mdbox_map_find_appendable_file(struct mdbox_map_append_context *ctx,
 			break;
 		}
 
+		/* Don't append to the index if the record indicates this is the
+		   last mail with special size=0. */
+		if (rec->size == 0)
+			continue;
+
 		/* first lookup: this should be enough usually, but we can't
 		   be sure until after locking. also if messages were recently
 		   moved, this message might not be the last one in the file. */
@@ -1130,7 +1136,7 @@ int mdbox_map_append_next(struct mdbox_map_append_context *ctx,
 	append = array_append_space(&ctx->appends);
 	append->file_append = file_append;
 	append->offset = (*output_r)->offset;
-	append->size = (uint32_t)-1;
+	append->size = UOFF_T_MAX;
 	if (!existing) {
 		i_assert(file_append->first_append_offset == 0);
 		file_append->first_append_offset = file_append->output->offset;
@@ -1167,7 +1173,7 @@ void mdbox_map_append_finish(struct mdbox_map_append_context *ctx)
 	appends = array_get_modifiable(&ctx->appends, &count);
 	i_assert(count > 0);
 	last = &appends[count-1];
-	i_assert(last->size == (uint32_t)-1);
+	i_assert(last->size == UOFF_T_MAX);
 
 	cur_offset = last->file_append->output->offset;
 	i_assert(cur_offset >= last->offset);
@@ -1183,7 +1189,7 @@ void mdbox_map_append_abort(struct mdbox_map_append_context *ctx)
 	unsigned int count;
 
 	appends = array_get_modifiable(&ctx->appends, &count);
-	i_assert(count > 0 && appends[count-1].size == (uint32_t)-1);
+	i_assert(count > 0 && appends[count-1].size == UOFF_T_MAX);
 	array_delete(&ctx->appends, count-1, 1);
 }
 
@@ -1304,12 +1310,11 @@ int mdbox_map_append_assign_map_uids(struct mdbox_map_append_context *ctx,
 		struct mdbox_file *mfile =
 			(struct mdbox_file *)appends[i].file_append->file;
 
-		i_assert(appends[i].offset <= (uint32_t)-1);
-		i_assert(appends[i].size <= (uint32_t)-1);
-
 		rec.file_id = mfile->file_id;
 		rec.offset = appends[i].offset;
-		rec.size = appends[i].size;
+		/* A mail that exceeds 4GB is the final mail in the record and
+		   thusly is registered with size=0. */
+		rec.size = (appends[i].size > UINT32_MAX) ? 0 : appends[i].size;
 
 		mail_index_append(ctx->trans, 0, &seq);
 		mail_index_update_ext(ctx->trans, seq, ctx->map->map_ext_id,
@@ -1371,7 +1376,9 @@ int mdbox_map_append_move(struct mdbox_map_append_context *ctx,
 		i_assert(j < appends_count);
 		rec.file_id = mfile->file_id;
 		rec.offset = appends[j].offset;
-		rec.size = appends[j].size;
+		/* A mail that exceeds 4GB is the final mail in the record and
+		   thusly is registered with size=0. */
+		rec.size = (appends[j].size > UINT32_MAX) ? 0 : appends[j].size;
 		j++;
 
 		if (!mail_index_lookup_seq(ctx->atomic->sync_view,

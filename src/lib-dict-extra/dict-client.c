@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -20,8 +20,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-/* Abort dict lookup after this many milliseconds. */
-#define DICT_CLIENT_REQUEST_TIMEOUT_MSECS 30000
+/* Abort dict lookup after this many milliseconds. This must be higher than
+   the backend (e.g. Cassandra/SQL) request timeout, so those queries are
+   aborted with a proper error before this dict timeout is reached. */
+#define DICT_CLIENT_REQUEST_TIMEOUT_MSECS 65000
 /* When dict lookup timeout is reached, wait a bit longer if the last dict
    ioloop wait was shorter than this. */
 #define DICT_CLIENT_REQUEST_TIMEOUT_MIN_LAST_IOLOOP_WAIT_MSECS 1000
@@ -108,13 +110,11 @@ struct client_dict_transaction_context {
 	struct dict_transaction_context ctx;
 	struct client_dict_transaction_context *prev, *next;
 
-	char *first_query;
 	char *error;
 
 	unsigned int id;
-	unsigned int query_count;
-
-	bool sent_begin:1;
+	string_t *queries;
+	bool can_retry;
 };
 
 struct dict_proxy_settings {
@@ -183,6 +183,26 @@ client_dict_cmd_init(struct client_dict *dict, const char *query)
 	cmd->start_dict_ioloop_usecs = io_wait_timer_get_usecs(dict->wait_timer);
 	cmd->start_lock_usecs = file_lock_wait_get_total_usecs();
 	return cmd;
+}
+
+static const char *client_dict_cmd_get_log_query(struct client_dict_cmd *cmd)
+{
+	const char *p = cmd->query, *last_lf = NULL, *first_trans_query = NULL;
+	unsigned int query_count = 0;
+
+	while ((p = strchr(p, '\n')) != NULL) {
+		if (first_trans_query == NULL)
+			first_trans_query = p + 1;
+		last_lf = p;
+		query_count++;
+		p++;
+	}
+	i_assert(last_lf != NULL);
+
+	if (query_count == 1)
+		return t_strdup_until(cmd->query, last_lf);
+	return t_strdup_printf("(%u queries in transaction, first=%s)",
+			       query_count, t_strcut(first_trans_query, '\n'));
 }
 
 static void client_dict_cmd_ref(struct client_dict_cmd *cmd)
@@ -266,24 +286,20 @@ static void client_dict_input_timeout(struct client_dict_cmd *cmd)
 		"(%u commands pending, oldest sent %lld.%03lld secs ago: %s, %s)",
 		connection_input_timeout_reason(&dict->conn.conn),
 		array_count(&dict->cmds),
-		cmd_diff/1000, cmd_diff%1000, cmd->query,
+		cmd_diff/1000, cmd_diff%1000, client_dict_cmd_get_log_query(cmd),
 		dict_wait_warnings(cmd)), &error);
 }
 
 static int
 client_dict_cmd_query_send(struct client_dict *dict, const char *query)
 {
-	struct const_iovec iov[2];
+	size_t len = strlen(query);
 	ssize_t ret;
 
-	iov[0].iov_base = query;
-	iov[0].iov_len = strlen(query);
-	iov[1].iov_base = "\n";
-	iov[1].iov_len = 1;
-	ret = o_stream_sendv(dict->conn.conn.output, iov, 2);
+	ret = o_stream_send(dict->conn.conn.output, query, len);
 	if (ret < 0)
 		return -1;
-	i_assert((size_t)ret == iov[0].iov_len + 1);
+	i_assert((size_t)ret == len);
 	return 0;
 }
 
@@ -348,58 +364,20 @@ client_dict_cmd_send(struct client_dict *dict, struct client_dict_cmd **_cmd,
 	}
 }
 
-static bool
-client_dict_transaction_send_begin(struct client_dict_transaction_context *ctx,
-				   const struct dict_op_settings_private *set)
-{
-	struct client_dict *dict = (struct client_dict *)ctx->ctx.dict;
-	struct client_dict_cmd *cmd;
-	const char *query, *error;
-
-	i_assert(ctx->error == NULL);
-
-	ctx->sent_begin = TRUE;
-
-	/* transactions commands don't have replies. only COMMIT has. */
-	query = t_strdup_printf("%c%u\t%s\t%u", DICT_PROTOCOL_CMD_BEGIN,
-				ctx->id,
-				set->username == NULL ? "" : str_tabescape(set->username),
-				set->expire_secs);
-	cmd = client_dict_cmd_init(dict, query);
-	cmd->no_replies = TRUE;
-	cmd->retry_errors = TRUE;
-	if (!client_dict_cmd_send(dict, &cmd, &error)) {
-		ctx->error = i_strdup(error);
-		return FALSE;
-	}
-	return TRUE;
-}
-
 static void
 client_dict_send_transaction_query(struct client_dict_transaction_context *ctx,
 				   const char *query)
 {
-	struct client_dict *dict = (struct client_dict *)ctx->ctx.dict;
-	const struct dict_op_settings_private *set = &ctx->ctx.set;
-	struct client_dict_cmd *cmd;
-	const char *error;
-
-	if (ctx->error != NULL)
-		return;
-
-	if (!ctx->sent_begin) {
-		if (!client_dict_transaction_send_begin(ctx, set))
-			return;
+	if (str_len(ctx->queries) == 0) {
+		const struct dict_op_settings_private *set = &ctx->ctx.set;
+		str_printfa(ctx->queries, "%c%u\t%s\t%u\n",
+			    DICT_PROTOCOL_CMD_BEGIN, ctx->id,
+			    set->username == NULL ? "" :
+			    str_tabescape(set->username),
+			    set->expire_secs);
 	}
 
-	ctx->query_count++;
-	if (ctx->first_query == NULL)
-		ctx->first_query = i_strdup(query);
-
-	cmd = client_dict_cmd_init(dict, query);
-	cmd->no_replies = TRUE;
-	if (!client_dict_cmd_send(dict, &cmd, &error))
-		ctx->error = i_strdup(error);
+	str_append(ctx->queries, query);
 }
 
 static bool client_dict_is_finished(struct client_dict *dict)
@@ -586,16 +564,7 @@ client_dict_abort_commands(struct client_dict *dict, const char *reason)
 
 static void client_dict_disconnect(struct client_dict *dict, const char *reason)
 {
-	struct client_dict_transaction_context *ctx, *next;
-
 	client_dict_abort_commands(dict, reason);
-
-	/* all transactions that have sent BEGIN are no longer valid */
-	for (ctx = dict->transactions; ctx != NULL; ctx = next) {
-		next = ctx->next;
-		if (ctx->sent_begin && ctx->error == NULL)
-			ctx->error = i_strdup(reason);
-	}
 
 	timeout_remove(&dict->to_idle);
 	connection_disconnect(&dict->conn.conn);
@@ -660,8 +629,13 @@ static void dict_conn_destroy(struct connection *_conn)
 {
 	struct dict_client_connection *conn =
 		(struct dict_client_connection *)_conn;
+	const char *error;
 
-	client_dict_disconnect(conn->dict, connection_disconnect_reason(_conn));
+	(void)client_dict_reconnect(conn->dict, t_strdup_printf(
+		"Dict server connection failed: %s "
+		"(%u commands pending)",
+		connection_disconnect_reason(_conn),
+		array_count(&conn->dict->cmds)), &error);
 }
 
 static const struct connection_settings dict_conn_set = {
@@ -896,7 +870,7 @@ client_dict_lookup_async_callback(struct client_dict_cmd *cmd,
 	default:
 		result.error = t_strdup_printf(
 			"dict-client: Invalid lookup '%s' reply: %c%s",
-			cmd->query, reply, value);
+			client_dict_cmd_get_log_query(cmd), reply, value);
 		/* This is already the command's callback being called.
 		   Make sure it is not called again by
 		   dict_cmd_callback_error() */
@@ -915,7 +889,7 @@ client_dict_lookup_async_callback(struct client_dict_cmd *cmd,
 		   diff >= (int)dict->set->dict_proxy_slow_warn) {
 		e_warning(dict->conn.conn.event, "dict lookup took %s: %s",
 			  dict_warnings_sec(cmd, diff, extra_args),
-			  cmd->query);
+			  client_dict_cmd_get_log_query(cmd));
 	}
 
 	dict_pre_api_callback(&dict->dict);
@@ -932,7 +906,7 @@ client_dict_lookup_async(struct dict *_dict, const struct dict_op_settings *set,
 	struct client_dict_cmd *cmd;
 	const char *query;
 
-	query = t_strdup_printf("%c%s\t%s", DICT_PROTOCOL_CMD_LOOKUP,
+	query = t_strdup_printf("%c%s\t%s\n", DICT_PROTOCOL_CMD_LOOKUP,
 				str_tabescape(key),
 				set->username == NULL ? "" : str_tabescape(set->username));
 	cmd = client_dict_cmd_init(dict, query);
@@ -1030,7 +1004,7 @@ client_dict_iter_api_callback(struct client_dict_iterate_context *ctx,
 			   diff >= (int)dict->set->dict_proxy_slow_warn) {
 			e_warning(dict->conn.conn.event, "dict iteration took %s: %s",
 				  dict_warnings_sec(cmd, diff, extra_args),
-				  cmd->query);
+				  client_dict_cmd_get_log_query(cmd));
 		}
 	}
 	if (ctx->ctx.async_callback == NULL) {
@@ -1150,6 +1124,7 @@ client_dict_iterate_cmd_send(struct client_dict_iterate_context *ctx)
 	str_append_tabescaped(query, ctx->path);
 	str_append_c(query, '\t');
 	str_append_tabescaped(query, set->username == NULL ? "" : set->username);
+	str_append_c(query, '\n');
 
 	cmd = client_dict_cmd_init(dict, str_c(query));
 	cmd->iter = ctx;
@@ -1231,6 +1206,8 @@ client_dict_transaction_init(struct dict *_dict)
 	ctx = i_new(struct client_dict_transaction_context, 1);
 	ctx->ctx.dict = _dict;
 	ctx->id = ++dict->transaction_id_counter;
+	ctx->queries = str_new(default_pool, 256);
+	ctx->can_retry = TRUE;
 
 	DLLIST_PREPEND(&dict->transactions, ctx);
 	return &ctx->ctx;
@@ -1242,7 +1219,7 @@ client_dict_transaction_free(struct client_dict_transaction_context **_ctx)
 	struct client_dict_transaction_context *ctx = *_ctx;
 
 	*_ctx = NULL;
-	i_free(ctx->first_query);
+	str_free(&ctx->queries);
 	i_free(ctx->error);
 	i_free(ctx);
 }
@@ -1307,10 +1284,9 @@ client_dict_transaction_commit_callback(struct client_dict_cmd *cmd,
 	} else if (!cmd->background && !cmd->trans->ctx.set.no_slowness_warning &&
 		   diff >= (int)dict->set->dict_proxy_slow_warn) {
 		e_warning(dict->conn.conn.event, "dict commit took %s: "
-			  "%s (%u commands, first: %s)",
+			  "%s",
 			  dict_warnings_sec(cmd, diff, extra_args),
-			  cmd->query, cmd->trans->query_count,
-			  cmd->trans->first_query);
+			  client_dict_cmd_get_log_query(cmd));
 	}
 	client_dict_transaction_free(&cmd->trans);
 
@@ -1330,14 +1306,15 @@ client_dict_transaction_commit(struct dict_transaction_context *_ctx,
 		(struct client_dict_transaction_context *)_ctx;
 	struct client_dict *dict = (struct client_dict *)_ctx->dict;
 	struct client_dict_cmd *cmd;
-	const char *query;
 
 	DLLIST_REMOVE(&dict->transactions, ctx);
 
-	if (ctx->sent_begin && ctx->error == NULL) {
-		query = t_strdup_printf("%c%u", DICT_PROTOCOL_CMD_COMMIT, ctx->id);
-		cmd = client_dict_cmd_init(dict, query);
+	if (str_len(ctx->queries) > 0 && ctx->error == NULL) {
+		str_printfa(ctx->queries, "%c%u\n", DICT_PROTOCOL_CMD_COMMIT,
+			    ctx->id);
+		cmd = client_dict_cmd_init(dict, str_c(ctx->queries));
 		cmd->trans = ctx;
+		cmd->retry_errors = ctx->can_retry;
 
 		cmd->callback = client_dict_transaction_commit_callback;
 		cmd->api_callback.commit = callback;
@@ -1374,14 +1351,6 @@ client_dict_transaction_rollback(struct dict_transaction_context *_ctx)
 		(struct client_dict_transaction_context *)_ctx;
 	struct client_dict *dict = (struct client_dict *)_ctx->dict;
 
-	if (ctx->sent_begin) {
-		const char *query;
-
-		query = t_strdup_printf("%c%u", DICT_PROTOCOL_CMD_ROLLBACK,
-					ctx->id);
-		client_dict_send_transaction_query(ctx, query);
-	}
-
 	DLLIST_REMOVE(&dict->transactions, ctx);
 	client_dict_transaction_free(&ctx);
 	client_dict_add_timeout(dict);
@@ -1394,7 +1363,7 @@ static void client_dict_set(struct dict_transaction_context *_ctx,
 		(struct client_dict_transaction_context *)_ctx;
 	const char *query;
 
-	query = t_strdup_printf("%c%u\t%s\t%s",
+	query = t_strdup_printf("%c%u\t%s\t%s\n",
 				DICT_PROTOCOL_CMD_SET, ctx->id,
 				str_tabescape(key),
 				str_tabescape(value));
@@ -1408,7 +1377,7 @@ static void client_dict_unset(struct dict_transaction_context *_ctx,
 		(struct client_dict_transaction_context *)_ctx;
 	const char *query;
 
-	query = t_strdup_printf("%c%u\t%s",
+	query = t_strdup_printf("%c%u\t%s\n",
 				DICT_PROTOCOL_CMD_UNSET, ctx->id,
 				str_tabescape(key));
 	client_dict_send_transaction_query(ctx, query);
@@ -1421,7 +1390,10 @@ static void client_dict_atomic_inc(struct dict_transaction_context *_ctx,
 		(struct client_dict_transaction_context *)_ctx;
 	const char *query;
 
-	query = t_strdup_printf("%c%u\t%s\t%lld",
+	/* Retrying may cause it to increment too many times */
+	ctx->can_retry = FALSE;
+
+	query = t_strdup_printf("%c%u\t%s\t%lld\n",
 				DICT_PROTOCOL_CMD_ATOMIC_INC,
 				ctx->id, str_tabescape(key), diff);
 	client_dict_send_transaction_query(ctx, query);
@@ -1434,7 +1406,7 @@ static void client_dict_set_timestamp(struct dict_transaction_context *_ctx,
 		(struct client_dict_transaction_context *)_ctx;
 	const char *query;
 
-	query = t_strdup_printf("%c%u\t%s\t%u",
+	query = t_strdup_printf("%c%u\t%s\t%u\n",
 				DICT_PROTOCOL_CMD_TIMESTAMP,
 				ctx->id, dec2str(ts->tv_sec),
 				(unsigned int)ts->tv_nsec);
@@ -1448,7 +1420,7 @@ static void client_dict_set_hide_log_values(struct dict_transaction_context *_ct
                container_of(_ctx, struct client_dict_transaction_context, ctx);
        const char *query;
 
-       query = t_strdup_printf("%c%u\t%s",
+       query = t_strdup_printf("%c%u\t%s\n",
                                DICT_PROTOCOL_CMD_HIDE_LOG_VALUES,
                                ctx->id,
                                hide_log_values ? "yes" : "no");

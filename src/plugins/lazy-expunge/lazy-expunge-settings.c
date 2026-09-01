@@ -1,4 +1,4 @@
-/* Copyright (c) 2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "settings-parser.h"
@@ -10,13 +10,13 @@
 
 static struct setting_define lazy_expunge_setting_defines[] = {
 	DEF(BOOL, lazy_expunge_only_last_instance),
-	DEF(STR, lazy_expunge_mailbox),
+	DEF(STR_NFC, lazy_expunge_mailbox),
 
 	SETTING_DEFINE_LIST_END
 };
 
 static struct lazy_expunge_settings lazy_expunge_default_settings = {
-	.lazy_expunge_only_last_instance = FALSE,
+	.lazy_expunge_only_last_instance = TRUE,
 	.lazy_expunge_mailbox = "",
 };
 

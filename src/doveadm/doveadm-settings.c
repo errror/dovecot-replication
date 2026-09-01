@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -29,7 +29,11 @@ struct service_settings doveadm_service_settings = {
 	.drop_priv_before_exec = FALSE,
 
 	.client_limit = 1,
+#ifdef DOVECOT_PRO_EDITION
+	.restart_request_count = 1000,
+#else
 	.restart_request_count = 1,
+#endif
 
 	.unix_listeners = ARRAY_INIT,
 	.fifo_listeners = ARRAY_INIT,
@@ -43,7 +47,9 @@ const struct setting_keyvalue doveadm_service_settings_defaults[] = {
 	{ "unix_listener/doveadm-server/type", "tcp" },
 	{ "unix_listener/doveadm-server/mode", "0600" },
 
-	{ "service_extra_groups", "$SET:default_internal_group" },
+	/* This needs to be here explicitly until the backwards compatibility
+	   is removed from settings-history-core.txt */
+	{ "service_extra_groups", "" },
 
 	{ NULL, NULL }
 };
@@ -100,7 +106,7 @@ const struct doveadm_settings doveadm_default_settings = {
 	.doveadm_password = "",
 	.doveadm_allowed_commands = ARRAY_INIT,
 	.dsync_alt_char = "_",
-	.dsync_remote_cmd = "ssh -l%{login} %{host} doveadm dsync-server -u%{user} -U",
+	.dsync_remote_cmd = "ssh -l%{login} %{host} doveadm dsync-server -u%{user}",
 	.dsync_features = "",
 	.dsync_hashed_headers = "Date Message-ID",
 	.dsync_commit_msgs_interval = 100,

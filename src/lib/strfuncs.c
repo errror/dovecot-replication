@@ -1,12 +1,19 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /* @UNSAFE: whole file */
 
+#include "config.h"
+#ifdef HAVE_MEMRCHR
+#  define _GNU_SOURCE
+#endif
 #include "lib.h"
 #include "str.h"
 #include "printf-format-fix.h"
 #include "strfuncs.h"
 #include "array.h"
+#include "hash.h"
+#include "hmac.h"
+#include "sha2.h"
 
 #include <stdio.h>
 #include <limits.h>
@@ -130,7 +137,7 @@ char *t_noalloc_strdup_vprintf(const char *format, va_list args,
 	char *tmp;
 	size_t init_size;
 	int ret;
-#ifdef DEBUG
+#ifdef DEBUG_FAST
 	int old_errno = errno;
 #endif
 
@@ -154,7 +161,7 @@ char *t_noalloc_strdup_vprintf(const char *format, va_list args,
 		ret = vsnprintf(tmp, *size_r, format, args2);
 		i_assert((unsigned int)ret == *size_r-1);
 	}
-#ifdef DEBUG
+#ifdef DEBUG_FAST
 	/* we rely on errno not changing. it shouldn't. */
 	i_assert(errno == old_errno);
 #endif
@@ -196,7 +203,7 @@ char *vstrconcat(const char *str1, va_list args, size_t *ret_len)
 
 		if (i + len >= bufsize) {
 			/* need more memory */
-			bufsize = nearest_power(i + len + 1);
+			bufsize = nearest_power(MALLOC_ADD3(i, len, 1));
 			temp = t_buffer_reget(temp, bufsize);
 		}
 
@@ -236,7 +243,7 @@ char *p_strconcat(pool_t pool, const char *str1, ...)
 	return ret;
 }
 
-static void *t_memdup_noconst(const void *data, size_t size)
+void *t_memdup_noconst(const void *data, size_t size)
 {
 	void *mem = t_malloc_no0(size);
 	memcpy(mem, data, size);
@@ -268,7 +275,7 @@ const char *t_strdup_empty(const char *str)
 	return t_strdup(str);
 }
 
-const char *t_strdup_until(const void *start, const void *end)
+char *t_strdup_until_noconst(const void *start, const void *end)
 {
 	char *mem;
 	size_t size;
@@ -281,6 +288,11 @@ const char *t_strdup_until(const void *start, const void *end)
 	memcpy(mem, start, size);
 	mem[size] = '\0';
 	return mem;
+}
+
+const char *t_strdup_until(const void *start, const void *end)
+{
+	return t_strdup_until_noconst(start, end);
 }
 
 const char *t_strndup(const void *str, size_t max_chars)
@@ -592,6 +604,22 @@ int i_memcasecmp(const void *p1, const void *p2, size_t size)
 	return 0;
 }
 
+void *i_memrchr(const void *data, int c, size_t size)
+{
+#ifdef HAVE_MEMRCHR
+	return memrchr(data, c, size);
+#else
+	const unsigned char *p = data;
+
+	while (size > 0) {
+		size--;
+		if (p[size] == (unsigned char)c)
+			return (void *)(p + size);
+	}
+	return NULL;
+#endif
+}
+
 int i_strcmp_p(const char *const *p1, const char *const *p2)
 {
 	return strcmp(*p1, *p2);
@@ -630,6 +658,32 @@ bool str_equals_timing_almost_safe(const char *s1, const char *s2)
 	   above loop early. */
 	timing_safety_unoptimization = ret;
 	return ret == 0;
+}
+
+bool str_equals_hash_timing_safe(const char *s1, const char *s2)
+{
+	struct hmac_context ctx;
+	unsigned char digest1[SHA256_RESULTLEN];
+	unsigned char digest2[SHA256_RESULTLEN];
+
+	/* Compare HMAC-SHA256 digests of the inputs rather than the inputs
+	   themselves. The digest length is constant, so the subsequent
+	   mem_equals_timing_safe() leaks no length information. The HMAC
+	   times depend on the input lengths, but each side's length is either
+	   a deployment constant (for the secret) or already known to the
+	   attacker (for their own input), so neither leaks a useful signal.
+	   hash_iv keys the HMAC to prevent precomputation. */
+	hmac_init(&ctx, (const unsigned char *)&hash_iv, sizeof(hash_iv),
+		  &hash_method_sha256);
+	hmac_update(&ctx, s1, strlen(s1));
+	hmac_final(&ctx, digest1);
+
+	hmac_init(&ctx, (const unsigned char *)&hash_iv, sizeof(hash_iv),
+		  &hash_method_sha256);
+	hmac_update(&ctx, s2, strlen(s2));
+	hmac_final(&ctx, digest2);
+
+	return mem_equals_timing_safe(digest1, digest2, sizeof(digest1));
 }
 
 size_t
@@ -753,10 +807,8 @@ split_str_slow(pool_t pool, const char *data, const char *separators, bool space
 			/* separator found */
 			if (count+1 >= alloc_count) {
 				new_alloc_count = nearest_power(alloc_count+1);
-				array = p_realloc(pool, array,
-						  sizeof(char *) * alloc_count,
-						  sizeof(char *) *
-						  new_alloc_count);
+				array = p_realloc_type(pool, array, char *,
+						       alloc_count, new_alloc_count);
 				alloc_count = new_alloc_count;
 			}
 
@@ -802,10 +854,8 @@ split_str_fast(pool_t pool, const char *data, char sep)
 		/* separator found */
 		if (count+1 >= alloc_count) {
 			new_alloc_count = nearest_power(alloc_count+1);
-			array = p_realloc(pool, array,
-					  sizeof(char *) * alloc_count,
-					  sizeof(char *) *
-					  new_alloc_count);
+			array = p_realloc_type(pool, array, char *,
+					       alloc_count, new_alloc_count);
 			alloc_count = new_alloc_count;
 		}
 		*str++ = '\0';
@@ -885,7 +935,7 @@ p_strarray_join_n(pool_t pool, const char *const *arr, unsigned int arr_len,
 
 	for (i = 0; i < arr_len; i++) {
 		len = strlen(arr[i]);
-		needed_space = pos + len + sep_len + 1;
+		needed_space = MALLOC_ADD(MALLOC_ADD3(pos, len, sep_len), 1);
 		if (needed_space > alloc_len) {
 			alloc_len = nearest_power(needed_space);
 			str = t_buffer_reget(str, alloc_len);
@@ -953,9 +1003,10 @@ const char **p_strarray_dup(pool_t pool, const char *const *arr)
 	char *p;
 	size_t len, size = sizeof(const char *);
 
-	/* @UNSAFE: integer overflow checks are missing */
-	for (i = 0; arr[i] != NULL; i++)
-		size += sizeof(const char *) + strlen(arr[i]) + 1;
+	for (i = 0; arr[i] != NULL; i++) {
+		size = MALLOC_ADD3(size, sizeof(const char *) + 1,
+				   strlen(arr[i]));
+	}
 
 	ret = p_malloc(pool, size);
 	p = PTR_OFFSET(ret, sizeof(const char *) * (i + 1));

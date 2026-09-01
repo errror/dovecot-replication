@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -588,13 +588,13 @@ static bool
 mail_message_has_attachment(struct message_part *part,
 			    const struct message_part_attachment_settings *set)
 {
-	for (; part != NULL; part = part->next) {
-		if (message_part_is_attachment(part, set) ||
-		    mail_message_has_attachment(part->children, set))
-			return TRUE;
-	}
+	bool has_attachment = FALSE;
+	for (; part != NULL && !has_attachment; part = part->next) T_BEGIN {
+		has_attachment = message_part_is_attachment(part, set) ||
+			mail_message_has_attachment(part->children, set);
+	} T_END;
 
-	return FALSE;
+	return has_attachment;
 }
 
 bool mail_has_attachment_keywords(struct mail *mail)
@@ -708,6 +708,14 @@ void mail_opened_event(struct mail *mail)
 {
 	struct mail_private *pmail =
 		container_of(mail, struct mail_private, mail);
+
+	/* If istream is opened twice for the same mail, count it as a single
+	   mail_opened event. Their cost is effectively the same, so having
+	   two events would just be confusing the statistics. */
+	if (pmail->mail_opened_event_sent)
+		return;
+	pmail->mail_opened_event_sent = TRUE;
+
 	struct event_passthrough *e =
 		event_create_passthrough(mail_event(mail))->
 		set_name("mail_opened")->

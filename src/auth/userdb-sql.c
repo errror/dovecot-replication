@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "userdb.h"
@@ -7,7 +7,6 @@
 
 #include "settings.h"
 #include "settings-parser.h"
-#include "auth-cache.h"
 #include "db-sql.h"
 
 #include <string.h>
@@ -112,10 +111,11 @@ static void sql_query_callback(struct sql_result *sql_result,
 	i_free(sql_request);
 }
 
-static const char *userdb_sql_escape(const char *str, void *context)
+static int userdb_sql_escape(const char *str, const char **output_r,
+			     void *context, const char **error_r)
 {
 	struct sql_db *db = context;
-	return sql_escape_string(db, str);
+	return sql_escape_string(db, str, output_r, error_r);
 }
 
 static void userdb_sql_lookup(struct auth_request *auth_request,
@@ -128,7 +128,7 @@ static void userdb_sql_lookup(struct auth_request *auth_request,
 	const struct userdb_sql_settings *set;
 	const char *error;
 
-	struct settings_get_params params = {
+	const struct settings_get_params params = {
 		.escape_func = userdb_sql_escape,
 		.escape_context = module->db,
 	};
@@ -180,9 +180,13 @@ userdb_sql_iterate_init(struct auth_request *auth_request,
 	ctx->ctx.context = context;
 	auth_request_ref(auth_request);
 
-	if (settings_get(authdb_event(auth_request),
-			 &userdb_sql_setting_parser_info, 0,
-			 &set, &error) < 0) {
+	const struct settings_get_params params = {
+		.escape_func = userdb_sql_escape,
+		.escape_context = module->db,
+	};
+	if (settings_get_params(authdb_event(auth_request),
+				&userdb_sql_setting_parser_info, &params,
+				&set, &error) < 0) {
 		e_error(authdb_event(auth_request), "%s", error);
 		ctx->ctx.failed = TRUE;
 		return &ctx->ctx;
@@ -292,6 +296,7 @@ static int userdb_sql_iterate_deinit(struct userdb_iterate_context *_ctx)
 
 static int
 userdb_sql_preinit(pool_t pool, struct event *event,
+		   const struct userdb_parameters *userdb_params,
 		   struct userdb_module **module_r, const char **error_r)
 {
 	struct sql_userdb_module *module;
@@ -318,13 +323,13 @@ userdb_sql_preinit(pool_t pool, struct event *event,
 		return -1;
 	}
 
-	module->module.default_cache_key =
-		auth_cache_parse_key_and_fields(pool, set->query,
-						&post_set->fields, "sql");
+	int ret = userdb_set_cache_key(&module->module, userdb_params, pool,
+				       set->query, &post_set->fields, "sql",
+				       error_r);
 	settings_free(set);
 	settings_free(post_set);
 	*module_r = &module->module;
-	return 0;
+	return ret;
 }
 
 static void userdb_sql_init(struct userdb_module *_module)

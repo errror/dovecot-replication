@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -50,7 +50,7 @@ struct quota_imapc_settings {
 	SETTING_DEFINE_STRUCT_##type(#name, name, struct quota_imapc_settings)
 static const struct setting_define quota_imapc_setting_defines[] = {
 	{ .type = SET_FILTER_NAME, .key = "quota_imapc" },
-	DEF(STR, quota_imapc_mailbox_name),
+	DEF(STR_NFC, quota_imapc_mailbox_name),
 	DEF(STR, quota_imapc_root_name),
 
 	SETTING_DEFINE_LIST_END
@@ -282,7 +282,7 @@ imapc_quota_refresh_update(struct quota *quota,
 			root->bytes_last = refresh_root->bytes_cur;
 			root->count_last = refresh_root->count_cur;
 
-			/* If limits are higher than what dovecot can handle
+			/* If limits are greater than what dovecot can handle
 			   consider them unlimited. */
 			if (refresh_root->bytes_limit > INT64_MAX)
 				root->root.bytes_limit = 0;

@@ -11,7 +11,9 @@ struct master_status {
 	pid_t pid;
 	/* uid is used to check for old/invalid status messages */
 	unsigned int uid;
-	/* number of new connections process is currently accepting */
+	/* number of new connections process is currently accepting.
+	   UINT_MAX = it has reached restart_request_count and is only
+	   handling existing connections. */
 	unsigned int available_count;
 };
 
@@ -63,6 +65,9 @@ enum master_login_state {
    timeout in seconds. */
 #define MASTER_SERVICE_IDLE_KILL_INTERVAL_ENV "IDLE_KILL_INTERVAL"
 
+/* getenv(MASTER_REUSE_PORT_ENV) is non-NULL if service_reuse_port=yes */
+#define MASTER_REUSE_PORT_ENV "REUSE_PORT"
+
 /* getenv(MASTER_CONFIG_FILE_ENV) provides path to configuration file. */
 #define MASTER_CONFIG_FILE_ENV "CONFIG_FILE"
 
@@ -113,6 +118,12 @@ enum master_login_state {
    socket. */
 #define DOVECOT_STATS_WRITER_SOCKET_PATH "STATS_WRITER_SOCKET_PATH"
 
+/* If master has already accepted a connection,
+   getenv(DOVECOT_ACCEPTED_CLIENT_LISTENER_FD_ENV) contains the listener's
+   file descriptor for the accepted connection. */
+#define DOVECOT_ACCEPTED_CLIENT_LISTENER_FD_ENV \
+	"DOVECOT_ACCEPTED_CLIENT_LISTENER_FD"
+
 /* Write pipe to anvil. */
 #define MASTER_ANVIL_FD 3
 /* Anvil reads new log fds from this fd */
@@ -127,13 +138,16 @@ enum master_login_state {
 #define MASTER_DEAD_FD 6
 /* Configuration file descriptor. */
 #define MASTER_CONFIG_FD 7
+/* If master pre-accepted a connection for a child process, this is the fd
+   number where it's passed to. */
+#define MASTER_ACCEPTED_CLIENT_FD 8
 /* First file descriptor where process is expected to be listening.
    The file descriptor count is given in -s parameter, defaulting to 1.
 
    master_status.available_count reports how many accept()s we're still
    accepting. Once no children are listening, master will do it and create
    new child processes when needed. */
-#define MASTER_LISTEN_FD_FIRST 8
+#define MASTER_LISTEN_FD_FIRST 9
 
 /* Timeouts: base everything on how long we can wait for login clients. */
 #define MASTER_LOGIN_TIMEOUT_SECS (3*60)

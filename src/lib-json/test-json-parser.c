@@ -1,8 +1,9 @@
-/* Copyright (c) 2017-2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
 #include "istream.h"
+#include "istream-private.h"
 #include "ostream.h"
 #include "istream-base64.h"
 #include "test-common.h"
@@ -807,7 +808,7 @@ static void test_json_parse_valid(void)
 
 		for (pos = 0; pos <= text_len && ret == 0; pos++) {
 			test_istream_set_size(input, pos);
-			ret = json_parse_more(parser, &error);
+			ret = json_parse_more(parser, NULL, &error);
 			if (ret < 0) {
 				if (debug)
 					i_debug("DATA: `%s'", text);
@@ -824,7 +825,7 @@ static void test_json_parse_valid(void)
 			&test->limits, test->flags, NULL, NULL);
 
 		test_istream_set_size(input, text_len);
-		ret = json_parse_more(parser, &error);
+		ret = json_parse_more(parser, NULL, &error);
 		if (ret < 0) {
 			if (debug)
 				i_debug("DATA: `%s'", text);
@@ -2054,7 +2055,7 @@ invalid_parse_tests[] = {
 	},
 	{
 		// invalid/lone-second-surrogate/input
-		.input = "[\"\\uDFAA (second surrogate on it's own)\"]\n",
+		.input = "[\"\\uDFAA (second surrogate on its own)\"]\n",
 	},
 	{
 		// invalid/negative-integer-starting-with-zero/input
@@ -2357,7 +2358,7 @@ static void test_json_parse_invalid(void)
 
 		for (pos = 0; pos <= text_len && ret == 0; pos++) {
 			test_istream_set_size(input, pos);
-			ret = json_parse_more(parser, &error);
+			ret = json_parse_more(parser, NULL, &error);
 			if (ret < 0)
 				break;
 			if (ret > 0) {
@@ -2375,7 +2376,7 @@ static void test_json_parse_invalid(void)
 			&test->limits, test->flags, NULL, NULL);
 
 		test_istream_set_size(input, text_len);
-		ret = json_parse_more(parser, &error);
+		ret = json_parse_more(parser, NULL, &error);
 		if (ret > 0) {
 			if (debug)
 				i_debug("DATA: `%s'", text);
@@ -2545,7 +2546,7 @@ static void test_json_parse_stream(void)
 			for (pos = 0; pos <= text_len+1000 && ret == 0; pos += trickle_step) {
 				test_istream_set_size(input, pos);
 				if (str_input == NULL) {
-					ret = json_parse_more(parser, &error);
+					ret = json_parse_more(parser, NULL, &error);
 					if (ret < 0)
 						break;
 				}
@@ -2586,7 +2587,7 @@ static void test_json_parse_stream(void)
 		json_parser_enable_string_stream(parser, 0, 10);
 
 		test_istream_set_size(input, text_len);
-		ret = json_parse_more(parser, &error);
+		ret = json_parse_more(parser, NULL, &error);
 		test_out_reason_quiet("parse success (buffered) #1",
 				      ret == 0, error);
 		if (ret == 0 && str_input != NULL) {
@@ -2607,7 +2608,7 @@ static void test_json_parse_stream(void)
 			}
 		}
 		if (ret == 0) {
-			ret = json_parse_more(parser, &error);
+			ret = json_parse_more(parser, NULL, &error);
 			test_out_reason_quiet("parse success (buffered) #2",
 					      ret > 0, error);
 		}
@@ -2621,6 +2622,68 @@ static void test_json_parse_stream(void)
 	} T_END;
 
 	str_free(&buffer);
+}
+
+/*
+ * Test: stream buffer snapshot
+ */
+
+static void test_json_parse_stream_snapshot(void)
+{
+	struct istream *input, *str_input = NULL;
+	struct istream_snapshot *snapshot;
+	struct json_parser *parser;
+	const unsigned char *data;
+	const char *error = NULL;
+	string_t *text;
+	size_t size, snapshot_size;
+	unsigned int i;
+	int ret;
+
+	test_begin("json parse stream snapshot");
+
+	/* Use a long string, so that the stream buffer needs to grow while
+	   the string is being read. */
+	text = t_str_new(1024);
+	str_append_c(text, '"');
+	for (i = 0; i < 500; i++)
+		str_append_c(text, 'a' + (i % 26));
+	str_append_c(text, '"');
+
+	input = test_istream_create_data(str_data(text), str_len(text));
+	test_istream_set_size(input, 10);
+
+	parser = json_parser_init(input, NULL, 0,
+				  &parse_stream_callbacks, &str_input);
+	json_parser_enable_string_stream(parser, 0, 1024);
+
+	ret = json_parse_more(parser, NULL, &error);
+	test_out_reason_quiet("parse success", ret == 0, error);
+	test_assert(str_input != NULL);
+
+	/* Read the beginning of the string and hold on to it. */
+	ret = i_stream_read_more(str_input, &data, &size);
+	test_assert(ret > 0 && size > 0);
+	snapshot_size = size;
+	snapshot = i_stream_default_snapshot(str_input->real_stream, NULL);
+
+	/* Decode the remainder of the string without consuming anything,
+	   which reallocates the stream buffer. */
+	for (i = 20; i <= str_len(text); i += 10) {
+		test_istream_set_size(input, i);
+		(void)i_stream_read(str_input);
+	}
+	i_stream_unref(&str_input);
+
+	/* The snapshotted data must still be intact. */
+	test_assert_memcmp(data, snapshot_size,
+			   str_data(text) + 1, snapshot_size);
+
+	i_stream_snapshot_free(&snapshot);
+	json_parser_deinit(&parser);
+	i_stream_unref(&input);
+
+	test_end();
 }
 
 /*
@@ -2754,7 +2817,7 @@ static void test_json_parse_stream_error(void)
 			for (pos = 0; pos <= text_len+1000 && ret == 0; pos += trickle_step) {
 				test_istream_set_size(input, pos);
 				if (str_input == NULL) {
-					ret = json_parse_more(parser, &error);
+					ret = json_parse_more(parser, NULL, &error);
 					if (ret < 0)
 						break;
 				}
@@ -2794,7 +2857,7 @@ static void test_json_parse_stream_error(void)
 		json_parser_enable_string_stream(parser, 0, 10);
 
 		test_istream_set_size(input, text_len);
-		ret = json_parse_more(parser, &error);
+		ret = json_parse_more(parser, NULL, &error);
 		test_out_reason_quiet("parse failure (buffered) #1",
 				      ret <= 0, error);
 		if (ret == 0 && str_input != NULL) {
@@ -2817,7 +2880,7 @@ static void test_json_parse_stream_error(void)
 			}
 		}
 		if (ret == 0) {
-			ret = json_parse_more(parser, &error);
+			ret = json_parse_more(parser, NULL, &error);
 			test_out_reason_quiet("parse failure (buffered) #2",
 					      ret < 0, error);
 		}
@@ -2839,6 +2902,7 @@ int main(int argc, char *argv[])
 		test_json_parse_valid,
 		test_json_parse_invalid,
 		test_json_parse_stream,
+		test_json_parse_stream_snapshot,
 		test_json_parse_stream_error,
 		NULL
 	};

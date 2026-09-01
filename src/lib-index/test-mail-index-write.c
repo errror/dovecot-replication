@@ -1,7 +1,8 @@
-/* Copyright (c) 2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "test-common.h"
+#include "test-dir.h"
 #include "mail-index-private.h"
 #include "mail-transaction-log-private.h"
 
@@ -54,7 +55,7 @@ int mail_index_create_tmp_file(struct mail_index *index ATTR_UNUSED,
 	test_assert(expect_index_rewrite);
 
 	path = *path_r = t_strconcat(path_prefix, ".tmp", NULL);
-	fd = open(path, O_RDWR|O_CREAT, 0600);
+	fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
 	if (fd == -1) {
 		i_error("creat() failed: %m");
 		return -1;
@@ -107,7 +108,8 @@ static void test_mail_index_write(void)
 		.dir = ".",
 		.fd = -1,
 		.indexid = TEST_INDEXID,
-		.filepath = TEST_INDEX_FNAME,
+		.filepath = p_strconcat(unsafe_data_stack_pool, test_dir_get(),
+					"/", TEST_INDEX_FNAME, NULL),
 		.log_sync_locked = TRUE,
 	};
 
@@ -137,7 +139,6 @@ static void test_mail_index_write(void)
 	test_assert(!index.reopen_main_index);
 
 	event_unref(&index.event);
-	i_unlink(TEST_INDEX_FNAME);
 	test_end();
 }
 
@@ -147,5 +148,7 @@ int main(void)
 		test_mail_index_write,
 		NULL
 	};
+
+	test_dir_init("test-mail-index-write");
 	return test_run(test_functions);
 }

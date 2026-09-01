@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -318,7 +318,8 @@ void smtp_client_command_fail_reply(struct smtp_client_command **_cmd,
 		cmd->delayed_failure = smtp_reply_clone(cmd->pool, reply);
 		cmd->delaying_failure = TRUE;
 		if (conn->to_cmd_fail == NULL) {
-			conn->to_cmd_fail = timeout_add_short(
+			conn->to_cmd_fail = timeout_add_short_to(
+				conn->conn.ioloop,
 				0, smtp_client_commands_fail_delayed, conn);
 		}
 		DLLIST_PREPEND(&conn->cmd_fail_list, cmd);
@@ -342,7 +343,12 @@ void smtp_client_command_fail_reply(struct smtp_client_command **_cmd,
 		e_debug(e->event(), "Failed: %s", smtp_reply_log(reply));
 
 		if (callback != NULL) {
-			while (cmd->replies_seen++ < cmd->replies_expected)
+			/* Generate a callback for each reply that is still
+			   expected, but leave cmd->replies_seen alone: when the
+			   command was already sent, it stays in the wait list
+			   and the peer's replies are still to be consumed by
+			   smtp_client_command_input_reply(). */
+			for (unsigned int i = cmd->replies_seen; i < cmd->replies_expected; i++)
 				(void)callback(reply, context);
 		}
 	}
@@ -509,8 +515,10 @@ static void smtp_client_command_sent(struct smtp_client_command *cmd)
 
 	if (cmd->data == NULL)
 		e_debug(e->event(), "Sent");
-	else {
-		i_assert(str_len(cmd->data) > 2);
+	else if (str_len(cmd->data) <= 2) {
+		i_assert(str_len(cmd->data) == 2);
+		e_debug(e->event(), "Sent empty line");
+	} else {
 		str_truncate(cmd->data, str_len(cmd->data)-2);
 		e_debug(e->event(), "Sent: %s", str_c(cmd->data));
 	}
@@ -707,7 +715,7 @@ smtp_client_command_pipeline_is_open(struct smtp_client_connection *conn)
 	return TRUE;
 }
 
-static void smtp_cient_command_wait(struct smtp_client_command *cmd)
+static void smtp_client_command_wait(struct smtp_client_command *cmd)
 {
 	struct smtp_client_connection *conn = cmd->conn;
 
@@ -746,7 +754,7 @@ static int smtp_client_command_do_send_more(struct smtp_client_connection *conn)
 			return ret;
 
 		/* Command line sent. move command to wait list. */
-		smtp_cient_command_wait(cmd);
+		smtp_client_command_wait(cmd);
 		cmd->state = SMTP_CLIENT_COMMAND_STATE_WAITING;
 	}
 
@@ -839,7 +847,8 @@ void smtp_client_command_submit_after(struct smtp_client_command *cmd,
 			       &conn->cmd_send_queue_tail, cmd);
 		conn->cmd_send_queue_count++;
 		if (conn->to_commands == NULL) {
-			conn->to_commands = timeout_add_short(
+			conn->to_commands = timeout_add_short_to(
+				conn->conn.ioloop,
 				0, smtp_client_command_disconnected, conn);
 		}
 		e_debug(e->event(), "Submitted, but disconnected");

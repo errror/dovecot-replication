@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -9,15 +9,22 @@
 #include "smtp-server-private.h"
 
 static void
-smtp_server_recipient_update_event(struct smtp_server_recipient_private *prcpt)
+smtp_server_recipient_update_event(struct smtp_server_recipient *rcpt)
 {
-	struct event *event = prcpt->rcpt.event;
-	const char *path = smtp_address_encode(prcpt->rcpt.path);
+	struct event *event = rcpt->event;
+	const char *path = smtp_address_encode(rcpt->path);
 
 	event_add_str(event, "rcpt_to", path);
-	smtp_params_rcpt_add_to_event(&prcpt->rcpt.params, event);
-	event_set_append_log_prefix(
-		event, t_strdup_printf("rcpt %s: ", str_sanitize(path, 128)));
+	smtp_params_rcpt_add_to_event(&rcpt->params, event);
+	if (rcpt->trans == NULL) {
+		event_set_append_log_prefix(event,
+			t_strdup_printf("rcpt %s: ", str_sanitize(path, 128)));
+	} else {
+		event_add_int(event, "rcpt_index", rcpt->index);
+		event_set_append_log_prefix(event,
+			t_strdup_printf("rcpt %s [%u]: ",
+					str_sanitize(path, 128), rcpt->index));
+	}
 }
 
 static void
@@ -45,7 +52,7 @@ smtp_server_recipient_create_event(struct smtp_server_recipient_private *prcpt)
 	   remains. */
 	event_drop_parent_log_prefixes(rcpt->event, 1);
 
-	smtp_server_recipient_update_event(prcpt);
+	smtp_server_recipient_update_event(&prcpt->rcpt);
 }
 
 struct smtp_server_recipient *
@@ -134,6 +141,13 @@ smtp_server_recipient_get_original(struct smtp_server_recipient *rcpt)
 	return rcpt->params.orcpt.addr;
 }
 
+void smtp_server_recipient_replied(struct smtp_server_recipient *rcpt,
+				  const struct smtp_server_reply *reply)
+{
+	e_debug(rcpt->event, "Reply submitted: %s",
+		smtp_server_reply_get_one_line(reply));
+}
+
 bool smtp_server_recipient_approved(struct smtp_server_recipient **_rcpt)
 {
 	struct smtp_server_recipient *rcpt = *_rcpt;
@@ -142,10 +156,11 @@ bool smtp_server_recipient_approved(struct smtp_server_recipient **_rcpt)
 	i_assert(trans != NULL);
 	i_assert(rcpt->event != NULL);
 
-	e_debug(rcpt->event, "Approved");
-
 	rcpt->cmd = NULL;
 	smtp_server_transaction_add_rcpt(trans, rcpt);
+
+	smtp_server_recipient_update_event(rcpt);
+	e_debug(rcpt->event, "Approved");
 
 	return smtp_server_recipient_call_hooks(
 		_rcpt, SMTP_SERVER_RECIPIENT_HOOK_APPROVED);
@@ -189,6 +204,8 @@ void smtp_server_recipient_data_replied(struct smtp_server_recipient *rcpt)
 struct smtp_server_reply *
 smtp_server_recipient_get_reply(struct smtp_server_recipient *rcpt)
 {
+	i_assert(rcpt->cmd != NULL);
+
 	if (!HAS_ALL_BITS(rcpt->trans->flags,
 			 SMTP_SERVER_TRANSACTION_FLAG_REPLY_PER_RCPT))
 		return smtp_server_command_get_reply(rcpt->cmd->cmd, 0);

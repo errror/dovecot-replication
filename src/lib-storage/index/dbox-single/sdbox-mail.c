@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -90,7 +90,9 @@ sdbox_mail_get_special(struct mail *_mail, enum mail_fetch_field field,
 				mail_set_expunged(_mail);
 			return -1;
 		}
-		*value_r = p_strdup_printf(mail->imail.mail.data_pool, "%llu",
+		*value_r = p_strdup_printf(mail->imail.mail.data_pool,
+					   "%u:%u:%llu",
+					   major(st.st_dev), minor(st.st_dev),
 					   (unsigned long long)st.st_ino);
 		return 0;
 	case MAIL_FETCH_UIDL_BACKEND:

@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "lib-event-private.h"
@@ -78,6 +78,9 @@ static struct event *event_last_passthrough = NULL;
 static ARRAY(event_callback_t *) event_handlers;
 static ARRAY(event_category_callback_t *) event_category_callbacks;
 static ARRAY(struct event_internal_category *) event_registered_categories_internal;
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+static ARRAY(struct event_category *) event_registered_categories;
+#endif
 static ARRAY(struct event_category *) event_registered_categories_representative;
 static ARRAY(struct event *) global_event_stack;
 static uint64_t event_id_counter = 0;
@@ -132,6 +135,8 @@ event_call_callbacks(struct event *event, enum event_callback_type type,
 	event_callback_t *callback;
 
 	if (event->disable_callbacks)
+		return TRUE;
+	if (!array_is_created(&event_handlers))
 		return TRUE;
 
 	array_foreach_elem(&event_handlers, callback) {
@@ -448,7 +453,9 @@ event_create_passthrough(struct event *parent, const char *source_filename,
 		if (event_last_passthrough != NULL) {
 			/* API is being used in a wrong or dangerous way */
 			i_panic("Can't create multiple passthrough events - "
-				"finish the earlier with ->event()");
+				"finish the earlier event (%s:%d) with ->event()",
+				event_last_passthrough->source_filename,
+				event_last_passthrough->source_linenum);
 		}
 		struct event *event =
 			event_create(parent, source_filename, source_linenum);
@@ -543,6 +550,17 @@ struct event *event_pop_global(struct event *event)
 
 struct event *event_get_global(void)
 {
+	return current_global_event;
+}
+
+struct event *event_get_global_root(void)
+{
+	if (array_is_created(&global_event_stack) &&
+	    array_count(&global_event_stack) > 0) {
+		struct event *const *events =
+			array_front(&global_event_stack);
+		return events[0];
+	}
 	return current_global_event;
 }
 
@@ -890,6 +908,22 @@ event_category_register(struct event_category *category)
 	}
 
 	category->internal = internal;
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+	/* Record the registered category for later cleanup upon lib_deinit().
+	   For normal operation, calling lib_init() a second time never occurs,
+	   so this cleanup (clearing state) is not necessary normally. However,
+	   some fuzzers rely on fuzzing some sub-system from the very inception
+	   of the Dovecot library, so cycling lib_init() and lib_deinit()
+	   becomes a concern. Sadly, clearing event category state will only
+	   work when that is not located in some loaded plugin module, which
+	   would be unloaded long before lib_deinit(). Since Dovecot supports
+	   loading modules at many subsystems, this would cause crashes during
+	   normal operation. Therefore, the cleanup of category state is omitted
+	   entirely for normal operation and is only compiled in for the benefit
+	   of fuzzing where loading such modules is either omitted or handled
+	   specially. */
+	array_push_back(&event_registered_categories, &category);
+#endif
 
 	if (!allocated) {
 		/* not the first registration of this category */
@@ -1685,6 +1719,11 @@ void event_register_callback(event_callback_t *callback)
 	array_push_back(&event_handlers, &callback);
 }
 
+void event_register_callback_prepend(event_callback_t *callback)
+{
+	array_push_front(&event_handlers, &callback);
+}
+
 void event_unregister_callback(event_callback_t *callback)
 {
 	unsigned int idx;
@@ -1865,18 +1904,31 @@ void event_enable_user_cpu_usecs(struct event *event)
 
 void lib_event_init(void)
 {
+	events = NULL;
+	current_global_event = NULL;
+	event_last_passthrough = NULL;
+	event_id_counter = 0;
+
 	i_array_init(&event_handlers, 4);
 	i_array_init(&event_category_callbacks, 4);
 	i_array_init(&event_registered_categories_internal, 16);
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+	/* Refer to earlier commment in event_category_register(). */
+	i_array_init(&event_registered_categories, 32);
+#endif
 	i_array_init(&event_registered_categories_representative, 16);
+	event_log_init();
 }
 
 void lib_event_deinit(void)
 {
 	struct event_internal_category *internal;
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+	struct event_category *category;
+#endif
 
+	event_log_deinit();
 	event_unset_global_debug_log_filter();
-	event_unset_global_debug_send_filter();
 	event_unset_global_core_log_filter();
 	for (struct event *event = events; event != NULL; event = event->next) {
 		i_warning("Event %p leaked (parent=%p): %s:%u",
@@ -1888,6 +1940,12 @@ void lib_event_deinit(void)
 		i_free(internal->name);
 		i_free(internal);
 	}
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+	/* Refer to earlier commment in event_category_register(). */
+	array_foreach_elem(&event_registered_categories, category)
+		category->internal = NULL;
+	array_free(&event_registered_categories);
+#endif
 	array_free(&event_handlers);
 	array_free(&event_category_callbacks);
 	array_free(&event_registered_categories_internal);

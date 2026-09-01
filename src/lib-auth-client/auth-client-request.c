@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -193,6 +193,8 @@ auth_server_send_new_request(struct auth_client_connection *conn,
 				 str_data(str), str_len(str)) < 0) {
 		e_error(request->event,
 			"Error sending request to auth server: %m");
+	} else {
+		request->sent = TRUE;
 	}
 }
 
@@ -242,14 +244,22 @@ void auth_client_request_enable_channel_binding(
 static void
 call_callback(struct auth_client_request *request,
 	      enum auth_request_status status,
+	      const char *log_error,
 	      const char *data_base64,
 	      const char *const *args)
 {
+	static const char *const temp_failure_args[] = {
+		"code="AUTH_CLIENT_FAIL_CODE_TEMPFAIL,
+		NULL
+	};
 	auth_request_callback_t *callback = request->callback;
 
-	if (status != AUTH_REQUEST_STATUS_CONTINUE)
+	if (status != AUTH_REQUEST_STATUS_CONTINUE) {
 		request->callback = NULL;
-	callback(request, status, data_base64, args, request->context);
+		if (args == NULL && status != AUTH_REQUEST_STATUS_OK)
+			args = temp_failure_args;
+	}
+	callback(request, status, log_error, data_base64, args, request->context);
 }
 
 static void
@@ -265,7 +275,8 @@ auth_client_request_fail_conn_lost(struct auth_client_request *request)
 	e->add_str("error", "Lost connection to server");
 	e_debug(e->event(), "Lost connection to server");
 
-	call_callback(request, AUTH_REQUEST_STATUS_INTERNAL_FAIL, NULL, NULL);
+	call_callback(request, AUTH_REQUEST_STATUS_INTERNAL_FAIL,
+		      "Lost connection to server", NULL, NULL);
 	conn->to = timeout_add_short(0, auth_server_reconnect_timeout, conn);
 }
 
@@ -275,7 +286,11 @@ static void auth_client_request_free(struct auth_client_request **_request)
 
 	*_request = NULL;
 
-	auth_client_connection_remove_request(request->conn, request);
+	if (!auth_client_connection_remove_request(request->conn, request)) {
+		/* Auth request was already sent to the server. Delay freeing
+		   it until we get a response or we get disconnected. */
+		return;
+	}
 
 	timeout_remove(&request->to_fail);
 	timeout_remove(&request->to_final);
@@ -297,7 +312,8 @@ void auth_client_request_abort(struct auth_client_request **_request,
 	e_debug(e->event(), "Aborted: %s", reason);
 
 	auth_client_send_cancel(request->conn->client, request->id);
-	call_callback(request, AUTH_REQUEST_STATUS_ABORT, NULL, NULL);
+	call_callback(request, AUTH_REQUEST_STATUS_ABORT,
+		      "Aborted", NULL, NULL);
 	auth_client_request_free(&request);
 }
 
@@ -320,11 +336,10 @@ auth_client_request_fail(struct auth_client_request **_request,
 	e->add_str("error", reason);
 	e_debug(e->event(), "Failed: %s", reason);
 
-	if (reason != NULL)
-		args[0] = t_strconcat("reason=", reason, NULL);
+	args[0] = t_strconcat("reason=", reason, NULL);
 
 	auth_client_send_cancel(request->conn->client, request->id);
-	call_callback(request, status, NULL, args);
+	call_callback(request, status, reason, NULL, args);
 	auth_client_request_free(&request);
 }
 
@@ -449,32 +464,13 @@ auth_client_request_handle_input(struct auth_client_request **_request,
 		return;
 	}
 
-	switch (status) {
-	case AUTH_REQUEST_STATUS_CONTINUE:
-		e = event_create_passthrough(request->event)->
-			set_name("auth_client_request_challenged");
-
+	if (status == AUTH_REQUEST_STATUS_CONTINUE) {
 		for (tmp = args; tmp != NULL && *tmp != NULL; tmp++) {
 			if (str_begins(*tmp, "channel_binding=",
 				       &cbinding_type))
 				break;
 		}
 		args = NULL;
-		break;
-	default:
-		e = event_create_passthrough(request->event)->
-			set_name("auth_client_request_finished");
-
-		for (tmp = args; tmp != NULL && *tmp != NULL; tmp++) {
-			const char *key;
-			const char *value;
-			t_split_key_value_eq(*tmp, &key, &value);
-			if (str_begins(key, "event_", &key))
-				event_add_str(request->event, key, value);
-			else
-				args_parse_user(request, key, value);
-		}
-		break;
 	}
 
 	if (cbinding_type != NULL) {
@@ -484,7 +480,7 @@ auth_client_request_handle_input(struct auth_client_request **_request,
 		if (request->cbinding_callback == NULL) {
 			auth_client_request_fail(
 				&request, AUTH_REQUEST_STATUS_INTERNAL_FAIL,
-				NULL);
+				"Channel binding not supported");
 			return;
 		}
 		if (request->cbinding_callback(cbinding_type,
@@ -502,6 +498,31 @@ auth_client_request_handle_input(struct auth_client_request **_request,
 		buffer_append_buf(request->cbinding_data, data, 0, SIZE_MAX);
 	}
 
+	const char *reason = NULL;
+	switch (status) {
+	case AUTH_REQUEST_STATUS_CONTINUE:
+		e = event_create_passthrough(request->event)->
+			set_name("auth_client_request_challenged");
+		break;
+	default:
+		e = event_create_passthrough(request->event)->
+			set_name("auth_client_request_finished");
+
+		for (tmp = args; tmp != NULL && *tmp != NULL; tmp++) {
+			const char *key;
+			const char *value;
+			t_split_key_value_eq(*tmp, &key, &value);
+			if (str_begins(key, "event_", &key))
+				event_add_str(request->event, key, value);
+			else if (strcmp(key, "reason") == 0)
+				reason = value;
+			else
+				args_parse_user(request, key, value);
+		}
+		break;
+	}
+
+	const char *log_error = NULL;
 	switch (status) {
 	case AUTH_REQUEST_STATUS_OK:
 		e_debug(e->event(), "Finished");
@@ -530,18 +551,21 @@ auth_client_request_handle_input(struct auth_client_request **_request,
 			e_debug(e->event(), "Created final challenge");
 		break;
 	case AUTH_REQUEST_STATUS_FAIL:
-		e->add_str("error", "Authentication failed");
+		log_error = reason != NULL && reason[0] != '\0' ? reason :
+			"Authentication failed";
+		e->add_str("error", log_error);
 		e_debug(e->event(), "Finished");
 		break;
 	case AUTH_REQUEST_STATUS_INTERNAL_FAIL:
-		e->add_str("error", "Internal failure");
+		log_error = "Internal failure";
+		e->add_str("error", log_error);
 		e_debug(e->event(), "Finished");
 		break;
 	case AUTH_REQUEST_STATUS_ABORT:
 		i_unreached();
 	}
 
-	call_callback(request, status, base64_data, args);
+	call_callback(request, status, log_error, base64_data, args);
 	if (status != AUTH_REQUEST_STATUS_CONTINUE)
 		auth_client_request_free(_request);
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "hostpid.h"
@@ -592,7 +592,7 @@ static int index_list_mailbox_open(struct mailbox *box)
 		/* Mailbox name is corrupted. Rename it to the previous name. */
 		const char *newname =
 			mailbox_name_hdr_decode_storage_name(
-				box->list, name_hdr, name_hdr_size);
+				box->list, name_hdr, name_hdr_size, NULL);
 		index_list_rename_corrupted(box, newname);
 	}
 	return 0;
@@ -722,7 +722,7 @@ index_list_try_delete_nonexistent_parent(struct mailbox_list *_list,
 			/* The parent mailbox has no other children and is not
 			   existant or not selectable, delete it */
 			str_truncate(full_name, 0);
-			mailbox_list_index_node_get_path(node, sep, full_name);
+			mailbox_list_index_node_get_path(_list, node, full_name);
 			if (index_list_delete_entry(list, str_c(full_name), FALSE) < 0)
 				return -1;
 
@@ -857,9 +857,19 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 	/* copy all the data from old node to new node */
 	newnode->uid = oldnode->uid;
 	newnode->flags = oldnode->flags;
+
+	/* the children move from oldnode to newnode, so their full storage
+	   paths change. drop their stale hash entries before reparenting and
+	   re-insert with the new paths afterwards. */
+	for (child = oldnode->children; child != NULL; child = child->next)
+		mailbox_list_index_subtree_hash_remove(sync_ctx->ilist, child);
+
 	newnode->children = oldnode->children; oldnode->children = NULL;
 	for (child = newnode->children; child != NULL; child = child->next)
 		child->parent = newnode;
+
+	for (child = newnode->children; child != NULL; child = child->next)
+		mailbox_list_index_subtree_hash_insert(sync_ctx->ilist, child);
 
 	/* remove the old node from existence */
 	mailbox_list_index_node_unlink(sync_ctx->ilist, oldnode);
@@ -900,18 +910,12 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 
 static struct mailbox_list_iterate_context *
 index_list_iter_init(struct mailbox_list *list,
-		     const char *const *patterns,
+		     const char *const *patterns ATTR_UNUSED,
 		     enum mailbox_list_iter_flags flags)
 {
 	struct mailbox_list_iterate_context *ctx;
-	pool_t pool;
-
-	if ((flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0) {
-		return mailbox_list_subscriptions_iter_init(list, patterns,
-							    flags);
-	}
-
-	pool = pool_alloconly_create("mailbox list index backend iter", 1024);
+	pool_t pool =
+		pool_alloconly_create("mailbox list index backend iter", 1024);
 	ctx = p_new(pool, struct mailbox_list_iterate_context, 1);
 	ctx->pool = pool;
 	ctx->list = list;
@@ -921,17 +925,13 @@ index_list_iter_init(struct mailbox_list *list,
 }
 
 static const struct mailbox_info *
-index_list_iter_next(struct mailbox_list_iterate_context *ctx)
+index_list_iter_next(struct mailbox_list_iterate_context *ctx ATTR_UNUSED)
 {
-	if ((ctx->flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0)
-		return mailbox_list_subscriptions_iter_next(ctx);
 	return NULL;
 }
 
 static int index_list_iter_deinit(struct mailbox_list_iterate_context *ctx)
 {
-	if ((ctx->flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0)
-		return mailbox_list_subscriptions_iter_deinit(ctx);
 	pool_unref(&ctx->pool);
 	return 0;
 }

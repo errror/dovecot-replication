@@ -43,11 +43,15 @@ struct master_service {
 	int syslog_facility;
 	data_stack_frame_t datastack_frame_id;
 
+	int accepted_listener_fd;
 	struct master_service_listener *listeners;
 	unsigned int socket_count;
 
 	struct io *io_status_write, *io_status_error;
+	/* Number of requests left before process is stopped. */
 	unsigned int restart_request_count_left;
+	/* Starts as service's client_limit, but never more than
+	   restart_request_count_left. */
 	unsigned int total_available_count;
 	unsigned int process_limit;
 	unsigned int process_min_avail;
@@ -64,6 +68,7 @@ struct master_service {
 	void *killed_context;
 
 	struct timeout *to_die;
+	unsigned int die_timeout_msecs;
 
 	master_service_avail_overflow_callback_t *avail_overflow_callback;
 	struct timeout *to_overflow_state, *to_overflow_call;
@@ -90,14 +95,17 @@ struct master_service {
 	struct master_service_haproxy_conn *haproxy_conns;
 	struct event_filter *process_shutdown_filter;
 
+	bool lib_initialized_externally:1;
 	bool stopping:1;
 	bool keep_environment:1;
+	bool options_parsed:1;
 	bool log_directly:1;
 	bool initial_status_sent:1;
 	bool die_with_master:1;
 	bool call_avail_overflow:1;
 	bool config_path_changed_with_param:1;
 	bool have_admin_sockets:1;
+	bool reuse_port:1;
 	bool want_ssl_server:1;
 	bool config_path_from_master:1;
 	bool log_initialized:1;
@@ -129,5 +137,8 @@ void master_service_haproxy_new(struct master_service *service,
 void master_service_haproxy_abort(struct master_service *service);
 
 void master_admin_clients_deinit(void);
+/* Wait for a while for master-admin connections that haven't sent their
+   command yet. */
+void master_admin_clients_wait_commands(void);
 
 #endif

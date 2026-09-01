@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "base64.h"
@@ -24,7 +24,7 @@ void client_authenticate_get_capabilities(struct client *client, string_t *str)
 	const struct auth_mech_desc *mech;
 	unsigned int i, count;
 
-	mech = sasl_server_get_advertised_mechs(client, &count);
+	mech = sasl_proxy_get_advertised_mechs(client, &count);
 	for (i = 0; i < count; i++) {
 		str_append_c(str, ' ');
 		str_append(str, "AUTH=");
@@ -214,5 +214,6 @@ int cmd_login(struct imap_client *imap_client, const struct imap_arg *args)
 
 	base64 = t_buffer_create(MAX_BASE64_ENCODED_SIZE(plain_login->used));
 	base64_encode(plain_login->data, plain_login->used, base64);
-	return imap_client_auth_begin(imap_client, "PLAIN", str_c(base64));
+	return imap_client_auth_begin(imap_client, SASL_MECH_NAME_PLAIN,
+				      str_c(base64));
 }

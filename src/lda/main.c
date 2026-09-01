@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
@@ -489,6 +489,7 @@ int main(int argc, char *argv[])
 	struct master_service_settings_input set_input = {
 		.preserve_user = TRUE,
 		.preserve_home = TRUE,
+		.use_sysexits = TRUE,
 	};
 	struct master_service_settings_output set_output;
 	if (master_service_settings_read(master_service, &set_input,

@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -408,6 +408,9 @@ static bool view_ext_get_reset_id(struct mail_index_view *view ATTR_UNUSED,
 void mail_index_view_close(struct mail_index_view **_view)
 {
 	struct mail_index_view *view = *_view;
+
+	if (view == NULL)
+		return;
 
 	*_view = NULL;
 	if (--view->refcount > 0)

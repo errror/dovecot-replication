@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -620,6 +620,22 @@ static int imapc_sync(struct imapc_mailbox *mbox)
 	if (imapc_sync_finish(&sync_ctx) < 0)
 		return -1;
 	return 0;
+}
+
+int imapc_mailbox_flush_local_flag_changes(struct imapc_mailbox *mbox)
+{
+	bool changes ATTR_UNUSED;
+
+	/* Make sure any locally cached flag/keyword changes are sent to the
+	   remote server. This is needed before passing through a SEARCH/SORT
+	   command, so that the remote evaluates them against the up-to-date
+	   flags instead of stale ones. imapc_sync() is a no-op when there is
+	   nothing to flush. */
+	if (mbox->syncing || mbox->client_box == NULL)
+		return 0;
+	if (imapc_mailbox_commit_delayed_trans(mbox, FALSE, &changes) < 0)
+		return -1;
+	return imapc_sync(mbox);
 }
 
 static void

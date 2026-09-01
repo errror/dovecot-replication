@@ -2,7 +2,7 @@
  * SCRAM-SHA-1 SASL authentication, see RFC-5802
  *
  * Copyright (c) 2011-2016 Florian Zeitz <florob@babelmonkeys.de>
- * Copyright (c) 2022-2023 Dovecot Oy
+ * Copyright (c) Dovecot authors, see top-level COPYING file
  *
  * This software is released under the MIT license.
  */
@@ -17,6 +17,7 @@
 #include "strfuncs.h"
 #include "strnum.h"
 
+#include "auth-gs2.h"
 #include "auth-scram-server.h"
 
 /* s-nonce length */
@@ -24,16 +25,15 @@
 
 static bool
 auth_scram_server_set_username(struct auth_scram_server *server,
-			       const char *username, const char **error_r)
+			       const char *username)
 {
-	return server->backend->set_username(server, username, error_r);
+	return server->backend->set_username(server, username);
 }
 static bool
 auth_scram_server_set_login_username(struct auth_scram_server *server,
-				     const char *username, const char **error_r)
+				     const char *username)
 {
-	return server->backend->set_login_username(server, username,
-						   error_r);
+	return server->backend->set_login_username(server, username);
 }
 
 static void
@@ -56,6 +56,9 @@ static int
 auth_scram_server_credentials_lookup(struct auth_scram_server *server)
 {
 	const struct hash_method *hmethod = server->set.hash_method;
+
+	i_assert(hmethod != NULL);
+
 	struct auth_scram_key_data *kdata = &server->key_data;
 	pool_t pool = server->pool;
 
@@ -92,37 +95,6 @@ void auth_scram_server_deinit(struct auth_scram_server *server)
 	pool_unref(&server->pool);
 }
 
-static const char *auth_scram_unescape_username(const char *in)
-{
-	string_t *out;
-
-	/* RFC 5802, Section 5.1:
-
-	   The characters ',' or '=' in usernames are sent as '=2C' and '=3D'
-	   respectively.  If the server receives a username that contains '='
-	   not followed by either '2C' or '3D', then the server MUST fail the
-	   authentication.
-	 */
-
-	out = t_str_new(64);
-	for (; *in != '\0'; in++) {
-		i_assert(in[0] != ','); /* strsplit should have caught this */
-
-		if (in[0] == '=') {
-			if (in[1] == '2' && in[2] == 'C')
-				str_append_c(out, ',');
-			else if (in[1] == '3' && in[2] == 'D')
-				str_append_c(out, '=');
-			else
-				return NULL;
-			in += 2;
-		} else {
-			str_append_c(out, *in);
-		}
-	}
-	return str_c(out);
-}
-
 static int
 auth_scram_parse_client_first(struct auth_scram_server *server,
 			      const unsigned char *data, size_t size,
@@ -130,13 +102,11 @@ auth_scram_parse_client_first(struct auth_scram_server *server,
 			      const char **login_username_r,
 			      const char **error_r)
 {
-	const char *login_username = NULL;
-	const char *data_cstr, *p;
-	const char *gs2_header, *gs2_cbind_flag, *authzid;
-	const char *cfm_bare, *username, *nonce;
+	struct auth_gs2_header gs2_header;
+	const unsigned char *gs2_header_end;
+	const char *cfm_bare, *login_username = NULL, *username, *nonce;
 	const char *const *fields;
-
-	data_cstr = gs2_header = t_strndup(data, size);
+	const char *error;
 
 	/* RFC 5802, Section 7:
 
@@ -158,25 +128,18 @@ auth_scram_parse_client_first(struct auth_scram_server *server,
 	                     ;; MUST be ignored.
 	   attr-val        = ALPHA "=" value
 	 */
-	p = strchr(data_cstr, ',');
-	if (p == NULL) {
-		*error_r = "Invalid initial client message: "
-			"Missing first ',' in GS2 header";
+
+	if (auth_gs2_header_decode(data, size, FALSE,
+				   &gs2_header, &gs2_header_end, &error) < 0) {
+		*error_r = t_strdup_printf("Invalid initial client message: %s",
+					   error);
 		return -1;
 	}
-	gs2_cbind_flag = t_strdup_until(data_cstr, p);
-	data_cstr = p + 1;
 
-	p = strchr(data_cstr, ',');
-	if (p == NULL) {
-		*error_r = "Invalid initial client message: "
-			"Missing second ',' in GS2 header";
-		return -1;
-	}
-	authzid = t_strdup_until(data_cstr, p);
-	gs2_header = t_strdup_until(gs2_header, p + 1);
-	cfm_bare = p + 1;
+	size_t gs2_header_size = gs2_header_end - data;
+	size_t cfm_bare_size = size - gs2_header_size;
 
+	cfm_bare = t_strndup(gs2_header_end, cfm_bare_size);
 	fields = t_strsplit(cfm_bare, ",");
 	if (str_array_length(fields) < 2) {
 		*error_r = "Invalid initial client message: "
@@ -191,20 +154,16 @@ auth_scram_parse_client_first(struct auth_scram_server *server,
 	enum auth_scram_cbind_server_support cbind_support =
 		server->set.cbind_support;
 
-	switch (gs2_cbind_flag[0]) {
-	case 'p':
-		if (gs2_cbind_flag[1] != '=' || gs2_cbind_flag[2] == '\0') {
-			*error_r = "Invalid GS2 header";
-			return -1;
-		}
+	switch (gs2_header.cbind.status) {
+	case AUTH_GS2_CBIND_STATUS_PROVIDED:
 		if (cbind_support == AUTH_SCRAM_CBIND_SERVER_SUPPORT_NONE) {
 			*error_r = "Channel binding not supported";
 			return -1;
 		}
-		auth_scram_server_start_channel_binding(server,
-							&gs2_cbind_flag[2]);
+		auth_scram_server_start_channel_binding(
+			server, gs2_header.cbind.name);
 		break;
-	case 'y':
+	case AUTH_GS2_CBIND_STATUS_NO_SERVER_SUPPORT:
 		/* RFC 5802, Section 6:
 
 		   If the flag is set to "y" and the server supports channel
@@ -222,7 +181,7 @@ auth_scram_parse_client_first(struct auth_scram_server *server,
 			return -1;
 		}
 		break;
-	case 'n':
+	case AUTH_GS2_CBIND_STATUS_NO_CLIENT_SUPPORT:
 		if (cbind_support == AUTH_SCRAM_CBIND_SERVER_SUPPORT_REQUIRED) {
 			*error_r = "Channel binding required";
 			return -1;
@@ -236,20 +195,8 @@ auth_scram_parse_client_first(struct auth_scram_server *server,
 	/* authzid         = "a=" saslname
 	                     ;; Protocol specific.
 	 */
-	if (authzid[0] == '\0')
-		;
-	else if (authzid[0] == 'a' && authzid[1] == '=') {
-		/* Unescape authzid */
-		login_username = auth_scram_unescape_username(authzid + 2);
-
-		if (login_username == NULL) {
-			*error_r = "authzid escaping is invalid";
-			return -1;
-		}
-	} else {
-		*error_r = "Invalid authzid field";
-		return -1;
-	}
+	if (gs2_header.authzid != NULL)
+		login_username = gs2_header.authzid;
 
 	/* reserved-mext   = "m=" 1*(value-char)
 	 */
@@ -260,9 +207,12 @@ auth_scram_parse_client_first(struct auth_scram_server *server,
 	/* username        = "n=" saslname
 	 */
 	if (username[0] == 'n' && username[1] == '=') {
+		const char *uname_enc = username + 2;
+		size_t uname_enc_size = strlen(uname_enc);
+
 		/* Unescape username */
-		username = auth_scram_unescape_username(username + 2);
-		if (username == NULL) {
+		if (auth_gs2_decode_username((const unsigned char *)uname_enc,
+					     uname_enc_size, &username) < 0) {
 			*error_r = "Username escaping is invalid";
 			return -1;
 		}
@@ -282,9 +232,8 @@ auth_scram_parse_client_first(struct auth_scram_server *server,
 	*username_r = username;
 	*login_username_r = login_username;
 
-	server->gs2_header = p_strdup(server->pool, gs2_header);
-	server->client_first_message_bare =
-		p_strdup(server->pool, cfm_bare);
+	server->gs2_header = p_strndup(server->pool, data, gs2_header_size);
+	server->client_first_message_bare = p_strdup(server->pool, cfm_bare);
 	return 0;
 }
 
@@ -292,6 +241,9 @@ static string_t *
 auth_scram_get_server_first(struct auth_scram_server *server)
 {
 	const struct hash_method *hmethod = server->set.hash_method;
+
+	i_assert(hmethod != NULL);
+
 	struct auth_scram_key_data *kdata = &server->key_data;
 	unsigned char snonce[SCRAM_SERVER_NONCE_LEN+1];
 	string_t *str;
@@ -341,6 +293,9 @@ static bool
 auth_scram_server_verify_credentials(struct auth_scram_server *server)
 {
 	const struct hash_method *hmethod = server->set.hash_method;
+
+	i_assert(hmethod != NULL);
+
 	struct auth_scram_key_data *kdata = &server->key_data;
 	struct hmac_context ctx;
 	const char *auth_message;
@@ -390,6 +345,9 @@ auth_scram_parse_client_final(struct auth_scram_server *server,
 			      const char **error_r)
 {
 	const struct hash_method *hmethod = server->set.hash_method;
+
+	i_assert(hmethod != NULL);
+
 	const char **fields, *nonce_str;
 	const void *cbind_input;
 	size_t cbind_input_size;
@@ -464,7 +422,13 @@ auth_scram_parse_client_final(struct auth_scram_server *server,
 	/* proof           = "p=" base64
 	 */
 	if (fields[field_count-1][0] == 'p') {
-		size_t len = strlen(&fields[field_count-1][2]);
+		size_t len = strlen(fields[field_count - 1]);
+
+		if (len < 3 || fields[field_count-1][1] != '=') {
+			*error_r = "Invalid ClientProof";
+			return -1;
+		}
+		len -= 2;
 
 		server->proof = buffer_create_dynamic(server->pool,
 					MAX_BASE64_DECODED_SIZE(len));
@@ -493,6 +457,9 @@ static string_t *
 auth_scram_get_server_final(struct auth_scram_server *server)
 {
 	const struct hash_method *hmethod = server->set.hash_method;
+
+	i_assert(hmethod != NULL);
+
 	struct auth_scram_key_data *kdata = &server->key_data;
 	struct hmac_context ctx;
 	const char *auth_message;
@@ -542,7 +509,7 @@ auth_scram_parse_client_finish(struct auth_scram_server *server ATTR_UNUSED,
 	return 0;
 }
 
-bool auth_scram_server_acces_granted(struct auth_scram_server *server)
+bool auth_scram_server_access_granted(struct auth_scram_server *server)
 {
 	return (server->state == AUTH_SCRAM_SERVER_STATE_SERVER_FINAL);
 }
@@ -558,7 +525,7 @@ auth_scram_server_input_client_first(struct auth_scram_server *server,
 	int ret;
 
 	username = login_username = NULL;
-	
+
 	/* Parse client-first message */
 	ret = auth_scram_parse_client_first(server, input, input_len,
 					    &username, &login_username,
@@ -570,17 +537,18 @@ auth_scram_server_input_client_first(struct auth_scram_server *server,
 
 	/* Pass usernames to backend */
 	i_assert(username != NULL);
-	if (!auth_scram_server_set_username(server, username, error_r)) {
+	if (!auth_scram_server_set_username(server, username)) {
+		*error_r = "Bad username";
 		*error_code_r =	AUTH_SCRAM_SERVER_ERROR_BAD_USERNAME;
 		return -1;
 	}
 	if (login_username != NULL &&
-	    !auth_scram_server_set_login_username(server, login_username,
-						  error_r)) {
+	    !auth_scram_server_set_login_username(server, login_username)) {
+		*error_r = "Bad login username";
 		*error_code_r = AUTH_SCRAM_SERVER_ERROR_BAD_LOGIN_USERNAME;
 		return -1;
 	}
-	
+
 	return 0;
 }
 
@@ -592,7 +560,7 @@ auth_scram_server_input_client_final(struct auth_scram_server *server,
 				     const char **error_r)
 {
 	int ret;
-	
+
 	/* Parse client-final message */
 	ret = auth_scram_parse_client_final(server, input, input_len, error_r);
 	if (ret < 0) {

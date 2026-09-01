@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -34,11 +34,24 @@ struct multiplex_ostream {
 	unsigned int stream_header_bytes_left;
 	buffer_t *pending_buf;
 
+	/* Tracks the parent's cork state. The multiplex owns the parent's
+	   cork while it is wrapping the stream: callers must not cork the
+	   parent directly. The only exception is stream_send_io() in
+	   ostream-file.c, which corks the parent around its flush callback;
+	   o_stream_multiplex_flush() undoes that on entry to keep this
+	   invariant true everywhere else. */
+	bool parent_corked:1;
+	/* Set during channel 0 destroy if channel 0 was corked at the
+	   time. o_stream_multiplex_try_destroy() then re-corks the parent
+	   so the cork the caller had on it before wrapping (which we
+	   moved onto channel 0 at create time) returns to the parent
+	   when the multiplex goes away. */
+	bool recork_parent_on_destroy:1;
 	bool pending_buf_prefix_char1:1;
 	bool destroyed:1;
 };
 
-static unsigned char ostream_multiplex_header[IOSTREAM_MULTIPLEX_HEADER_SIZE] =
+static unsigned char ostream_multiplex_header[IOSTREAM_MULTIPLEX_HEADER_SIZE] ATTR_NONSTRING =
 	"\xFF\xFF\xFF\xFF\xFF\x00\x02"
         IOSTREAM_MULTIPLEX_CHANNEL_SWITCH_PREFIX;
 
@@ -52,6 +65,36 @@ get_channel(struct multiplex_ostream *mstream, uint8_t cid)
 			return channel;
 	}
 	return NULL;
+}
+
+static void
+multiplex_cork_parent(struct multiplex_ostream *mstream, bool set)
+{
+	/* Catch any caller that corked or uncorked the parent behind our
+	   back. */
+	i_assert(o_stream_is_corked(mstream->parent) == mstream->parent_corked);
+	if (set)
+		o_stream_cork(mstream->parent);
+	else
+		o_stream_uncork(mstream->parent);
+	/* o_stream_(un)cork() is a no-op on a closed/errored stream, so
+	   re-read the actual state instead of trusting the request. */
+	mstream->parent_corked = o_stream_is_corked(mstream->parent);
+}
+
+static void
+multiplex_transfer_parent_cork(struct ostream *parent, bool set)
+{
+	/* Direct state transfer between the parent and channel 0 cork at
+	   wrap/unwrap time. We cannot go through o_stream_(un)cork()
+	   here: o_stream_uncork() flushes data already buffered in the
+	   parent (ostream-file.c buffer_flush(), default cork's
+	   o_stream_flush()), which would defeat the transparency of the
+	   transfer - the caller wrapped a corked parent and expects its
+	   buffered bytes to stay buffered until they uncork channel 0. */
+	i_assert(o_stream_is_corked(parent) == !set);
+	i_assert(!parent->closed && parent->stream_errno == 0);
+	parent->real_stream->corked = set;
 }
 
 static void propagate_error(struct multiplex_ostream *mstream)
@@ -97,8 +140,8 @@ o_stream_multiplex_send_packet(struct multiplex_ostream *mstream,
 	/* ensure it fits into 32 bit int */
 	size_t amt = I_MIN(UINT_MAX, I_MIN(tmp, channel->buf->used));
 	/* delay corking here now that we are going to send something */
-	if (!o_stream_is_corked(mstream->parent))
-		o_stream_cork(mstream->parent);
+	if (!mstream->parent_corked)
+		multiplex_cork_parent(mstream, TRUE);
 	uint32_t len = cpu32_to_be(amt);
 	const struct const_iovec vec[] = {
 		{ &channel->cid, 1 },
@@ -173,8 +216,8 @@ again:
 		skip++;
 	}
 
-	if (!o_stream_is_corked(mstream->parent))
-		o_stream_cork(mstream->parent);
+	if (!mstream->parent_corked)
+		multiplex_cork_parent(mstream, TRUE);
 	const struct const_iovec vec[] = {
 		{ mstream->pending_buf->data, mstream->pending_buf->used },
 		{ data, skip }
@@ -243,7 +286,26 @@ o_stream_multiplex_sendv(struct multiplex_ostream *mstream)
 	while((channel = get_next_channel(mstream)) != NULL) {
 		if (channel->buf->used == 0)
 			continue;
-		if (o_stream_get_buffer_avail_size(mstream->parent) < 6) {
+		/* Only the PACKET format needs this gate: it writes a whole
+		   header and its data in a single sendv and can't do a
+		   partial parent write, so it must wait until the parent has
+		   room for a full header. The STREAM format sends
+		   incrementally via pending_buf and handles partial parent
+		   writes, so it must attempt the send instead. It also must
+		   not be gated on get_buffer_avail_size() here: a parent with
+		   max_buffer_size==0 (as imap-fetch sets while streaming a
+		   body straight to the socket) always reports 0, which would
+		   wrongly block STREAM from writing to it. */
+		if (mstream->format == OSTREAM_MULTIPLEX_FORMAT_PACKET &&
+		    o_stream_get_buffer_avail_size(mstream->parent) < 6) {
+			/* A small avail here is normal backpressure: the
+			   parent buffer is temporarily full and will drain.
+			   But a parent whose max_buffer_size can't even hold
+			   a header can never drain enough for send_packet(),
+			   so it would just deadlock. Catch that (a
+			   max_buffer_size==0 streaming parent is unsupported
+			   for PACKET) loudly instead. */
+			i_assert(o_stream_get_max_buffer_size(mstream->parent) >= 6);
 			all_sent = 0;
 			break;
 		}
@@ -264,13 +326,22 @@ o_stream_multiplex_sendv(struct multiplex_ostream *mstream)
 		buffer_delete(channel->buf, 0, ret);
 		channel->last_sent_counter = ++mstream->send_counter;
 	}
-	if (o_stream_is_corked(mstream->parent))
-		o_stream_uncork(mstream->parent);
+	if (mstream->parent_corked)
+		multiplex_cork_parent(mstream, FALSE);
 	return all_sent;
 }
 
 static int o_stream_multiplex_flush(struct multiplex_ostream *mstream)
 {
+	/* stream_send_io() in ostream-file.c corks the parent around our
+	   flush callback. Restore the invariant that the parent is not
+	   corked outside of multiplex_cork_parent() before doing anything
+	   else. */
+	i_assert(!mstream->parent_corked);
+	if (o_stream_is_corked(mstream->parent))
+		o_stream_uncork(mstream->parent);
+	mstream->parent_corked = o_stream_is_corked(mstream->parent);
+
 	int ret = o_stream_flush(mstream->parent);
 	if (ret >= 0) {
 		if ((ret = o_stream_multiplex_sendv(mstream)) <= 0)
@@ -336,22 +407,38 @@ o_stream_multiplex_ochannel_sendv(struct ostream_private *stream,
 		container_of(stream, struct multiplex_ochannel, ostream);
 	size_t total = 0, avail = o_stream_get_buffer_avail_size(&stream->ostream);
 	size_t optimal_size = I_MIN(IO_BLOCK_SIZE, avail);
+	bool grown = FALSE;
 
 	for (unsigned int i = 0; i < iov_count; i++)
 		total += iov[i].iov_len;
 
-	if (avail < total && channel->buf->used < IO_BLOCK_SIZE) {
+	if (avail < total && channel->buf->used < IO_BLOCK_SIZE &&
+	    o_stream_get_buffer_used_size(channel->mstream->parent) == 0) {
 		/* ostream buffer size is too small for us - keep it always at
-		   least at IO_BLOCK_SIZE. */
+		   least at IO_BLOCK_SIZE. Only do this while the parent has no
+		   un-flushed data, i.e. the socket is keeping up. If the parent
+		   already has a backlog the socket is congested, and buffering
+		   more here would defeat backpressure: a max_buffer_size==0
+		   parent always reports avail==0, so without this the STREAM
+		   format would keep accepting data and busy-loop writing to a
+		   full socket instead of returning 0 to let the caller wait. */
 		avail = IO_BLOCK_SIZE - channel->buf->used;
+		grown = TRUE;
 	}
-	if (avail < total) {
+	if (avail < total && !grown) {
 		if (o_stream_multiplex_sendv(channel->mstream) < 0)
 			return -1;
 		avail = o_stream_get_buffer_avail_size(&stream->ostream);
 		if (avail == 0)
 			return 0;
 	}
+	/* If we grew the buffer above but a single sendv is still larger than
+	   IO_BLOCK_SIZE, don't refuse it entirely: buffer up to avail bytes so
+	   the caller makes forward progress. Otherwise a >IO_BLOCK_SIZE send
+	   (e.g. o_stream_send_istream() of an in-memory istream that returns all
+	   its data at once) would repeatedly buffer nothing and busy-loop. The
+	   remainder applies backpressure on the next call, when buf->used has
+	   reached IO_BLOCK_SIZE and the grow no longer triggers. */
 
 	total = 0;
 
@@ -458,6 +545,18 @@ static void o_stream_multiplex_try_destroy(struct multiplex_ostream *mstream)
 					    *mstream->old_flush_callback,
 					    mstream->old_flush_context);
 	}
+	/* Channel 0 was corked at destroy: transfer that cork back to
+	   the parent, mirroring the create-time transfer in the other
+	   direction so the caller's cork balance is preserved across
+	   the multiplex's lifetime. Skip the transfer if the parent
+	   failed or was closed: there is nothing left to preserve, and
+	   the parent may still be corked by us, because o_stream_uncork()
+	   is a no-op on a failed/closed stream. */
+	if (mstream->recork_parent_on_destroy &&
+	    !mstream->parent->closed && mstream->parent->stream_errno == 0) {
+		i_assert(!mstream->parent_corked);
+		multiplex_transfer_parent_cork(mstream->parent, TRUE);
+	}
 	o_stream_unref(&mstream->parent);
 	array_free(&mstream->channels);
 	buffer_free(&mstream->pending_buf);
@@ -469,6 +568,12 @@ static void o_stream_multiplex_ochannel_destroy(struct iostream_private *stream)
 	struct multiplex_ochannel **channelp;
 	struct multiplex_ochannel *channel =
 		container_of(stream, struct multiplex_ochannel, ostream.iostream);
+	/* Capture channel 0's cork state before tearing it down so that
+	   o_stream_multiplex_try_destroy() can transfer it back to the
+	   parent. This pairs with the create-time transfer in
+	   o_stream_create_multiplex(). */
+	if (channel->cid == 0 && channel->ostream.corked)
+		channel->mstream->recork_parent_on_destroy = TRUE;
 	o_stream_unref(&channel->ostream.parent);
 	if (channel->buf != NULL)
 		buffer_free(&channel->buf);
@@ -526,6 +631,16 @@ struct ostream *o_stream_create_multiplex(struct ostream *parent, size_t bufsize
 					  enum ostream_multiplex_format format)
 {
 	struct multiplex_ostream *mstream;
+	/* The multiplex owns the parent's cork state while it is
+	   wrapping it. If the caller had corked the parent before
+	   wrapping, transfer that cork onto channel 0: from the caller's
+	   point of view the cork still exists on the ostream they pass
+	   us back (which is channel 0), and a later o_stream_uncork()
+	   on it stays balanced. The reverse transfer happens in
+	   o_stream_multiplex_try_destroy(). */
+	bool transfer_cork = o_stream_is_corked(parent);
+	if (transfer_cork)
+		multiplex_transfer_parent_cork(parent, FALSE);
 
 	mstream = i_new(struct multiplex_ostream, 1);
 	mstream->parent = parent;
@@ -549,7 +664,10 @@ struct ostream *o_stream_create_multiplex(struct ostream *parent, size_t bufsize
 	i_array_init(&mstream->channels, 8);
 	o_stream_ref(parent);
 
-	return o_stream_add_channel_real(mstream, 0);
+	struct ostream *channel0 = o_stream_add_channel_real(mstream, 0);
+	if (transfer_cork)
+		o_stream_cork(channel0);
+	return channel0;
 }
 
 uint8_t o_stream_multiplex_get_channel_id(struct ostream *stream)

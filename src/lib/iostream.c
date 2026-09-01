@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -26,6 +26,8 @@ bool iostream_fd_unref(struct iostream_fd **_ref)
 
 	i_assert(ref != NULL);
 	i_assert(ref->refcount > 0);
+
+	*_ref = NULL;
 
 	if (--ref->refcount > 0)
 		return TRUE;

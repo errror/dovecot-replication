@@ -163,6 +163,9 @@ struct mailbox_list_iterate_context {
 	bool index_iteration;
 	bool iter_from_index_dir;
 
+	struct mailbox_info info;
+	pool_t info_pool;
+
 	struct imap_match_glob *glob;
 	struct mailbox_list_autocreate_iterate_context *autocreate_ctx;
 	struct mailbox_info specialuse_info;
@@ -170,6 +173,10 @@ struct mailbox_list_iterate_context {
 
 	ARRAY(union mailbox_list_iterate_module_context *) module_contexts;
 	HASH_TABLE(const char *, void*) found_mailboxes;
+	struct mailbox_tree_context *subscriptions;
+	struct mailbox_tree_iterate_context *subscriptions_iter;
+	struct mailbox_info subscriptions_info;
+	bool subscriptions_children;
 };
 
 struct mailbox_list_iter_update_context {
@@ -179,7 +186,6 @@ struct mailbox_list_iter_update_context {
 	struct imap_match_glob *glob;
 	enum mailbox_info_flags leaf_flags, parent_flags;
 
-	bool update_only:1;
 	bool match_parents:1;
 };
 
@@ -190,13 +196,21 @@ extern struct mailbox_list_module_register mailbox_list_module_register;
 void mailbox_lists_init(void);
 void mailbox_lists_deinit(void);
 
+/* Escape a single hierarchy part of a mailbox name. The name must already be
+   split by its hierarchy separator - list_sep is escaped as a literal
+   character. first_part=TRUE only for the leading part of the full name. */
+void
+mailbox_list_escape_name_params_to_str(string_t *escaped_name, const char *vname,
+				       char list_sep, char escape_char,
+				       const char *maildir_name,
+				       bool first_part);
 const char *
-mailbox_list_escape_name_params(const char *vname, const char *ns_prefix,
-				char ns_sep, char list_sep, char escape_char,
-				const char *maildir_name);
+mailbox_list_escape_name_params(const char *vname, char list_sep,
+				char escape_char, const char *maildir_name,
+				bool first_part);
 const char *
-mailbox_list_unescape_name_params(const char *src, const char *ns_prefix,
-				  char ns_sep, char list_sep, char escape_char);
+mailbox_list_unescape_name_params(const char *src, char ns_sep, char list_sep,
+				  char escape_char);
 
 int mailbox_list_default_get_storage(struct mailbox_list **list,
 				     const char **vname,
@@ -204,6 +218,15 @@ int mailbox_list_default_get_storage(struct mailbox_list **list,
 				     struct mail_storage **storage_r);
 const char *mailbox_list_default_get_storage_name(struct mailbox_list *list,
 						  const char *vname);
+/* If legacy_fname differs from new_fname, rename legacy_fname to new_fname
+   in the parent_dir_path. If it fails, log an error. Returns 1 if the mailbox
+   name changed, 0 if they are equal, -1 on error. Intended to be used by
+   mailbox listing code to automatically rename mailboxes with legacy escaping
+   format. */
+int mailbox_list_try_migrate_legacy_escape(struct mailbox_list *list,
+					   const char *parent_dir_path,
+					   const char *legacy_fname,
+					   const char *new_fname);
 const char *mailbox_list_default_get_vname(struct mailbox_list *list,
 					   const char *storage_name);
 const char *mailbox_list_get_unexpanded_path(struct mailbox_list *list,
@@ -250,5 +273,13 @@ mailbox_list_iter_autocreate_filter(struct mailbox_list_iterate_context *ctx,
 
 int mailbox_list_lock(struct mailbox_list *list);
 void mailbox_list_unlock(struct mailbox_list *list);
+
+/* Like mailbox_list_mailbox(), but additionally reports whether the ACL
+   plugin determined that the session does not hold the LOOKUP right on the
+   mailbox (always FALSE without the ACL plugin, and FALSE whenever "name"
+   isn't the special-cased INBOX). */
+int mailbox_list_mailbox_full(struct mailbox_list *list, const char *name,
+			      enum mailbox_info_flags *flags_r,
+			      bool *acl_no_lookup_right_r);
 
 #endif

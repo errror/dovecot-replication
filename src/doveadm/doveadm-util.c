@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,6 +7,7 @@
 #include "ostream.h"
 #include "net.h"
 #include "time-util.h"
+#include "version.h"
 #include "master-service.h"
 #include "module-dir.h"
 #include "doveadm-settings.h"
@@ -189,10 +190,16 @@ int doveadm_blocking_connect(const char *path,
 		alarm(0);
 	}
 	if (ret < 0) {
+		o_stream_ignore_last_errors(*output_r);
 		o_stream_destroy(output_r);
 		i_stream_destroy(input_r);
 	}
 	return ret;
+}
+
+bool doveadm_is_killed(void)
+{
+	return master_service_is_killed(master_service);
 }
 
 int i_strccdascmp(const char *a, const char *b)

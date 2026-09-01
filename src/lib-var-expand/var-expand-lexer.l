@@ -1,4 +1,4 @@
-/* Copyright (c) 2024 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 %option nounput
 %option noinput
@@ -21,6 +21,9 @@
 #include "var-expand-parser.h"
 
 #pragma GCC diagnostic push
+
+/* If we hit here, the program has prematurely ended */
+#define ECHO STMT_START { scanner_error(yyscanner, "Premature program end"); } STMT_END;
 
 /* ignore strict bool warnings in generated code */
 #ifdef HAVE_STRICT_BOOL
@@ -120,7 +123,7 @@ static bool append_valid_utf8(void *yyscanner, YYSTYPE *state, const char *value
   ["]       { yy_push_state(stringdq, yyscanner); INIT_STR; }
   [0-9]+    { INIT_STR; str_append(yylval->str, yytext); return NUMBER; }
 }
-y
+
 "%{"	  { yy_push_state(expr, yyscanner); return OCBRACE; }
 "%%{"     { INIT_STR; str_append(yylval->str, "%{"); return VALUE; }
 "%"	  { return PERC; }
@@ -132,7 +135,8 @@ extern void var_expand_parser_error(YYLTYPE *loc, YYSTYPE *state, const char *er
 void var_expand_parser_error(YYLTYPE *loc ATTR_UNUSED, YYSTYPE *state, const char *error)
 {
 	state->failed = TRUE;
-	state->error = p_strdup(state->pool, error);
+	if (state->error == NULL)
+		state->error = p_strdup(state->pool, error);
 }
 
 static int scanner_error(void *scanner, const char *msg)

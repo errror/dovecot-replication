@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "safe-mkstemp.h"
@@ -389,6 +389,18 @@ bool index_attachment_parse_extrefs(const char *line, pool_t pool,
 	return TRUE;
 }
 
+uoff_t index_attachment_base64_decoded_size(const struct mail_attachment_extref *extref)
+{
+	uoff_t encoded_size = extref->size;
+	unsigned int nl_size = extref->base64_have_crlf ? 2 : 1;
+	unsigned int line_size = extref->base64_blocks_per_line * 4 + nl_size;
+	uoff_t nl_count = (encoded_size - 1) / line_size;
+	uoff_t nl_bytes = nl_size * nl_count;
+
+	i_assert(extref->base64_blocks_per_line > 0);
+	return MAX_BASE64_DECODED_SIZE(encoded_size - nl_bytes);
+}
+
 int index_attachment_stream_get(struct fs *fs, const char *attachment_dir,
 				const char *path_suffix,
 				struct istream **stream, uoff_t full_size,
@@ -418,14 +430,10 @@ int index_attachment_stream_get(struct fs *fs, const char *attachment_dir,
 		file = fs_file_init(fs, path, FS_OPEN_MODE_READONLY |
 				    FS_OPEN_FLAG_SEEKABLE);
 		uoff_t raw_size;
-		if (extref->base64_blocks_per_line > 0) {
-			/* extref->size is base64 encoded size, convert into raw size */
-			uoff_t nl_count = (extref->size - 1)/(extref->base64_blocks_per_line * 4);
-			uoff_t nl_bytes = extref->base64_have_crlf ? 2 * nl_count : nl_count;
-			raw_size = MAX_BASE64_DECODED_SIZE(extref->size - nl_bytes);
-		} else {
+		if (extref->base64_blocks_per_line > 0)
+			raw_size = index_attachment_base64_decoded_size(extref);
+		else
 			raw_size = extref->size;
-		}
 		fs_set_metadata(file, FS_METADATA_FILE_SIZE, t_strdup_printf("%"PRIuUOFF_T, raw_size));
 		input = i_stream_create_fs_file(&file, IO_BLOCK_SIZE);
 

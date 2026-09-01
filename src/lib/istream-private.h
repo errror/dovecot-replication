@@ -8,6 +8,33 @@
 
 struct io;
 
+/* How the istream reads from istreams that aren't its istream-parent. The
+   ioloop IO is found by walking the istream-parents, so such a hidden istream
+   must be declared for i_stream_set_input_pending() to be able to find it. */
+enum istream_hidden_inputs {
+	/* The istream reads only from its istream-parent, if it has one. */
+	ISTREAM_HIDDEN_INPUTS_NONE = 0,
+	/* The istream reads from an istream that isn't its istream-parent,
+	   and declares it with istream_private.io_parent. This is verified
+	   while the istream is reading. */
+	ISTREAM_HIDDEN_INPUTS_DECLARED,
+	/* The istream reads from istreams that aren't its istream-parent, but
+	   can't declare them with istream_private.io_parent. Nothing can be
+	   verified while such an istream is reading, and an
+	   i_stream_set_input_pending() for one of the istreams it is reading
+	   may not reach the ioloop IO. That doesn't necessarily lose it:
+	   istream-multiplex channels legitimately own separate ioloop IOs for
+	   the same istream, so the pending can still be handled via another
+	   channel's IO. */
+	ISTREAM_HIDDEN_INPUTS_UNCHECKED,
+	/* Like ISTREAM_HIDDEN_INPUTS_UNCHECKED, except there is no such other
+	   IO to fall back to, because a single io_parent can't declare more
+	   than one istream (e.g. istream-concat). If such an istream owns the
+	   ioloop IO, an i_stream_set_input_pending() for one of the istreams
+	   it is reading is lost, so panic instead of hanging silently. */
+	ISTREAM_HIDDEN_INPUTS_PANIC,
+};
+
 struct istream_private {
 /* inheritance: */
 	struct iostream_private iostream;
@@ -44,6 +71,17 @@ struct istream_private {
 	size_t high_pos;
 
 	struct istream *parent; /* for filter streams */
+	/* Streams that read from another istream without exposing it as
+	   their istream-parent (e.g. istream-multiplex channels) must point
+	   this to that istream. It is used only for finding the istream that
+	   owns the ioloop IO: without it i_stream_set_input_pending() called
+	   on the underlying stream (e.g. an SSL istream that still has
+	   buffered input) would be silently lost, because the IO is
+	   registered on this stream instead.
+
+	   Not referenced, so the istream declaring the link must make sure
+	   the pointer doesn't outlive the istream it points to. */
+	struct istream *io_parent;
 	uoff_t parent_start_offset;
 	/* Initially UOFF_T_MAX. Otherwise it's the exact known stream size,
 	   which can be used by stat() / get_size(). */
@@ -59,6 +97,9 @@ struct istream_private {
 	   this way streams can check if their parent streams have been
 	   accessed behind them. */
 	unsigned int access_counter;
+	/* How this istream reads istreams that aren't its istream-parent,
+	   as given to i_stream_create(). */
+	enum istream_hidden_inputs hidden_inputs;
 	/* Timestamp when read() last returned >0 */
 	struct timeval last_read_timeval;
 
@@ -70,6 +111,10 @@ struct istream_private {
 	/* After IO is added back to this istream, call io_set_pending() for
 	   it. This is set only for the root istream. */
 	bool io_pending:1;
+	/* io_add_istream() has been used at some point for this istream. This
+	   isn't cleared when the IO is removed again, so it can be used to
+	   check whether the istream is expected to have an IO. */
+	bool io_ever_added:1;
 	/* If this is TRUE for the istream or its parents after i_stream_read(),
 	   set the istream IO pending again. This is cleared before each
 	   istream read(). The purpose is to prevent hangs in case a child
@@ -96,6 +141,7 @@ enum istream_create_flag {
 
 struct istream * ATTR_NOWARN_UNUSED_RESULT
 i_stream_create(struct istream_private *stream, struct istream *parent, int fd,
+		enum istream_hidden_inputs hidden_inputs,
 		enum istream_create_flag flags) ATTR_NULL(2);
 /* Initialize parent lazily after i_stream_create() has already been called. */
 void i_stream_init_parent(struct istream_private *_stream,
@@ -139,6 +185,11 @@ void i_stream_snapshot_free(struct istream_snapshot **snapshot);
 struct istream *i_stream_get_root_io(struct istream *stream);
 void i_stream_set_io(struct istream *stream, struct io *io);
 void i_stream_unset_io(struct istream *stream, struct io *io);
+/* Returns TRUE if io_add_istream() has been used at some point for this istream
+   or for any other istream that shares its ioloop IO. This isn't cleared when
+   the IO is removed again, so it can be used to check whether the istream is
+   expected to have an IO. */
+bool i_stream_io_ever_added(struct istream *stream);
 
 /* Filter istreams should be calling this instead of i_stream_read() to avoid
    unnecessarily referencing memareas. After this call any pointers to the

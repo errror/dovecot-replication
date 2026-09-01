@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -265,7 +265,8 @@ int virtual_mailbox_ext_header_read(struct virtual_mailbox *mbox,
 		mailboxes = (const void *)(ext_hdr + 1);
 		ext_name_offset = sizeof(*ext_hdr) +
 			ext_hdr->mailbox_count * sizeof(*mailboxes);
-		if (ext_name_offset >= ext_size ||
+		if ((ext_name_offset == ext_size && ext_hdr->mailbox_count > 0) ||
+		    ext_name_offset > ext_size ||
 		    ext_hdr->mailbox_count > INT_MAX/sizeof(*mailboxes)) {
 			e_error(event,
 				"virtual index %s: Broken mailbox_count header",
@@ -1335,6 +1336,14 @@ static void virtual_sync_backend_box_deleted(struct virtual_sync_context *ctx,
 	bbox->deleted = TRUE;
 }
 
+static bool
+virtual_backend_box_is_uncreated(struct virtual_backend_box *bbox)
+{
+	/* The mailbox doesn't exist, but it's autocreated the next time it's
+	   accessed outside syncing. Don't treat it as a deleted mailbox. */
+	return mailbox_is_autocreated(bbox->box);
+}
+
 static int
 virtual_try_open_and_sync_backend_box(struct virtual_sync_context *ctx,
 				      struct virtual_backend_box *bbox,
@@ -1349,6 +1358,8 @@ virtual_try_open_and_sync_backend_box(struct virtual_sync_context *ctx,
 	if (ret < 0) {
 		if (mailbox_get_last_mail_error(bbox->box) != MAIL_ERROR_NOTFOUND)
 			return -1;
+		if (virtual_backend_box_is_uncreated(bbox))
+			return 0;
 		/* mailbox was deleted */
 		virtual_sync_backend_box_deleted(ctx, bbox);
 		return 0;
@@ -1400,6 +1411,8 @@ static int virtual_sync_backend_box(struct virtual_sync_context *ctx,
 					  &metadata) < 0)) {
 			if (mailbox_get_last_mail_error(bbox->box) != MAIL_ERROR_NOTFOUND)
 				return -1;
+			if (virtual_backend_box_is_uncreated(bbox))
+				return 0;
 			/* mailbox was deleted */
 			virtual_sync_backend_box_deleted(ctx, bbox);
 			return 0;
@@ -1820,9 +1833,9 @@ static int virtual_sync_mail_mailbox_cmp(const struct virtual_sync_mail *m1,
 	return 0;
 }
 
-static void virtual_sync_bboxes_get_mails(struct virtual_sync_context *ctx)
+static int virtual_sync_bboxes_get_mails(struct virtual_sync_context *ctx)
 {
-	uint32_t messages, vseq;
+	uint32_t messages, vseq, vuid, prev_vuid = 0;
 	const void *mail_data;
 	const struct virtual_mail_index_record *vrec;
 	struct virtual_sync_mail *sync_mail;
@@ -1830,6 +1843,16 @@ static void virtual_sync_bboxes_get_mails(struct virtual_sync_context *ctx)
 	messages = mail_index_view_get_messages_count(ctx->sync_view);
 	i_array_init(&ctx->all_mails, messages);
 	for (vseq = 1; vseq <= messages; vseq++) {
+		mail_index_lookup_uid(ctx->sync_view, vseq, &vuid);
+		if (vuid <= prev_vuid) {
+			mail_storage_set_critical(ctx->mbox->box.storage,
+				"Corrupted virtual index: uid=%u followed by uid=%u",
+				prev_vuid, vuid);
+			mail_index_mark_corrupted(ctx->mbox->box.index);
+			return -1;
+		}
+		prev_vuid = vuid;
+
 		mail_index_lookup_ext(ctx->sync_view, vseq,
 				      ctx->mbox->virtual_ext_id, &mail_data, NULL);
 		vrec = mail_data;
@@ -1838,6 +1861,7 @@ static void virtual_sync_bboxes_get_mails(struct virtual_sync_context *ctx)
 		sync_mail->vrec = *vrec;
 	}
 	array_sort(&ctx->all_mails, virtual_sync_mail_mailbox_cmp);
+	return 0;
 }
 
 static int virtual_sync_backend_boxes(struct virtual_sync_context *ctx)
@@ -1854,8 +1878,10 @@ static int virtual_sync_backend_boxes(struct virtual_sync_context *ctx)
 
 	/* we have different optimizations depending on whether the virtual
 	   mailbox consists of multiple backend boxes or just one */
-	if (count > 1)
-		virtual_sync_bboxes_get_mails(ctx);
+	if (count > 1) {
+		if (virtual_sync_bboxes_get_mails(ctx) < 0)
+			return -1;
+	}
 
 	for (i = 0; i < count; i++) {
 		struct virtual_backend_box *bbox = bboxes[i];
@@ -1901,11 +1927,34 @@ static void virtual_sync_backend_boxes_finish(struct virtual_sync_context *ctx)
 		virtual_backend_box_sync_mail_unset(bboxes[i]);
 }
 
+static void
+virtual_sync_backend_boxes_set_no_autocreate(struct virtual_mailbox *mbox,
+					     bool set)
+{
+	struct virtual_backend_box *const *bboxp;
+
+	/* Backend mailboxes must not be autocreated while the virtual
+	   mailbox's transaction log is locked. mailbox_create() locks the
+	   mailbox list first and the transaction log only afterwards, so the
+	   two would deadlock. A backend mailbox that doesn't exist yet is
+	   skipped by the sync instead, and it's created when it's next
+	   accessed outside syncing. */
+	array_foreach(&mbox->backend_boxes, bboxp) {
+		if (set)
+			(*bboxp)->box->flags |= MAILBOX_FLAG_NO_AUTOCREATE;
+		else {
+			(*bboxp)->box->flags &=
+				ENUM_NEGATE(MAILBOX_FLAG_NO_AUTOCREATE);
+		}
+	}
+}
+
 static int virtual_sync_finish(struct virtual_sync_context *ctx, bool success)
 {
 	struct event *event = ctx->mbox->box.event;
 	int ret = success ? 0 : -1;
 
+	virtual_sync_backend_boxes_set_no_autocreate(ctx->mbox, FALSE);
 	virtual_sync_backend_boxes_finish(ctx);
 	if (success) {
 		if (mail_index_sync_commit(&ctx->index_sync_ctx) < 0) {
@@ -1963,6 +2012,8 @@ static int virtual_sync(struct virtual_mailbox *mbox,
 		virtual_sync_deinit(&ctx);
 		return ret;
 	}
+
+	virtual_sync_backend_boxes_set_no_autocreate(mbox, TRUE);
 
 	ret = virtual_mailbox_ext_header_read(mbox, ctx->sync_view, &broken);
 	if (ret < 0)

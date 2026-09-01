@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "path-util.h"
@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 
-#define TEMP_DIRNAME ".test-path-util"
+#define TEMP_DIRNAME "path-util"
 
 static const char *tmpdir;
 static const char *cwd;
@@ -233,6 +233,180 @@ static void test_link_alloc2(void)
 	tmpdir = o_tmpdir;
 }
 
+static void test_openat_safe(void)
+{
+	const char *error;
+	int base_fd, fd;
+
+	base_fd = open(tmpdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (base_fd < 0)
+		i_fatal("open(%s) failed: %m", tmpdir);
+
+	/* Plain regular file inside base. */
+	const char *plain = t_strconcat(tmpdir, "/plain", NULL);
+	int wfd = creat(plain, 0600);
+	if (wfd < 0)
+		i_fatal("creat(%s) failed: %m", plain);
+	i_close_fd(&wfd);
+
+	fd = t_openat_safe(base_fd, "plain", O_RDONLY, &error);
+	test_assert(fd >= 0);
+	i_close_fd(&fd);
+
+	/* "./plain" and redundant slashes. */
+	fd = t_openat_safe(base_fd, "./plain", O_RDONLY, &error);
+	test_assert(fd >= 0);
+	i_close_fd(&fd);
+	fd = t_openat_safe(base_fd, ".//plain", O_RDONLY, &error);
+	test_assert(fd >= 0);
+	i_close_fd(&fd);
+
+	/* Symlink whose target is inside the base: allowed. */
+	const char *in_link = t_strconcat(tmpdir, "/in-link", NULL);
+	if (symlink("plain", in_link) < 0)
+		i_fatal("symlink(plain, %s) failed: %m", in_link);
+	fd = t_openat_safe(base_fd, "in-link", O_RDONLY, &error);
+	test_assert(fd >= 0);
+	i_close_fd(&fd);
+
+	/* Absolute symlink target: refused. */
+	const char *abs_link = t_strconcat(tmpdir, "/abs-link", NULL);
+	if (symlink("/etc/hostname", abs_link) < 0)
+		i_fatal("symlink failed: %m");
+	errno = 0;
+	fd = t_openat_safe(base_fd, "abs-link", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ELOOP);
+	test_assert(error != NULL);
+
+	/* Relative symlink with '..' that escapes the base: refused. */
+	const char *escape_link = t_strconcat(tmpdir, "/escape-link", NULL);
+	if (symlink("../../etc/hostname", escape_link) < 0)
+		i_fatal("symlink failed: %m");
+	errno = 0;
+	fd = t_openat_safe(base_fd, "escape-link", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ELOOP);
+	test_assert(error != NULL);
+
+	/* Direct '..' escape attempt: refused. */
+	errno = 0;
+	fd = t_openat_safe(base_fd, "../plain", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ELOOP);
+
+	/* Absolute literal path: refused. */
+	errno = 0;
+	fd = t_openat_safe(base_fd, "/etc/hostname", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ELOOP);
+
+	/* link2's target is an absolute path (tmpdir/link3): refused as an
+	   absolute target before the loop is ever followed. */
+	errno = 0;
+	fd = t_openat_safe(base_fd, "link2", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ELOOP);
+
+	/* Relative symlink loop staying inside the base: nothing rejects it
+	   except the hop counter, so this exercises
+	   PATH_UTIL_OPENAT_SAFE_MAX_SYMLINKS. */
+	const char *loopa = t_strconcat(tmpdir, "/loopa", NULL);
+	const char *loopb = t_strconcat(tmpdir, "/loopb", NULL);
+	if (symlink("loopb", loopa) < 0)
+		i_fatal("symlink(loopb, %s) failed: %m", loopa);
+	if (symlink("loopa", loopb) < 0)
+		i_fatal("symlink(loopa, %s) failed: %m", loopb);
+	errno = 0;
+	fd = t_openat_safe(base_fd, "loopa", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ELOOP);
+	test_assert(error != NULL);
+
+	/* '..' that stays within the base: allowed. Create sub/under and
+	   reach back to plain via sub/../plain. */
+	const char *subdir = t_strconcat(tmpdir, "/sub", NULL);
+	if (mkdir(subdir, 0700) < 0 && errno != EEXIST)
+		i_fatal("mkdir(%s) failed: %m", subdir);
+	fd = t_openat_safe(base_fd, "sub/../plain", O_RDONLY, &error);
+	test_assert(fd >= 0);
+	i_close_fd(&fd);
+
+	/* Breaking out of the base via subdirectory. */
+	errno = 0;
+	fd = t_openat_safe(base_fd, "sub/../../plain", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ELOOP);
+
+	/* Nonexistent file inside base: ENOENT, not ELOOP. */
+	errno = 0;
+	fd = t_openat_safe(base_fd, "no-such-file", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ENOENT);
+
+	i_close_fd(&base_fd);
+
+	i_unlink(plain);
+	i_unlink(in_link);
+	i_unlink(abs_link);
+	i_unlink(escape_link);
+	i_unlink(loopa);
+	i_unlink(loopb);
+	if (rmdir(subdir) < 0)
+		i_error("rmdir(%s) failed: %m", subdir);
+}
+
+static void test_openat_safe_dir(void)
+{
+	const char *error;
+	int fd;
+
+	/* Plain file: success. */
+	const char *plain = t_strconcat(tmpdir, "/plain2", NULL);
+	int wfd = creat(plain, 0600);
+	if (wfd < 0)
+		i_fatal("creat(%s) failed: %m", plain);
+	i_close_fd(&wfd);
+
+	fd = t_openat_safe_dir(tmpdir, "plain2", O_RDONLY, &error);
+	test_assert(fd >= 0);
+	i_close_fd(&fd);
+
+	/* Nonexistent base_dir. */
+	errno = 0;
+	fd = t_openat_safe_dir(t_strconcat(tmpdir, "/no-such-dir", NULL),
+			       "plain2", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ENOENT);
+	test_assert(error != NULL);
+
+	/* Absolute symlink in relative part: refused. */
+	const char *abs_link2 = t_strconcat(tmpdir, "/abs-link2", NULL);
+	if (symlink("/etc/hostname", abs_link2) < 0)
+		i_fatal("symlink failed: %m");
+	errno = 0;
+	fd = t_openat_safe_dir(tmpdir, "abs-link2", O_RDONLY, &error);
+	test_assert(fd == -1);
+	test_assert(errno == ELOOP);
+
+	/* O_NOFOLLOW: symlink as base_dir final component refused. */
+	const char *dir_link = t_strconcat(tmpdir, "/dir-link", NULL);
+	if (symlink(tmpdir, dir_link) < 0)
+		i_fatal("symlink failed: %m");
+	errno = 0;
+	fd = t_openat_safe_dir(dir_link, "plain2",
+			       O_RDONLY | O_NOFOLLOW, &error);
+	test_assert(fd == -1);
+	/* Without O_NOFOLLOW the same symlinked base_dir succeeds. */
+	fd = t_openat_safe_dir(dir_link, "plain2", O_RDONLY, &error);
+	test_assert(fd >= 0);
+	i_close_fd(&fd);
+
+	i_unlink(plain);
+	i_unlink(abs_link2);
+	i_unlink(dir_link);
+}
+
 static void test_cleanup(void)
 {
 	const char *error;
@@ -241,10 +415,12 @@ static void test_cleanup(void)
 		i_error("unlink_directory() failed: %s", error);
 }
 
-static void test_init(void)
+static void test_path_util_init(void)
 {
 	const char *error;
-	test_assert(t_get_working_dir(&cwd, &error) == 0);
+	cwd = test_dir_get();
+	if (t_normpath(cwd, &cwd, &error) < 0)
+		i_fatal("t_normpath(%s) failed: %s", cwd, error);
 	tmpdir = t_strconcat(cwd, "/"TEMP_DIRNAME, NULL);
 
 	test_cleanup();
@@ -259,7 +435,7 @@ void test_path_util(void)
 {
 	test_begin("test_path_util");
 	alarm(20);
-	test_init();
+	test_path_util_init();
 	test_local_path();
 	test_absolute_path_no_change();
 	test_travel_to_root();
@@ -272,6 +448,8 @@ void test_path_util(void)
 	test_abspath_vs_normpath();
 	test_link_alloc();
 	test_link_alloc2();
+	test_openat_safe();
+	test_openat_safe_dir();
 	test_cleanup();
 	alarm(0);
 	test_end();

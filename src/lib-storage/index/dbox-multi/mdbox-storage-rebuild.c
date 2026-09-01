@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -26,8 +26,8 @@ struct mdbox_rebuild_msg {
 
 	guid_128_t guid_128;
 	uint32_t file_id;
-	uint32_t offset;
-	uint32_t rec_size;
+	uoff_t offset;
+	uoff_t rec_size;
 	uoff_t mail_size;
 	uint32_t map_uid;
 
@@ -219,8 +219,8 @@ static int rebuild_file_mails(struct mdbox_storage_rebuild_context *ctx,
 		} else {
 			/* duplicate GUID, but not a duplicate message. */
 			e_error(event, "Duplicate GUID %s in "
-				"m.%u:%u (size=%"PRIuUOFF_T") and m.%u:%u "
-				"(size=%"PRIuUOFF_T")",
+				"m.%u:%"PRIuUOFF_T" (size=%"PRIuUOFF_T") and "
+				"m.%u:%"PRIuUOFF_T" (size=%"PRIuUOFF_T")",
 				guid, old_rec->file_id, old_rec->offset,
 				old_rec->mail_size, rec->file_id, rec->offset,
 				rec->mail_size);
@@ -559,7 +559,7 @@ rebuild_mailbox(struct mdbox_storage_rebuild_context *ctx,
 	int ret;
 
 	box = mailbox_alloc(ns->list, vname, MAILBOX_FLAG_READONLY |
-			    MAILBOX_FLAG_IGNORE_ACLS);
+			    MAILBOX_FLAG_IGNORE_ACLS | MAILBOX_FLAG_RAW_NAME);
 	if (box->storage != &ctx->storage->storage.storage) {
 		/* the namespace has multiple storages. */
 		mailbox_free(&box);
@@ -915,7 +915,7 @@ static bool mdbox_mailbox_is_fscked(struct mailbox *box)
 
 static int
 mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx,
-				   struct mailbox *fsckd_box,
+				   struct mailbox *fscked_box,
 				   enum mdbox_rebuild_reason reason,
 				   const char **reason_string_r)
 {
@@ -946,9 +946,9 @@ mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx,
 		   mdbox_map_is_fscked(ctx->storage->map))
 		*reason_string_r = "dovecot.index.map was fsck'd";
 	else if ((reason & MDBOX_REBUILD_REASON_MAILBOX_FSCKD) != 0 &&
-		 mdbox_mailbox_is_fscked(fsckd_box)) {
+		 mdbox_mailbox_is_fscked(fscked_box)) {
 		*reason_string_r = t_strdup_printf(
-			"Mailbox %s index was fsck'd", fsckd_box->vname);
+			"Mailbox %s index was fsck'd", fscked_box->vname);
 	} else {
 		/* storage was already rebuilt by someone else */
 		return 0;
@@ -1001,7 +1001,7 @@ static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx,
 static int
 mdbox_storage_rebuild_in_context(struct mdbox_storage *storage,
 				 struct mdbox_map_atomic_context *atomic,
-				 struct mailbox *fsckd_box,
+				 struct mailbox *fscked_box,
 				 enum mdbox_rebuild_reason rebuild_reason)
 {
 	struct mdbox_storage_rebuild_context *ctx;
@@ -1017,7 +1017,7 @@ mdbox_storage_rebuild_in_context(struct mdbox_storage *storage,
 	}
 
 	ctx = mdbox_storage_rebuild_init(storage, atomic);
-	if ((ret = mdbox_storage_rebuild_scan_prepare(ctx, fsckd_box,
+	if ((ret = mdbox_storage_rebuild_scan_prepare(ctx, fscked_box,
 						      rebuild_reason,
 						      &reason_string)) > 0) {
 		struct event_reason *reason = event_reason_begin("mdbox:rebuild");
@@ -1034,7 +1034,7 @@ mdbox_storage_rebuild_in_context(struct mdbox_storage *storage,
 }
 
 int mdbox_storage_rebuild(struct mdbox_storage *storage,
-			  struct mailbox *fsckd_box,
+			  struct mailbox *fscked_box,
 			  enum mdbox_rebuild_reason reason)
 {
 	struct mdbox_map_atomic_context *atomic;
@@ -1042,7 +1042,7 @@ int mdbox_storage_rebuild(struct mdbox_storage *storage,
 
 	atomic = mdbox_map_atomic_begin(storage->map);
 	ret = mdbox_storage_rebuild_in_context(storage, atomic,
-					       fsckd_box, reason);
+					       fscked_box, reason);
 	mdbox_map_atomic_set_success(atomic);
 	mdbox_map_atomic_unset_fscked(atomic);
 	(void)mail_index_reset_fscked(storage->map->index);

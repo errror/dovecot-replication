@@ -1,7 +1,8 @@
-/* Copyright (c) 2015-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "test-common.h"
+#include "test-dir.h"
 #include "hex-binary.h"
 #include "settings.h"
 #include "master-service.h"
@@ -429,6 +430,7 @@ int main(int argc, char **argv)
 					     &argc, &argv, "");
 	settings_info_register(&dict_setting_parser_info);
 	settings_info_register(&dict_file_setting_parser_info);
+	test_dir_init("test-mail-key");
 	int ret = test_run(tests);
 	master_service_deinit(&master_service);
 	return ret;

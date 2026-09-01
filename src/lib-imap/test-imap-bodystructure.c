@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -398,10 +398,11 @@ msg_parse(pool_t pool, const char *message, unsigned int max_nested_mime_parts,
 
 	input = i_stream_create_from_data(message, strlen(message));
 	parser = message_parser_init(pool, input, &parser_set);
+	struct message_part_data_limits limits = MESSAGE_PART_DATA_LIMITS_INIT;
 	while ((ret = message_parser_parse_next_block(parser, &block)) > 0) {
 		if (parse_bodystructure) {
 			message_part_data_parse_from_header(pool, block.part,
-							block.hdr);
+							&limits, block.hdr);
 		}
 	}
 	test_assert(ret < 0);
@@ -425,11 +426,11 @@ static void test_imap_bodystructure_write(void)
 		test_begin(t_strdup_printf("imap bodystructure write [%u]", i));
 		parts = msg_parse(pool, test->message, 0, 0, TRUE);
 
-		test_assert(imap_bodystructure_write(parts, str, TRUE, &error) == 0);
+		test_assert(imap_bodystructure_write(parts, str, TRUE, 0, &error) == 0);
 		test_assert(strcmp(str_c(str), test->bodystructure) == 0);
 
 		str_truncate(str, 0);
-		test_assert(imap_bodystructure_write(parts, str, FALSE, &error) == 0);
+		test_assert(imap_bodystructure_write(parts, str, FALSE, 0, &error) == 0);
 		test_assert(strcmp(str_c(str), test->body) == 0);
 
 		pool_unref(&pool);
@@ -445,7 +446,7 @@ static void test_imap_bodystructure_write(void)
 		parts->flags &= ENUM_NEGATE(MESSAGE_PART_FLAG_TEXT);
 
 		string_t *str = t_str_new(128);
-		test_assert(imap_bodystructure_write(parts, str, FALSE, &error) < 0);
+		test_assert(imap_bodystructure_write(parts, str, FALSE, 0, &error) < 0);
 		test_assert_strcmp(error, "text flag mismatch");
 		pool_unref(&pool);
 		test_end();
@@ -477,7 +478,7 @@ static void test_imap_bodystructure_parse(void)
 
 		if (ret == 0) {
 			str_truncate(str, 0);
-			test_assert(imap_bodystructure_write(parts, str, TRUE, &error) == 0);
+			test_assert(imap_bodystructure_write(parts, str, TRUE, 0, &error) == 0);
 			test_assert(strcmp(str_c(str), test->bodystructure) == 0);
 		} else {
 			i_error("Invalid BODYSTRUCTURE: %s", error);
@@ -581,7 +582,7 @@ static void test_imap_bodystructure_parse_full(void)
 
 		if (ret == 0) {
 			str_truncate(str, 0);
-			test_assert(imap_bodystructure_write(parts, str, TRUE, &error) == 0);
+			test_assert(imap_bodystructure_write(parts, str, TRUE, 0, &error) == 0);
 			test_assert(strcmp(str_c(str), test->bodystructure) == 0);
 		} else {
 			i_error("Invalid BODYSTRUCTURE: %s", error);
@@ -613,7 +614,7 @@ static void test_imap_bodystructure_normalize(void)
 
 		if (ret == 0) {
 			str_truncate(str, 0);
-			test_assert(imap_bodystructure_write(parts, str, TRUE, &error) == 0);
+			test_assert(imap_bodystructure_write(parts, str, TRUE, 0, &error) == 0);
 			test_assert(strcmp(str_c(str), test->output) == 0);
 		} else {
 			i_error("Invalid BODYSTRUCTURE: %s", error);
@@ -702,7 +703,7 @@ static void test_imap_bodystructure_truncation(void)
 				  TRUE);
 
 		/* write out BODYSTRUCTURE and serialize message_parts */
-		test_assert(imap_bodystructure_write(parts, str_body, TRUE, &error) == 0);
+		test_assert(imap_bodystructure_write(parts, str_body, TRUE, 0, &error) == 0);
 		message_part_serialize(parts, str_parts);
 
 		/* now deserialize message_parts and make sure they can be used
@@ -716,6 +717,38 @@ static void test_imap_bodystructure_truncation(void)
 				   truncation_tests[i].bodystructure);
 	}
 	pool_unref(&pool);
+	test_end();
+}
+
+static void test_imap_bodystructure_parse_full_invalid(void)
+{
+	static const struct {
+		const char *bodystructure;
+		const char *error;
+	} tests[] = {
+		/* message/rfc822 truncated right after the size field: the
+		   envelope, child bodystructure and line count are all missing.
+		   The parser must reject this without reading past the end of
+		   the argument list. */
+		{ "\"message\" \"rfc822\" NIL NIL NIL \"7bit\" 0",
+		  "Envelope list expected" },
+		{ "\"message\" \"rfc822\" NIL NIL NIL \"7bit\" 0 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)",
+		  "Child bodystructure list expected" },
+	};
+	const char *error;
+
+	test_begin("imap bodystructure parser full invalid");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) T_BEGIN {
+		struct message_part *parts = NULL;
+		pool_t pool = pool_alloconly_create(
+			"imap bodystructure parse full invalid", 1024);
+
+		test_assert_idx(imap_bodystructure_parse_full(
+			tests[i].bodystructure, pool, &parts, &error) == -1, i);
+		test_assert_strcmp_idx(error, tests[i].error, i);
+
+		pool_unref(&pool);
+	} T_END;
 	test_end();
 }
 
@@ -752,6 +785,7 @@ int main(void)
 		test_imap_bodystructure_parse_invalid,
 		test_imap_bodystructure_normalize,
 		test_imap_bodystructure_parse_full,
+		test_imap_bodystructure_parse_full_invalid,
 		test_imap_bodystructure_truncation,
 		test_imap_bodystructure_nesting,
 		NULL

@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "hex-binary.h"
@@ -424,6 +424,39 @@ static void test_hash_methods_fips() {
 			"\xe5\x89\xc5\x1c\xa1\xa4\xa8\x41"
 			"\x6d\xf6\x54\x5a\x1c\xe8\xba\x00",
 			512 / 8,
+		},
+		/* xxh64 reference vectors (seed=0) */
+		{ "xxh64",
+			"",
+			0,
+			1,
+			"\xef\x46\xdb\x37\x51\xd8\xe9\x99",
+			64 / 8
+		},
+		{ "xxh64",
+			"abc",
+			3,
+			1,
+			"\x44\xbc\x2c\xf5\xad\x77\x09\x99",
+			64 / 8
+		},
+		/* 62 bytes: exercises the >= 32-byte accumulator path */
+		{ "xxh64",
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
+			"ghijklmnopqrstuvwxyz0123456789",
+			62,
+			1,
+			"\xba\x76\x1a\x9a\xa8\x0e\x0d\x36",
+			64 / 8
+		},
+		/* 16 bytes × 3 rounds: exercises chunked input across the 32-byte block boundary */
+		{ "xxh64",
+			"\x00\x01\x02\x03\x04\x05\x06\x07"
+			"\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f",
+			16,
+			3,
+			"\x32\x0d\xcd\xab\xd8\x29\x7a\x9e",
+			64 / 8
 		},
 	};
 

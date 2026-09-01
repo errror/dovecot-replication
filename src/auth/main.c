@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "array.h"
@@ -19,10 +19,9 @@
 #include "dict.h"
 #include "password-scheme.h"
 #include "passdb-cache.h"
-#include "mech.h"
-#include "otp.h"
-#include "mech-otp-common.h"
+#include "sasl-server.h"
 #include "auth.h"
+#include "auth-sasl.h"
 #include "auth-penalty.h"
 #include "auth-token.h"
 #include "auth-request-handler.h"
@@ -71,7 +70,6 @@ time_t process_start_time;
 struct auth_penalty *auth_penalty;
 
 static struct module *modules = NULL;
-static struct mechanisms_register *mech_reg;
 static ARRAY(struct auth_socket_listener) listeners;
 
 void auth_refresh_proctitle(void)
@@ -179,9 +177,8 @@ static void main_preinit(void)
 		auth_penalty = auth_penalty_init(AUTH_PENALTY_ANVIL_PATH);
 
 	dict_drivers_register_builtin();
-	mech_init(global_auth_settings);
-	mech_reg = mech_register_init(global_auth_settings);
-	auths_preinit(NULL, global_auth_settings, mech_reg, protocols);
+	auth_sasl_preinit(global_auth_settings);
+	auths_preinit(NULL, global_auth_settings, protocols);
 
 	listeners_init();
 	if (!worker)
@@ -223,6 +220,7 @@ static void main_init(void)
 	child_wait_init();
 	auth_worker_connection_init();
 	auths_init();
+	auth_sasl_init();
 	auth_request_handler_init();
 	auth_policy_init();
 
@@ -241,7 +239,8 @@ static void main_init(void)
 		/* caching is handled only by the main auth process */
 		passdb_cache_init(global_auth_settings);
 		if (global_auth_settings->allow_weak_schemes)
-			i_warning("Weak password schemes are allowed");
+			i_warning("Weak password schemes are allowed "
+				  "(auth_allow_weak_schemes=yes)");
 	}
 }
 
@@ -258,10 +257,8 @@ static void main_deinit(void)
         auth_worker_connection_deinit();
 	/* deinit passdbs and userdbs. it aborts any pending async requests. */
 	auths_deinit();
-	/* flush pending requests */
+	/* flush pending request failures */
 	auth_request_handler_deinit();
-	/* there are no more auth requests */
-	auths_free();
 	dict_drivers_unregister_builtin();
 
 	auth_token_deinit();
@@ -271,20 +268,23 @@ static void main_deinit(void)
 	auth_worker_connections_destroy_all();
 
 	auth_policy_deinit();
-	mech_register_deinit(&mech_reg);
-	mech_otp_deinit();
 	db_oauth2_deinit();
-	mech_deinit(global_auth_settings);
-	settings_free(global_auth_settings);
+
+	/* there are no more auth requests */
+	auths_free();
 
 	/* allow modules to unregister their dbs/drivers/etc. before freeing
 	   the whole data structures containing them. */
 	module_dir_unload(&modules);
 
+	auth_sasl_deinit();
+
 	userdbs_deinit();
 	passdbs_deinit();
 	passdb_cache_deinit();
         password_schemes_deinit();
+
+	settings_free(global_auth_settings);
 
 	sql_drivers_deinit();
 	child_wait_deinit();
@@ -370,7 +370,6 @@ int main(int argc, char *argv[])
 		MASTER_SERVICE_FLAG_NO_SSL_INIT;
 
 	master_service = master_service_init("auth", service_flags, &argc, &argv, "w");
-	master_service_init_log(master_service);
 
 	while ((c = master_getopt(master_service)) > 0) {
 		switch (c) {
@@ -382,6 +381,7 @@ int main(int argc, char *argv[])
 			return FATAL_DEFAULT;
 		}
 	}
+	master_service_init_log(master_service);
 
 	main_preinit();
 	master_service_set_die_callback(master_service, auth_die);

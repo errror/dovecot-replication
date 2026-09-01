@@ -3,6 +3,8 @@
 
 #include "lib.h"
 #include "test-common.h"
+#include "test-dir.h"
+#include "test-subprocess.h"
 
 #define TEST(x) TEST_DECL(x)
 #define FATAL(x) FATAL_DECL(x)

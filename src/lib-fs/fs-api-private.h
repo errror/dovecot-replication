@@ -39,6 +39,7 @@ struct fs_vfuncs {
 			  enum fs_open_mode mode, enum fs_open_flags flags);
 	void (*file_deinit)(struct fs_file *file);
 	void (*file_close)(struct fs_file *file);
+	bool (*file_equals)(struct fs_file *file1, struct fs_file *file2);
 	const char *(*get_path)(struct fs_file *file);
 
 	void (*set_async_callback)(struct fs_file *file,
@@ -179,6 +180,7 @@ extern const struct fs fs_class_sis_queue;
 extern const struct fs fs_class_test;
 
 void fs_class_register(const struct fs *fs_class);
+void fs_class_unregister(const struct fs *fs_class);
 
 int fs_init_parent(struct fs *fs, const struct fs_parameters *params,
 		   const char **error_r);

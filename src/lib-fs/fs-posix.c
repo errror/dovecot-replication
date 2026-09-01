@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -395,6 +395,15 @@ static void fs_posix_file_close(struct fs_file *_file)
 		}
 		file->fd = -1;
 	}
+}
+
+static bool fs_posix_file_equals(struct fs_file *_file1, struct fs_file *_file2)
+{
+	struct posix_fs_file *file1 =
+		container_of(_file1, struct posix_fs_file, file);
+	struct posix_fs_file *file2 =
+		container_of(_file2, struct posix_fs_file, file);
+	return strcmp(file1->full_path, file2->full_path) == 0;
 }
 
 static void fs_posix_file_deinit(struct fs_file *_file)
@@ -822,6 +831,11 @@ static int fs_posix_stat(struct fs_file *_file, struct stat *st_r)
 			return -1;
 		}
 	}
+	/* Used by obox to set MAIL_FETCH_REFCOUNT_ID for lazy_expunge: */
+	fs_default_set_metadata(_file, FS_METADATA_OBJECTID,
+		t_strdup_printf("%u:%u:%llu",
+				major(st_r->st_dev), minor(st_r->st_dev),
+				(unsigned long long)st_r->st_ino));
 	return 0;
 }
 
@@ -836,7 +850,8 @@ static int fs_posix_copy(struct fs_file *_src, struct fs_file *_dest)
 
 	fs_posix_write_rename_if_needed(dest);
 	ret = link(src->full_path, dest->full_path);
-	if (errno == EEXIST && dest->open_mode == FS_OPEN_MODE_REPLACE) {
+	if (ret < 0 && errno == EEXIST &&
+	    dest->open_mode == FS_OPEN_MODE_REPLACE) {
 		/* destination file already exists - replace it */
 		i_unlink_if_exists(dest->full_path);
 		ret = link(src->full_path, dest->full_path);
@@ -1027,6 +1042,7 @@ const struct fs fs_class_posix = {
 		.file_init = fs_posix_file_init,
 		.file_deinit = fs_posix_file_deinit,
 		.file_close = fs_posix_file_close,
+		.file_equals = fs_posix_file_equals,
 		.get_path = NULL,
 		.set_async_callback = NULL,
 		.wait_async = NULL,

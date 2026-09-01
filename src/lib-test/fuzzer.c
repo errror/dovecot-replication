@@ -1,4 +1,4 @@
-/* Copyright (c) 2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
@@ -18,8 +18,10 @@ void fuzzer_init(struct fuzzer_context *fuzz_ctx)
 		lib_init();
 		lib_signals_init();
 		lib_signals_ignore(SIGPIPE, TRUE);
+		fuzz_ctx->lib_initialized = TRUE;
 	}
 	fuzz_ctx->fd = -1;
+	fuzz_ctx->fd_pump = -1;
 }
 
 void fuzzer_deinit(struct fuzzer_context *fuzz_ctx)
@@ -33,6 +35,10 @@ void fuzzer_deinit(struct fuzzer_context *fuzz_ctx)
 		(void)close(fuzz_ctx->fd_pump);
 	if (fuzz_ctx->ioloop != NULL)
 		io_loop_destroy(&fuzz_ctx->ioloop);
+	if (fuzz_ctx->lib_initialized) {
+		lib_signals_deinit();
+		lib_deinit();
+	}
 }
 
 static void pump_finished(enum iostream_pump_status status ATTR_UNUSED,
@@ -85,7 +91,6 @@ int fuzzer_io_as_fd(struct fuzzer_context *fuzz_ctx,
 	iostream_pump_start(fuzz_ctx->pump);
 	return sfd[1];
 }
-
 
 const char *fuzzer_t_strndup_replace_zero(
 	const uint8_t *data, size_t size, char subst)

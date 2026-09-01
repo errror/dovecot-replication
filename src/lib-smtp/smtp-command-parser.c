@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -299,6 +299,7 @@ static int smtp_command_parse_parameters(struct smtp_command_parser *parser)
 		/* Buffered also in the parser */
 		buffer_append(parser->line_buffer, parser->cur,
 			      (mp - parser->cur));
+		buffer_nul_terminate(parser->line_buffer);
 		parser->state.cmd_params =
 			buffer_free_without_data(&parser->line_buffer);
 	}
@@ -506,6 +507,7 @@ static int smtp_command_parse_finish_data(struct smtp_command_parser *parser)
 }
 
 int smtp_command_parse_next(struct smtp_command_parser *parser,
+			    bool only_finish_previous,
 			    const char **cmd_name_r, const char **cmd_params_r,
 			    enum smtp_command_parse_error *error_code_r,
 			    const char **error_r)
@@ -517,6 +519,8 @@ int smtp_command_parse_next(struct smtp_command_parser *parser,
 		 parser->state.state == SMTP_COMMAND_PARSE_STATE_ERROR);
 	parser->auth_response = FALSE;
 
+	*cmd_name_r = NULL;
+	*cmd_params_r = NULL;
 	*error_code_r = parser->error_code = SMTP_COMMAND_PARSE_ERROR_NONE;
 	*error_r = NULL;
 
@@ -532,6 +536,9 @@ int smtp_command_parse_next(struct smtp_command_parser *parser,
 		}
 		return ret;
 	}
+
+	if (only_finish_previous)
+		return 1;
 
 	ret = smtp_command_parse(parser);
 	if (ret <= 0) {

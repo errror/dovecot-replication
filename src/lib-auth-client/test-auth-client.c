@@ -1,4 +1,4 @@
-/* Copyright (c) 2019 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -22,6 +22,7 @@
 #include "auth-client.h"
 
 #include <unistd.h>
+#include <signal.h>
 
 #define TEST_SOCKET "./auth-client-test"
 #define CLIENT_PROGRESS_TIMEOUT     30
@@ -95,6 +96,7 @@ test_run_client_server(test_client_init_t *client_test,
 static void test_server_connection_refused(void)
 {
 	i_close_fd(&fd_listen);
+	test_subprocess_notify_signal_send_parent(SIGUSR1);
 	i_sleep_intr_secs(500);
 }
 
@@ -867,6 +869,7 @@ struct login_test {
 static void
 test_client_auth_callback(struct auth_client_request *request,
 			  enum auth_request_status status,
+			  const char *log_error ATTR_UNUSED,
 			  const char *data_base64 ATTR_UNUSED,
 			  const char *const *args ATTR_UNUSED, void *context)
 {
@@ -916,14 +919,14 @@ test_client_auth_callback(struct auth_client_request *request,
 
 static void
 test_client_auth_connected(struct auth_client *client ATTR_UNUSED,
-			   bool connected, void *context)
+			   const char *error, void *context)
 {
 	struct login_test *login_test = context;
 
 	if (to_client_progress != NULL)
 		timeout_reset(to_client_progress);
 
-	if (login_test->status == 0 && !connected) {
+	if (login_test->status == 0 && error != NULL) {
 		i_assert(login_test->error == NULL);
 		login_test->error = i_strdup("Connection failed");
 		login_test->status = -1;
@@ -1119,10 +1122,11 @@ static void server_connection_accept(void *context ATTR_UNUSED)
 
 	/* accept new client */
 	fd = net_accept(fd_listen, NULL, NULL);
-	if (fd == -1)
+	if (fd == -1) {
+		if (!NET_ACCEPT_ENOCONN(errno))
+			i_fatal("test server: accept() failed: %m");
 		return;
-	if (fd == -2)
-		i_fatal("test server: accept() failed: %m");
+	}
 
 	server_connection_init(fd);
 }
@@ -1147,6 +1151,9 @@ static void test_server_run(void)
 
 	server_conn_list = connection_list_init(&server_connection_set,
 						&server_connection_vfuncs);
+
+	/* notify client that the server is ready */
+	test_subprocess_notify_signal_send_parent(SIGUSR1);
 
 	io_loop_run(ioloop);
 
@@ -1199,8 +1206,6 @@ static void test_run_client(test_client_init_t *client_test)
 	if (debug)
 		i_debug("PID=%s", my_pid);
 
-	i_sleep_intr_msecs(100); /* wait a little for server setup */
-
 	ioloop = io_loop_create();
 	if (client_test())
 		io_loop_run(ioloop);
@@ -1217,9 +1222,14 @@ test_run_client_server(test_client_init_t *client_test,
 {
 	if (server_test != NULL) {
 		/* Fork server */
+		test_subprocess_notify_signal_reset(SIGUSR1);
 		fd_listen = test_open_server_fd();
 		test_subprocess_fork(test_run_server, server_test, FALSE);
 		i_close_fd(&fd_listen);
+
+		/* wait until the server is ready before connecting */
+		test_subprocess_notify_signal_wait(
+			SIGUSR1, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 	}
 
 	/* Run client */
@@ -1266,12 +1276,13 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	test_subprocesses_init(debug);
-	test_subprocess_set_cleanup_callback(main_cleanup);
+	test_init();
+	event_set_forced_debug(test_event, debug);
+	test_set_cleanup_callback(main_cleanup);
+	test_subprocesses_init();
 
 	ret = test_run(test_functions);
 
-	test_subprocesses_deinit();
 	main_deinit();
 	lib_deinit();
 	return ret;

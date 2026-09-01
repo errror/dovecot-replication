@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /* doc/thread-refs.txt describes the incremental algorithm we use here. */
 
@@ -7,6 +7,9 @@
 #include "bsearch-insert-pos.h"
 #include "hash2.h"
 #include "message-id.h"
+#include "master-service.h"
+#include "master-service-settings.h"
+#include "storage-version.h"
 #include "mail-search.h"
 #include "mail-search-build.h"
 #include "mailbox-search-result-private.h"
@@ -93,9 +96,11 @@ mail_strmap_rec_get_msgid(struct mail_thread_context *ctx,
 
 	/* get the nth message-id */
 	msgid = message_id_get_next(&msgids);
-	if (msgid != NULL) {
-		for (; n > 0; n--)
-			msgid = message_id_get_next(&msgids);
+	if (msgid != NULL && n > 0) {
+		for (; n > 1; n--) T_BEGIN {
+			(void)message_id_get_next(&msgids);
+		} T_END;
+		msgid = message_id_get_next(&msgids);
 	}
 
 	if (msgid == NULL) {
@@ -185,7 +190,7 @@ static void mail_thread_strmap_remap(const uint32_t *idx_map,
 	i_array_init(&new_nodes, new_count + invalid_count + 32);
 
 	/* optimization: allocate all nodes initially */
-	(void)array_idx_modifiable(&new_nodes, new_count-1);
+	(void)array_idx_get_space(&new_nodes, new_count-1);
 
 	/* renumber existing valid nodes. all existing records in old_nodes
 	   should also exist in idx_map since we've removed expunged messages
@@ -212,7 +217,7 @@ static void mail_thread_strmap_remap(const uint32_t *idx_map,
 	new_first_invalid = new_count + 1 +
 		THREAD_INVALID_MSGID_STR_IDX_SKIP_COUNT;
 	for (i = 0; i < invalid_count; i++) {
-		node = array_idx_modifiable(&new_nodes, new_first_invalid + i);
+		node = array_idx_get_space(&new_nodes, new_first_invalid + i);
 		*node = old_nodes[cache->first_invalid_msgid_str_idx + i];
 		if (node->parent_idx != 0) {
 			node->parent_idx = idx_map[node->parent_idx];
@@ -266,13 +271,20 @@ mail_thread_map_add_mail(struct mail_thread_context *ctx, struct mail *mail)
 	msgid = message_id_get_next(&references);
 	if (msgid != NULL) {
 		ref_index = MAIL_THREAD_NODE_REF_REFERENCES1;
+		mail_index_strmap_view_sync_add(ctx->strmap_sync,
+						mail->uid, ref_index, msgid);
 		do {
-			mail_index_strmap_view_sync_add(ctx->strmap_sync,
-							mail->uid,
-							ref_index, msgid);
-			ref_index++;
-			msgid = message_id_get_next(&references);
-		} while (msgid != NULL);
+			T_BEGIN {
+				ref_index++;
+				msgid = message_id_get_next(&references);
+				if (msgid != NULL) {
+					mail_index_strmap_view_sync_add(
+						ctx->strmap_sync, mail->uid,
+						ref_index, msgid);
+				}
+			} T_END;
+		} while (msgid != NULL &&
+			 ref_index < MAIL_THREAD_NODE_REF_REFERENCES1 + MAIL_THREAD_REFERENCES_MAX);
 	} else {
 		/* no References:, use In-Reply-To: */
 		if (thread_get_mail_header(mail, HDR_IN_REPLY_TO,
@@ -659,8 +671,15 @@ void index_thread_mailbox_opened(struct mailbox *box)
 	box->v.close = mail_thread_mailbox_close;
 	box->v.free = mail_thread_mailbox_free;
 
+	const struct master_service_settings *master_set =
+		master_service_get_service_settings(master_service);
+	bool use_xxh64 = master_set != NULL &&
+		storage_version_has_mail_index_strmap_v2(
+			master_set->dovecot_storage_version);
+
 	tbox->strmap = mail_index_strmap_init(box->index,
-					      MAIL_THREAD_INDEX_SUFFIX);
+					      MAIL_THREAD_INDEX_SUFFIX,
+					      use_xxh64);
 	tbox->next_msgid_idx = 1;
 
 	tbox->cache = i_new(struct mail_thread_cache, 1);

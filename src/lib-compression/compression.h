@@ -22,8 +22,9 @@ extern const struct compression_handler compression_handlers[];
 int compression_lookup_handler(const char *name,
 			       const struct compression_handler **handler_r);
 /* Detect handler by looking at the first few bytes of the input stream. */
-const struct compression_handler *
-compression_detect_handler(struct istream *input);
+int ATTR_NOWARN_UNUSED_RESULT
+compression_detect_handler(struct istream *input,
+			   const struct compression_handler **handler_r);
 /* Lookup handler based on filename extension in the path, returns the same
  * values as compression_lookup_handler. */
 int compression_lookup_handler_from_ext(const char *path,

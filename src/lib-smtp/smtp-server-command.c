@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -879,7 +879,7 @@ void smtp_server_command_pipeline_block(struct smtp_server_cmd_ctx *cmd)
 	e_debug(cmd->event, "Pipeline blocked");
 
 	command->pipeline_blocked = TRUE;
-	smtp_server_connection_input_lock(conn);
+	smtp_server_connection_input_halt(conn);
 }
 
 void smtp_server_command_pipeline_unblock(struct smtp_server_cmd_ctx *cmd)
@@ -890,8 +890,8 @@ void smtp_server_command_pipeline_unblock(struct smtp_server_cmd_ctx *cmd)
 	if (!command->pipeline_blocked)
 		return;
 
-	command->pipeline_blocked = FALSE;
-	smtp_server_connection_input_unlock(conn);
-
 	e_debug(cmd->event, "Pipeline unblocked");
+
+	command->pipeline_blocked = FALSE;
+	smtp_server_connection_input_resume(conn);
 }

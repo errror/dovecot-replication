@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -49,7 +49,9 @@ const struct setting_keyvalue pop3_service_settings_defaults[] = {
 	{ "unix_listener/srv.pop3\\s%{pid}/type", "admin" },
 	{ "unix_listener/srv.pop3\\s%{pid}/mode", "0600" },
 
-	{ "service_extra_groups", "$SET:default_internal_group" },
+	/* This needs to be here explicitly until the backwards compatibility
+	   is removed from settings-history-core.txt */
+	{ "service_extra_groups", "" },
 
 	{ NULL, NULL }
 };
@@ -60,7 +62,7 @@ const struct setting_keyvalue pop3_service_settings_defaults[] = {
 
 static const struct setting_define pop3_setting_defines[] = {
 	DEF(BOOL, verbose_proctitle),
-	DEF(STR, rawlog_dir),
+	DEF(PATH_DIR, rawlog_dir),
 
 	DEF(BOOL, pop3_no_flag_updates),
 	DEF(BOOL, pop3_enable_last),

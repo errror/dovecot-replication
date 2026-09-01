@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lmtp-common.h"
 #include "smtp-server.h"
@@ -294,10 +294,9 @@ lmtp_local_rcpt_anvil_cb(const struct anvil_reply *reply,
 	}
 }
 
-int lmtp_local_rcpt(struct client *client,
-		    struct smtp_server_cmd_ctx *cmd ATTR_UNUSED,
-		    struct lmtp_recipient *lrcpt)
+int lmtp_local_rcpt(struct lmtp_recipient *lrcpt)
 {
+	struct client *client = lrcpt->client;
 	struct smtp_server_recipient *rcpt = lrcpt->rcpt;
 	struct lmtp_local_recipient *llrcpt;
 	struct mail_storage_service_input input;
@@ -330,15 +329,14 @@ int lmtp_local_rcpt(struct client *client,
 					    "Temporary internal error");
 		return -1;
 	}
-	if (ret == 0) {
-		smtp_server_recipient_reply(rcpt, 550, "5.1.1",
-					    "User doesn't exist: %s",
-					    username);
-		return -1;
-	}
+	if (ret == 0)
+		return lmtp_rcpt_continue(lrcpt);
 
 	if (client->local == NULL)
 		client->local = lmtp_local_init(client);
+
+	e_debug(rcpt->event, "Recipient maps to local user %s",
+		service_user->input.username);
 
 	llrcpt = p_new(rcpt->pool, struct lmtp_local_recipient, 1);
 	llrcpt->rcpt = lrcpt;
@@ -363,9 +361,7 @@ int lmtp_local_rcpt(struct client *client,
 		rcpt, SMTP_SERVER_RECIPIENT_HOOK_APPROVED,
 		lmtp_local_rcpt_approved, llrcpt);
 
-	if (client->lmtp_set->lmtp_user_concurrency_limit == SET_UINT_UNLIMITED) {
-		(void)lmtp_local_rcpt_anvil_finish(llrcpt);
-	} else {
+	if (client->lmtp_set->lmtp_user_concurrency_limit != SET_UINT_UNLIMITED) {
 		/* NOTE: username may change as the result of the userdb
 		   lookup. Look up the new one via service_user. */
 		const struct mail_storage_service_input *input =
@@ -378,7 +374,8 @@ int lmtp_local_rcpt(struct client *client,
 			lmtp_local_rcpt_anvil_cb, llrcpt);
 		return 0;
 	}
-
+	if (!lmtp_local_rcpt_anvil_finish(llrcpt))
+		return -1;
 	return 1;
 }
 

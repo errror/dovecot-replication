@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -6,7 +6,7 @@
 #include "str.h"
 #include "strescape.h"
 #include "write-full.h"
-#include "master-service.h"
+#include "version.h"
 #include "doveadm.h"
 #include "doveadm-print.h"
 #include "stats-settings.h"

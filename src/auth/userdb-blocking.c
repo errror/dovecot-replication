@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "str.h"
@@ -50,7 +50,11 @@ static bool user_callback(struct auth_worker_connection *conn ATTR_UNUSED,
 	}
 
 	if (args != NULL && args[0] != NULL && *args[0] != '\0') {
-		auth_fields_import_args(request->fields.userdb_reply, args, 0);
+		if (auth_fields_import_args(request->fields.userdb_reply,
+					    args, 0) < 0) {
+			e_error(authdb_event(request),
+				"BUG: auth-worker sent invalid args");
+		}
 		if (auth_fields_exists(request->fields.userdb_reply, "tempfail"))
 			request->userdb_lookup_tempfailed = TRUE;
 	}

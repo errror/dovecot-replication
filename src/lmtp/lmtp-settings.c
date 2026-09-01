@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -51,6 +51,8 @@ const struct setting_keyvalue lmtp_service_settings_defaults[] = {
 	{ "inet_listener/lmtp/port", "24" },
 #endif
 
+	/* LMTP needs this group for accessing anvil, before mail_access_groups
+	   is applied. */
 	{ "service_extra_groups", "$SET:default_internal_group" },
 
 	{ NULL, NULL }

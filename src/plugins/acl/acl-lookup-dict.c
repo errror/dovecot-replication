@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -14,6 +14,7 @@
 
 
 #define DICT_SHARED_BOXES_PATH "shared-boxes/"
+#define DICT_SHARED_USER_BOXES_PATH_REV "shared-user-boxes-rev/"
 
 extern struct event_category event_category_acl;
 
@@ -98,8 +99,9 @@ acl_rights_is_same_user(const struct acl_rights *right, struct mail_user *user)
 		strcmp(right->identifier, user->username) == 0;
 }
 
-static int acl_lookup_dict_rebuild_add_backend(struct mail_namespace *ns,
-					       ARRAY_TYPE(const_string) *ids)
+static int
+acl_lookup_dict_rebuild_add_backend(struct mail_namespace *ns, pool_t pool,
+				    ARRAY_TYPE(const_string) *ids)
 {
 	struct acl_backend *backend;
 	struct acl_mailbox_list_context *ctx;
@@ -120,7 +122,7 @@ static int acl_lookup_dict_rebuild_add_backend(struct mail_namespace *ns,
 
 	id = t_str_new(128);
 	ctx = acl_backend_nonowner_lookups_iter_init(backend);
-	while (acl_backend_nonowner_lookups_iter_next(ctx, &name)) {
+	while (acl_backend_nonowner_lookups_iter_next(ctx, &name)) T_BEGIN {
 		aclobj = acl_object_init_from_name(backend, name);
 
 		iter = acl_object_list_init(aclobj);
@@ -133,13 +135,13 @@ static int acl_lookup_dict_rebuild_add_backend(struct mail_namespace *ns,
 				acl_lookup_dict_write_rights_id(id, &rights);
 				str_append_c(id, '/');
 				str_append(id, ns->owner->username);
-				id_dup = t_strdup(str_c(id));
+				id_dup = p_strdup(pool, str_c(id));
 				array_push_back(ids, &id_dup);
 			}
 		}
 		if (acl_object_list_deinit(&iter) < 0) ret = -1;
 		acl_object_deinit(&aclobj);
-	}
+	} T_END;
 	if (acl_backend_nonowner_lookups_iter_deinit(&ctx) < 0) ret = -1;
 	return ret;
 }
@@ -147,7 +149,7 @@ static int acl_lookup_dict_rebuild_add_backend(struct mail_namespace *ns,
 static int
 acl_lookup_dict_rebuild_update(struct acl_lookup_dict *dict,
 			       const ARRAY_TYPE(const_string) *new_ids_arr,
-			       bool no_removes)
+			       bool no_removes, bool acl_dict_index)
 {
 	struct event *event = dict->event;
 	const char *username = dict->user->username;
@@ -168,15 +170,43 @@ acl_lookup_dict_rebuild_update(struct acl_lookup_dict *dict,
 	   that aren't visible to us, so we don't want to remove anything
 	   that could break them. */
 	t_array_init(&old_ids_arr, 128);
-	prefix = DICT_PATH_SHARED DICT_SHARED_BOXES_PATH;
-	prefix_len = strlen(prefix);
-	iter = dict_iterate_init(dict->dict, set, prefix, DICT_ITERATE_FLAG_RECURSE);
-	while (dict_iterate(iter, &key, &value)) {
-		/* prefix/$type/$dest/$source */
-		key += prefix_len;
-		p = strrchr(key, '/');
-		if (p != NULL && strcmp(p + 1, username) == 0) {
-			key = t_strdup_until(key, p);
+	if (!acl_dict_index) {
+		prefix = DICT_PATH_SHARED DICT_SHARED_BOXES_PATH;
+		prefix_len = strlen(prefix);
+		iter = dict_iterate_init(dict->dict, set, prefix, DICT_ITERATE_FLAG_RECURSE);
+		while (dict_iterate(iter, &key, &value)) {
+			/* prefix/$type/$dest/$source */
+			key += prefix_len;
+			p = strrchr(key, '/');
+			if (p != NULL && strcmp(p + 1, username) == 0) {
+				key = t_strdup(key);
+				array_push_back(&old_ids_arr, &key);
+			}
+		}
+	} else {
+		key = t_strdup_printf(DICT_PATH_SHARED
+				      DICT_SHARED_BOXES_PATH"anyone/%s",
+				      username);
+		ret = dict_lookup(dict->dict, set, pool_datastack_create(),
+				  key, &value, &error);
+		if (ret < 0) {
+			e_error(event, "dict_lookup(%s) failed: %s - can't update dict",
+				key, error);
+			return -1;
+		}
+		if (ret > 0) {
+			key = t_strdup_printf("anyone/%s", username);
+			array_push_back(&old_ids_arr, &key);
+		}
+		prefix = t_strdup_printf(DICT_PATH_SHARED
+					 DICT_SHARED_USER_BOXES_PATH_REV"%s/",
+					 username);
+		prefix_len = strlen(prefix);
+		iter = dict_iterate_init(dict->dict, set, prefix, DICT_ITERATE_FLAG_RECURSE);
+		while (dict_iterate(iter, &key, &value)) {
+			/* prefix/$dest */
+			key = t_strdup_printf("user/%s/%s", key + prefix_len,
+					      username);
 			array_push_back(&old_ids_arr, &key);
 		}
 	}
@@ -190,7 +220,8 @@ acl_lookup_dict_rebuild_update(struct acl_lookup_dict *dict,
 
 	/* sync the identifiers */
 	path = t_str_new(256);
-	str_append(path, prefix);
+	str_append(path, DICT_PATH_SHARED DICT_SHARED_BOXES_PATH);
+	prefix_len = str_len(path);
 
 	old_ids = array_get(&old_ids_arr, &old_count);
 	new_ids = array_get(new_ids_arr, &new_count);
@@ -211,10 +242,11 @@ acl_lookup_dict_rebuild_update(struct acl_lookup_dict *dict,
 			/* old identifier removed */
 			str_truncate(path, prefix_len);
 			str_append(path, old_ids[oldi]);
-			str_append_c(path, '/');
-			str_append(path, username);
 			dt = dict_transaction_begin(dict->dict, set);
 			dict_unset(dt, str_c(path));
+			oldi++;
+		} else {
+			/* old identifier that we're not allowed to remove */
 			oldi++;
 		}
 		if (dt != NULL && dict_transaction_commit(&dt, &error) < 0) {
@@ -226,7 +258,7 @@ acl_lookup_dict_rebuild_update(struct acl_lookup_dict *dict,
 	return 0;
 }
 
-int acl_lookup_dict_rebuild(struct acl_lookup_dict *dict)
+int acl_lookup_dict_rebuild(struct acl_lookup_dict *dict, bool acl_dict_index)
 {
 	struct mail_namespace *ns;
 	ARRAY_TYPE(const_string) ids_arr;
@@ -238,11 +270,12 @@ int acl_lookup_dict_rebuild(struct acl_lookup_dict *dict)
 		return 0;
 
 	/* get all ACL identifiers with a positive lookup right */
-	t_array_init(&ids_arr, 128);
-	for (ns = dict->user->namespaces; ns != NULL; ns = ns->next) {
-		if (acl_lookup_dict_rebuild_add_backend(ns, &ids_arr) < 0)
+	pool_t pool = pool_alloconly_create("acl dict rebuild", 1024);
+	p_array_init(&ids_arr, pool, 128);
+	for (ns = dict->user->namespaces; ns != NULL; ns = ns->next) T_BEGIN {
+		if (acl_lookup_dict_rebuild_add_backend(ns, pool, &ids_arr) < 0)
 			ret = -1;
-	}
+	} T_END;
 
 	/* sort identifiers and remove duplicates */
 	array_sort(&ids_arr, i_strcmp_p);
@@ -259,8 +292,10 @@ int acl_lookup_dict_rebuild(struct acl_lookup_dict *dict)
 
 	/* if lookup failed at some point we can still add new ids,
 	   but we can't remove any existing ones */
-	if (acl_lookup_dict_rebuild_update(dict, &ids_arr, ret < 0) < 0)
+	if (acl_lookup_dict_rebuild_update(dict, &ids_arr, ret < 0,
+					   acl_dict_index) < 0)
 		ret = -1;
+	pool_unref(&pool);
 	return ret;
 }
 

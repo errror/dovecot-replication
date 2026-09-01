@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "ioloop.h"
@@ -16,6 +16,11 @@
 #include "submission-proxy.h"
 
 #include <ctype.h>
+
+/* Maximum number of lines the backend may send in a single proxied AUTH
+   reply. Legitimate replies are one line (occasionally a few); this only
+   bounds a malicious backend from growing proxy_reply without limit. */
+#define SUBMISSION_PROXY_MAX_REPLY_LINES 128
 
 static const char *submission_proxy_state_names[] = {
 	"banner", "ehlo", "starttls", "tls-ehlo", "xclient", "xclient-ehlo", "authenticate"
@@ -184,6 +189,17 @@ proxy_send_xclient(struct submission_client *client, struct ostream *output)
 			addr = t_strconcat("IPV6:", addr, NULL);
 		proxy_send_xclient_more(client, output, str, "ADDR", addr);
 	}
+	if (str_array_icase_find(client->proxy_xclient, "DESTPORT")) {
+		proxy_send_xclient_more(
+			client, output, str, "DESTPORT",
+			t_strdup_printf("%u", client->common.local_port));
+	}
+	if (str_array_icase_find(client->proxy_xclient, "DESTADDR")) {
+		const char *addr = net_ip2addr(&client->common.local_ip);
+		if (client->common.local_ip.family == AF_INET6)
+			addr = t_strconcat("IPV6:", addr, NULL);
+		proxy_send_xclient_more(client, output, str, "DESTADDR", addr);
+	}
 	if (str_array_icase_find(client->proxy_xclient, "SESSION")) {
 		proxy_send_xclient_more(client, output, str, "SESSION",
 					client_get_session_id(&client->common));
@@ -240,6 +256,7 @@ proxy_send_login(struct submission_client *client, struct ostream *output)
 
 	i_assert(client->common.proxy_sasl_client == NULL);
 	i_zero(&sasl_set);
+	sasl_set.event_parent = client->common.event;
 	sasl_set.authid = client->common.proxy_master_user != NULL ?
 		client->common.proxy_master_user : client->common.proxy_user;
 	sasl_set.authzid = client->common.proxy_user;
@@ -250,7 +267,8 @@ proxy_send_login(struct submission_client *client, struct ostream *output)
 
 	str_printfa(str, "AUTH %s", mech_name);
 	if (dsasl_client_output(client->common.proxy_sasl_client,
-				&sasl_output, &sasl_output_len, &error) < 0) {
+				&sasl_output, &sasl_output_len,
+				&error) != DSASL_CLIENT_RESULT_OK) {
 		const char *reason = t_strdup_printf(
 			"SASL mechanism %s init failed: %s",
 			mech_name, error);
@@ -299,7 +317,7 @@ static int
 proxy_handle_ehlo_reply(struct submission_client *client,
 			struct ostream *output)
 {
-	struct smtp_server_cmd_ctx *cmd = client->pending_auth;
+	struct smtp_server_cmd_ctx *cmd = client->auth_cmd;
 	int ret;
 
 	switch (client->proxy_state) {
@@ -335,7 +353,7 @@ proxy_handle_ehlo_reply(struct submission_client *client,
 		smtp_server_command_add_hook(
 			cmd->cmd, SMTP_SERVER_COMMAND_HOOK_DESTROY,
 			submission_proxy_success_reply_sent, client);
-		client->pending_auth = NULL;
+		client->auth_cmd = NULL;
 
 		smtp_server_reply(cmd, 235, "2.7.0", "Logged in.");
 		return 1;
@@ -352,10 +370,6 @@ submission_proxy_continue_sasl_auth(struct client *client,
 	struct submission_client *subm_client =
 		container_of(client, struct submission_client, common);
 	string_t *str;
-	const unsigned char *data;
-	size_t data_len;
-	const char *error;
-	int ret;
 
 	if (!last_line) {
 		const char *reason = t_strdup_printf(
@@ -392,26 +406,10 @@ submission_proxy_continue_sasl_auth(struct client *client,
 			"Invalid base64 data in AUTH response");
 		return -1;
 	}
-	ret = dsasl_client_input(client->proxy_sasl_client,
-				 str_data(str), str_len(str), &error);
-	if (ret == 0) {
-		ret = dsasl_client_output(client->proxy_sasl_client,
-					  &data, &data_len, &error);
-	}
-	if (ret < 0) {
-		const char *reason = t_strdup_printf(
-			"Invalid authentication data: %s", error);
-		login_proxy_failed(client->login_proxy,
-			login_proxy_get_event(client->login_proxy),
-			LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, reason);
+
+	if (login_proxy_sasl_step(client, str) < 0)
 		return -1;
-	}
-	i_assert(ret == 0);
-
-	str_truncate(str, 0);
-	base64_encode(data, data_len, str);
 	str_append(str, "\r\n");
-
 	o_stream_nsend(output, str_data(str), str_len(str));
 	return 0;
 }
@@ -507,24 +505,29 @@ submission_proxy_handle_redirect(struct client *client, unsigned int status,
 
 int submission_proxy_parse_line(struct client *client, const char *line)
 {
+	i_assert(!client->destroyed);
+
 	struct submission_client *subm_client =
 		container_of(client, struct submission_client, common);
-	struct smtp_server_cmd_ctx *cmd = subm_client->pending_auth;
+	struct smtp_server_cmd_ctx *cmd = subm_client->auth_cmd;
+
+	i_assert(cmd != NULL);
+
 	struct smtp_server_command *command = cmd->cmd;
 	struct ostream *output;
 	bool last_line = FALSE, invalid_line = FALSE;
 	const char *suffix, *text = NULL, *enh_code = NULL;
 	unsigned int status = 0;
 
-	i_assert(!client->destroyed);
-	i_assert(cmd != NULL);
-
-	if ((line[3] != ' ' && line[3] != '-') ||
-	    str_parse_uint(line, &status, &text) < 0 ||
-	    status < 200 || status >= 560) {
+	const char *sep = NULL;
+	if (str_parse_uint(line, &status, &text) < 0 ||
+	    status < 200 || status >= 560 ||
+	    (*text != ' ' && *text != '-')) {
 		invalid_line = TRUE;
 	} else {
-		text++;
+		/* text points at the ' '/'-' separator following the status
+		   code; remember it before stepping past it */
+		sep = text++;
 
 		if ((subm_client->proxy_capability &
 		    SMTP_CAPABILITY_ENHANCEDSTATUSCODES) != 0)
@@ -541,7 +544,7 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 				   LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, reason);
 		return -1;
 	}
-	if (line[3] == ' ') {
+	if (sep != NULL && *sep == ' ') {
 		last_line = TRUE;
 		subm_client->proxy_reply_status = 0;
 	} else {
@@ -628,9 +631,11 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 		if (invalid_line || (status / 100) != 2) {
 			const char *reason = t_strdup_printf(
 				"XCLIENT failed: %s", str_sanitize(line, 160));
+			/* XCLIENT failure is some misconfiguration - don't try
+			   to reconnect. */
 			login_proxy_failed(client->login_proxy,
 				login_proxy_get_event(client->login_proxy),
-				LOGIN_PROXY_FAILURE_TYPE_REMOTE, reason);
+				LOGIN_PROXY_FAILURE_TYPE_REMOTE_CONFIG, reason);
 			return -1;
 		}
 		if (!last_line)
@@ -641,8 +646,17 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 		subm_client->proxy_state = SUBMISSION_PROXY_XCLIENT_EHLO;
 		return 0;
 	case SUBMISSION_PROXY_AUTHENTICATE:
-		if (invalid_line)
-			break;
+		if (invalid_line) {
+			/* A malformed reply line here would fall through to the
+			   shared failure block below, which assumes proxy_reply
+			   was already created. Fail cleanly instead. */
+			const char *reason = t_strdup_printf(
+				"Invalid AUTH reply: %s", str_sanitize(line, 160));
+			login_proxy_failed(client->login_proxy,
+				login_proxy_get_event(client->login_proxy),
+				LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, reason);
+			return -1;
+		}
 		if (status == 334 && client->proxy_sasl_client != NULL) {
 			/* continue SASL authentication */
 			if (submission_proxy_continue_sasl_auth(
@@ -651,9 +665,26 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 			return 0;
 		}
 
-		i_assert(subm_client->proxy_reply == NULL);
-		subm_client->proxy_reply = smtp_server_reply_create(
-			command, status, enh_code);
+		/* The backend may answer the proxied AUTH with a multi-line
+		   reply, in which case this callback is invoked once per line
+		   with the reply still pending (!last_line). Create the reply
+		   on the first line and append the text of each subsequent
+		   line. Cap the number of continuation lines so a malicious
+		   backend can't grow proxy_reply without bound. */
+		if (++subm_client->proxy_reply_lines >
+		    SUBMISSION_PROXY_MAX_REPLY_LINES) {
+			const char *reason = t_strdup_printf(
+				"Backend sent too many AUTH reply lines (>%u)",
+				SUBMISSION_PROXY_MAX_REPLY_LINES);
+			login_proxy_failed(client->login_proxy,
+				login_proxy_get_event(client->login_proxy),
+				LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, reason);
+			return -1;
+		}
+		if (subm_client->proxy_reply == NULL) {
+			subm_client->proxy_reply = smtp_server_reply_create(
+				command, status, enh_code);
+		}
 		smtp_server_reply_add_text(subm_client->proxy_reply, text);
 
 		if (!last_line)
@@ -667,7 +698,8 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 			command, SMTP_SERVER_COMMAND_HOOK_DESTROY,
 			submission_proxy_success_reply_sent, subm_client);
 
-		subm_client->pending_auth = NULL;
+		login_proxy_input_halt(client->login_proxy);
+		subm_client->auth_cmd = NULL;
 
 		/* Login successful. Send this reply to client. */
 		smtp_server_reply_submit(subm_client->proxy_reply);
@@ -693,15 +725,29 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 	   shouldn't be a real problem since of course everyone will
 	   be using only Dovecot as their backend :) */
 	enum login_proxy_failure_type failure_type =
-		LOGIN_PROXY_FAILURE_TYPE_AUTH;
-	if ((status / 100) == 4)
+		LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED;
+	if (status == 421) {
+		/* The backend won't accept further AUTH attempts on this
+		   connection. If it signaled 4.7.0, the user's connection
+		   limit (mail_max_userip_connections) was reached; report
+		   that specifically. Otherwise treat as a generic auth
+		   reply (e.g. backend shutting down). The reply was
+		   prepared from the backend's 421 line; forward it to the
+		   client and detach the AUTH command. */
+		failure_type = (null_strcmp(enh_code, "4.7.0") == 0) ?
+			LOGIN_PROXY_FAILURE_TYPE_AUTH_LIMIT_REACHED_REPLIED :
+			LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED;
+		i_assert(subm_client->proxy_reply != NULL);
+		smtp_server_reply_submit(subm_client->proxy_reply);
+		subm_client->auth_cmd = NULL;
+	} else if ((status / 100) == 4)
 		failure_type = LOGIN_PROXY_FAILURE_TYPE_AUTH_TEMPFAIL;
 	else if (!submission_proxy_handle_redirect(
 			client, status, enh_code, text, &failure_type, &text)) {
 		i_assert((status / 100) != 2);
 		i_assert(subm_client->proxy_reply != NULL);
 		smtp_server_reply_submit(subm_client->proxy_reply);
-		subm_client->pending_auth = NULL;
+		subm_client->auth_cmd = NULL;
 	}
 
 	login_proxy_failed(client->login_proxy,
@@ -720,6 +766,7 @@ void submission_proxy_reset(struct client *client)
 	i_free_and_null(subm_client->proxy_xclient);
 	i_free(subm_client->proxy_sasl_ir);
 	subm_client->proxy_reply_status = 0;
+	subm_client->proxy_reply_lines = 0;
 	subm_client->proxy_reply = NULL;
 }
 
@@ -728,7 +775,7 @@ submission_proxy_send_failure_reply(struct submission_client *subm_client,
 				    enum login_proxy_failure_type type,
 				    const char *reason ATTR_UNUSED)
 {
-	struct smtp_server_cmd_ctx *cmd = subm_client->pending_auth;
+	struct smtp_server_cmd_ctx *cmd = subm_client->auth_cmd;
 
 	switch (type) {
 	case LOGIN_PROXY_FAILURE_TYPE_CONNECT:
@@ -738,18 +785,20 @@ submission_proxy_send_failure_reply(struct submission_client *subm_client,
 	case LOGIN_PROXY_FAILURE_TYPE_REMOTE_CONFIG:
 	case LOGIN_PROXY_FAILURE_TYPE_PROTOCOL:
 	case LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_NOT_REPLIED:
 		i_assert(cmd != NULL);
-		subm_client->pending_auth = NULL;
+		subm_client->auth_cmd = NULL;
 		smtp_server_reply(cmd, 454, "4.7.0", LOGIN_PROXY_FAILURE_MSG);
 		break;
 	case LOGIN_PROXY_FAILURE_TYPE_AUTH_TEMPFAIL:
 		i_assert(cmd != NULL);
-		subm_client->pending_auth = NULL;
+		subm_client->auth_cmd = NULL;
 
 		i_assert(subm_client->proxy_reply != NULL);
 		smtp_server_reply_submit(subm_client->proxy_reply);
 		break;
-	case LOGIN_PROXY_FAILURE_TYPE_AUTH:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_LIMIT_REACHED_REPLIED:
 		/* reply was already sent */
 		i_assert(cmd == NULL);
 		break;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -151,7 +151,7 @@ static void test_charset_iconv_utf7_state(void)
 	memcpy(nextbuf, "+AOQ-", 5);
 	size = sizeof(nextbuf);
 	test_assert(charset_to_utf8(trans, nextbuf, &size, str) == CHARSET_RET_OK);
-	test_assert(strcmp(str_c(str), "a\xC3\xA4???????????") == 0);
+	test_assert_strcmp(str_c(str), "a\xC3\xA4?????????????????");
 	charset_to_utf8_end(&trans);
 	test_end();
 }

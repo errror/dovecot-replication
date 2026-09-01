@@ -1,7 +1,8 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
+#include "str.h"
 #include "hash.h"
 #include "istream.h"
 #include "mail-index-modseq.h"
@@ -57,6 +58,10 @@ struct dsync_mailbox_exporter {
 	struct dsync_mail_change change;
 	struct dsync_mail dsync_mail;
 
+	time_t sync_since_timestamp;
+	time_t sync_until_timestamp;
+	uoff_t sync_max_size;
+
 	const char *error;
 	enum mail_error mail_error;
 
@@ -65,6 +70,7 @@ struct dsync_mailbox_exporter {
 	bool mails_have_guids:1;
 	bool minimal_dmail_fill:1;
 	bool return_all_mails:1;
+	bool return_all_attrs:1;
 	bool export_received_timestamps:1;
 	bool export_virtual_sizes:1;
 	bool no_hdr_hashes:1;
@@ -403,11 +409,32 @@ dsync_mailbox_export_search(struct dsync_mailbox_exporter *exporter)
 		wanted_headers = exporter->wanted_headers;
 	}
 
+	if (exporter->sync_since_timestamp != 0) {
+		sarg = mail_search_build_add(search_args, SEARCH_SINCE);
+		sarg->value.date_type = MAIL_SEARCH_DATE_TYPE_RECEIVED;
+		sarg->value.time = exporter->sync_since_timestamp;
+	}
+
+	if (exporter->sync_until_timestamp != 0) {
+		sarg = mail_search_build_add(search_args, SEARCH_BEFORE);
+		sarg->value.date_type = MAIL_SEARCH_DATE_TYPE_RECEIVED;
+		sarg->value.time = exporter->sync_until_timestamp;
+	}
+
+	if (exporter->sync_max_size != 0) {
+		sarg = mail_search_build_add(search_args, SEARCH_SMALLER);
+		/* the limit is <= but search criteria is < */
+		sarg->value.size = exporter->sync_max_size + 1;
+	}
+
 	exporter->trans = mailbox_transaction_begin(exporter->box,
 						MAILBOX_TRANSACTION_FLAG_SYNC,
 						__func__);
+	string_t *search_str = t_str_new(128);
+	mail_search_args_to_cmdline(search_str, search_args->args);
 	search_ctx = mailbox_search_init(exporter->trans, search_args, NULL,
 					 wanted_fields, wanted_headers);
+	e_debug(exporter->event, "Using search: %s", str_c(search_str));
 	mail_search_args_unref(&search_args);
 
 	while (mailbox_search_next(search_ctx, &mail)) {
@@ -502,11 +529,7 @@ dsync_mailbox_export_log_scan(struct dsync_mailbox_exporter *exporter,
 struct dsync_mailbox_exporter *
 dsync_mailbox_export_init(struct mailbox *box,
 			  struct dsync_transaction_log_scan *log_scan,
-			  uint32_t last_common_uid,
-			  enum dsync_mailbox_exporter_flags flags,
-			  unsigned int hdr_hash_version,
-			  const char *const *hashed_headers,
-			  struct event *parent_event)
+			  const struct dsync_mailbox_export_settings *set)
 {
 	struct dsync_mailbox_exporter *exporter;
 	pool_t pool;
@@ -517,22 +540,27 @@ dsync_mailbox_export_init(struct mailbox *box,
 	exporter->pool = pool;
 	exporter->box = box;
 	exporter->log_scan = log_scan;
-	exporter->last_common_uid = last_common_uid;
+	exporter->last_common_uid = set->last_common_uid;
 	exporter->auto_export_mails =
-		(flags & DSYNC_MAILBOX_EXPORTER_FLAG_AUTO_EXPORT_MAILS) != 0;
+		(set->flags & DSYNC_MAILBOX_EXPORTER_FLAG_AUTO_EXPORT_MAILS) != 0;
 	exporter->mails_have_guids =
-		(flags & DSYNC_MAILBOX_EXPORTER_FLAG_MAILS_HAVE_GUIDS) != 0;
+		(set->flags & DSYNC_MAILBOX_EXPORTER_FLAG_MAILS_HAVE_GUIDS) != 0;
 	exporter->minimal_dmail_fill =
-		(flags & DSYNC_MAILBOX_EXPORTER_FLAG_MINIMAL_DMAIL_FILL) != 0;
+		(set->flags & DSYNC_MAILBOX_EXPORTER_FLAG_MINIMAL_DMAIL_FILL) != 0;
 	exporter->export_received_timestamps =
-		(flags & DSYNC_MAILBOX_EXPORTER_FLAG_TIMESTAMPS) != 0;
+		(set->flags & DSYNC_MAILBOX_EXPORTER_FLAG_TIMESTAMPS) != 0;
 	exporter->export_virtual_sizes =
-		(flags & DSYNC_MAILBOX_EXPORTER_FLAG_VSIZES) != 0;
-	exporter->hdr_hash_version = hdr_hash_version;
+		(set->flags & DSYNC_MAILBOX_EXPORTER_FLAG_VSIZES) != 0;
+	exporter->return_all_attrs =
+		(set->flags & DSYNC_MAILBOX_EXPORTER_FLAG_ALL_ATTRS) != 0;
+	exporter->hdr_hash_version = set->hdr_hash_version;
 	exporter->no_hdr_hashes =
-		(flags & DSYNC_MAILBOX_EXPORTER_FLAG_NO_HDR_HASHES) != 0;
-	exporter->hashed_headers = hashed_headers;
-	exporter->event = event_create(parent_event);
+		(set->flags & DSYNC_MAILBOX_EXPORTER_FLAG_NO_HDR_HASHES) != 0;
+	exporter->hashed_headers = set->hashed_headers;
+	exporter->sync_since_timestamp = set->sync_since_timestamp;
+	exporter->sync_until_timestamp = set->sync_until_timestamp;
+	exporter->sync_max_size = set->sync_max_size;
+	exporter->event = event_create(set->parent_event);
 
 	p_array_init(&exporter->requested_uids, pool, 16);
 	p_array_init(&exporter->search_uids, pool, 16);
@@ -616,6 +644,7 @@ dsync_mailbox_export_iter_next_attr(struct dsync_mailbox_exporter *exporter)
 	bool export_all_attrs;
 
 	export_all_attrs = exporter->return_all_mails ||
+		exporter->return_all_attrs ||
 		exporter->last_common_uid == 0;
 	attr_changes = dsync_transaction_log_scan_get_attr_hash(exporter->log_scan);
 	lookup_attr.type = exporter->attr_type;

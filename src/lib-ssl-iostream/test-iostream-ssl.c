@@ -1,4 +1,4 @@
-/* Copyright (c) 2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "buffer.h"
@@ -239,22 +239,25 @@ static int test_iostream_ssl_handshake_real(struct ssl_iostream_settings *server
 	if (client->failed || server->failed)
 		ret = -1;
 
-	if (ssl_iostream_has_handshake_failed(client->iostream)) {
+	if (ssl_iostream_get_state(client->iostream) != SSL_IOSTREAM_STATE_OK &&
+	    ssl_iostream_get_state(client->iostream) != SSL_IOSTREAM_STATE_HANDSHAKING) {
 		i_error("client: %s", ssl_iostream_get_last_error(client->iostream));
 		ret = -1;
-	} else if (ssl_iostream_has_handshake_failed(server->iostream)) {
+	} else if (ssl_iostream_get_state(server->iostream) != SSL_IOSTREAM_STATE_OK &&
+		   ssl_iostream_get_state(server->iostream) != SSL_IOSTREAM_STATE_HANDSHAKING) {
 		i_error("server: %s", ssl_iostream_get_last_error(server->iostream));
 		ret = -1;
 	/* check hostname */
 	} else if (client->hostname != NULL &&
 	    !client->set->allow_invalid_cert &&
 	    ssl_iostream_check_cert_validity(client->iostream, client->hostname,
-					     &error) != 0) {
+					     &error) != SSL_IOSTREAM_CERT_VALIDITY_OK) {
 		i_error("client(%s): %s", client->hostname, error);
 		ret = -1;
 	/* client cert */
 	} else if (server->set->verify_remote_cert &&
-	    ssl_iostream_check_cert_validity(server->iostream, NULL, &error) != 0) {
+		   ssl_iostream_check_cert_validity(server->iostream, NULL,
+						    &error) != SSL_IOSTREAM_CERT_VALIDITY_OK) {
 		i_error("server: %s", error);
 		ret = -1;
 	}

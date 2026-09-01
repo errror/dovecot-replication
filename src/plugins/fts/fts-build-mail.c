@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -8,6 +8,7 @@
 #include "message-address.h"
 #include "message-parser.h"
 #include "message-decoder.h"
+#include "message-header-decode.h"
 #include "mail-storage.h"
 #include "index-mail.h"
 #include "fts-parser.h"
@@ -30,7 +31,7 @@ struct fts_mail_build_context {
 	struct mail *mail;
 	struct fts_backend_update_context *update_ctx;
 
-	char *content_type, *content_disposition;
+	char *content_type, *content_type_params, *content_disposition;
 	struct fts_parser *body_parser;
 
 	buffer_t *word_buf, *pending_input;
@@ -55,7 +56,13 @@ static void fts_build_parse_content_type(struct fts_mail_build_context *ctx,
 	T_BEGIN {
 		content_type = t_str_new(64);
 		(void)rfc822_parse_content_type(&parser, content_type);
+		/* Parse the mime-type only... */
 		ctx->content_type = str_lcase(i_strdup(str_c(content_type)));
+		/* ... then store the remainder of the line - which may contain RFC2231
+		   parameters - without parsing it because not all backends need them. In
+		   the backends that need them further parsing can be implemented. */
+		ctx->content_type_params =
+			i_strdup_until(parser.data, parser.end);
 	} T_END;
 	rfc822_parser_deinit(&parser);
 }
@@ -166,9 +173,17 @@ static int fts_build_mail_header(struct fts_mail_build_context *ctx,
 		ret = fts_build_unstructured_header(ctx, hdr);
 	} else T_BEGIN {
 		/* message address. normalize it to give better
-		   search results. */
+		   search results.
+
+		   The decoder was initialised with
+		   MESSAGE_DECODER_FLAG_RAW_ADDRESS_HEADERS, so hdr->full_value
+		   still holds the raw header bytes with RFC 2047 encoded-words
+		   intact. Parsing the raw value avoids having decoded display
+		   name characters (e.g. '(' or '[') reinterpreted as RFC 5322
+		   comments or other specials. After normalisation the result
+		   is decoded to UTF-8 for indexing. */
 		struct message_address *addr;
-		string_t *str;
+		string_t *str, *decoded;
 
 		addr = message_address_parse(pool_datastack_create(),
 					     hdr->full_value,
@@ -177,7 +192,12 @@ static int fts_build_mail_header(struct fts_mail_build_context *ctx,
 		str = t_str_new(hdr->full_value_len);
 		message_address_write(str, addr);
 
-		ret = fts_build_data(ctx, str_data(str), str_len(str), TRUE);
+		decoded = t_str_new(str_len(str));
+		message_header_decode_utf8(str_data(str), str_len(str),
+					   decoded,
+					   ctx->update_ctx->normalizer);
+		ret = fts_build_data(ctx, str_data(decoded),
+				     str_len(decoded), TRUE);
 	} T_END;
 
 	if ((ctx->update_ctx->backend->flags &
@@ -214,8 +234,14 @@ fts_build_body_begin(struct fts_mail_build_context *ctx,
 	key.part = part;
 
 	i_zero(&parser_context);
-	parser_context.content_type = ctx->content_type != NULL ?
-		ctx->content_type : "text/plain";
+	if (ctx->content_type != NULL) {
+		parser_context.content_type = ctx->content_type;
+		parser_context.content_type_params = ctx->content_type_params;
+	} else {
+		parser_context.content_type = "text/plain";
+		parser_context.content_type_params = "";
+	}
+
 	if (str_begins_with(parser_context.content_type, "multipart/")) {
 		/* multiparts are never indexed, only their contents */
 		return FALSE;
@@ -612,7 +638,8 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 	pool_t parts_pool = pool_alloconly_create("fts message parts", 512);
 	parser = message_parser_init(parts_pool, input, &parser_set);
 
-	decoder = message_decoder_init(update_ctx->normalizer, 0);
+	decoder = message_decoder_init(update_ctx->normalizer,
+				       MESSAGE_DECODER_FLAG_RAW_ADDRESS_HEADERS);
 	for (;;) {
 		ret = message_parser_parse_next_block(parser, &raw_block);
 		i_assert(ret != 0);
@@ -641,6 +668,7 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 			fts_backend_update_unset_build_key(update_ctx);
 			prev_part = raw_block.part;
 			i_free_and_null(ctx.content_type);
+			i_free_and_null(ctx.content_type_params);
 			i_free_and_null(ctx.content_disposition);
 
 			if (raw_block.size != 0) {
@@ -671,7 +699,7 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 		/* If the block size exceeds limit, we truncate the block
 		   which would have exceeded to final size, and parse it.
 		   Then we ignore the rest body parts. */
-		if (body_part && orig_fts_message_max_size > 0) {
+		if (body_part && orig_fts_message_max_size != SET_SIZE_UNLIMITED) {
 			if (fts_message_max_size > block.size) {
 				fts_message_max_size -= block.size;
 			} else if (fts_message_max_size == 0) {
@@ -721,6 +749,7 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 		index_mail_set_message_parts_corrupted(mail, error);
 	message_decoder_deinit(&decoder);
 	i_free(ctx.content_type);
+	i_free(ctx.content_type_params);
 	i_free(ctx.content_disposition);
 	buffer_free(&ctx.word_buf);
 	buffer_free(&ctx.pending_input);

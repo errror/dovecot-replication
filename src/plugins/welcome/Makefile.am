@@ -1,6 +1,7 @@
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-settings \
+	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-mail \
 	-I$(top_srcdir)/src/lib-index \
 	-I$(top_srcdir)/src/lib-program-client \
@@ -14,4 +15,10 @@ module_LTLIBRARIES = \
 	lib99_welcome_plugin.la
 
 lib99_welcome_plugin_la_SOURCES = \
-	welcome-plugin.c
+	welcome-plugin.c \
+	welcome-settings.c
+
+settingsdir = $(dovecot_moduledir)/settings
+
+noinst_HEADERS = \
+	welcome-settings.h

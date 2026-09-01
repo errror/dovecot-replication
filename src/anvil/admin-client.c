@@ -1,4 +1,4 @@
-/* Copyright (c) 2021 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -69,6 +69,12 @@ static void admin_client_destroy(struct connection *conn)
 	struct admin_client *client =
 		container_of(conn, struct admin_client, conn);
 
+	/* Remove the io and mark the connection disconnected. Otherwise the
+	   destroy callback keeps getting called for the dead fd, since the
+	   pool/target still holds a reference and connection_deinit() (which
+	   does the actual disconnect) isn't reached until refcount drops to
+	   0 in admin_client_unref(). */
+	connection_disconnect(&client->conn);
 	admin_client_fail_commands(client, connection_disconnect_reason(conn));
 }
 
@@ -115,6 +121,8 @@ void admin_client_send_cmd(struct admin_client *client, const char *cmdline,
 	cmd->cmdline = i_strdup(cmdline);
 	cmd->callback = callback;
 	cmd->context = context;
+
+	e_debug(client->conn.event, "Sending admin command: %s", cmdline);
 
 	if (client->conn.disconnected) {
 		if (connection_client_connect_async(&client->conn) < 0)

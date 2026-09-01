@@ -1,14 +1,20 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
+#include "lib-signals.h"
 #include "str.h"
 #include "safe-mkstemp.h"
 #include "test-common.h"
+#include "test-private.h"
+#include "test-subprocess.h"
 
+#include <unistd.h>
 #include <stdio.h>
 #include <setjmp.h> /* for fatal tests */
 
-static bool test_deinit_lib;
+static bool test_initialized = FALSE;
+static bool test_deinit_lib = FALSE;
+static bool test_deinit_lib_signals = FALSE;
 
 /* To test the firing of i_assert, we need non-local jumps, i.e. setjmp */
 static volatile bool expecting_fatal = FALSE;
@@ -16,14 +22,19 @@ static jmp_buf fatal_jmpbuf;
 
 #define OUT_NAME_ALIGN 70
 
+struct event *test_event = NULL;
+
 static char *test_prefix;
 static bool test_success;
+static bool test_running;
 static unsigned int failure_count;
 static unsigned int total_count;
 static unsigned int expected_errors;
 static char *expected_error_str, *expected_fatal_str;
 static test_fatal_callback_t *test_fatal_callback;
 static void *test_fatal_context;
+static void (*test_cleanup_callback)(void) = NULL;
+volatile sig_atomic_t terminating = 0;
 
 void test_begin(const char *name)
 {
@@ -62,7 +73,7 @@ void test_assert_failed_idx(const char *code, const char *file, unsigned int lin
 }
 
 void test_assert_failed_strcmp_idx(const char *code, const char *file, unsigned int line,
-				   const char * src, const char * dst, long long i)
+				   const char *src, const char *dst, long long i)
 {
 	printf("%s:%u: Assert", file, line);
 	if (i == LLONG_MIN)
@@ -77,6 +88,40 @@ void test_assert_failed_strcmp_idx(const char *code, const char *file, unsigned 
 		printf("\"%s\"\n", dst);
 	else
 		printf("NULL\n");
+	fflush(stdout);
+	test_success = FALSE;
+#ifdef STATIC_CHECKER
+	i_unreached();
+#endif
+}
+
+static void print_memcmp_data(const void *_data, size_t len)
+{
+	const unsigned char *data = _data;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		if (data[i] >= 0x20 && data[i] < 0x7f)
+			printf("%c", data[i]);
+		else
+			printf("\\x%02X", data[i]);
+	}
+}
+
+void test_assert_failed_memcmp_idx(const char *code, const char *file, unsigned int line,
+				   const void *src, const void *dst, size_t len, long long i)
+{
+	printf("%s:%u: Assert", file, line);
+	if (i == LLONG_MIN)
+		printf(" failed: %s\n", code);
+	else
+		printf("(#%lld) failed: %s\n", i, code);
+	printf("        \"");
+	print_memcmp_data(src, len);
+	printf("\" != \n");
+	printf("        \"");
+	print_memcmp_data(dst, len);
+	printf("\" (len == %zu)\n", len);
 	fflush(stdout);
 	test_success = FALSE;
 #ifdef STATIC_CHECKER
@@ -323,8 +368,54 @@ test_fatal_handler(const struct failure_context *ctx,
 	i_unreached(); /* we simply can't get here */
 }
 
-static void test_init(void)
+static void test_cleanup(void)
 {
+	if (test_subprocess_is_child()) {
+		/* Child processes must not execute the cleanups */
+		return;
+	}
+
+	test_subprocess_cleanup();
+
+	/* Perform any additional important cleanup specific to the test. */
+	if (test_cleanup_callback != NULL)
+		test_cleanup_callback();
+
+	test_dir_cleanup();
+}
+
+static void test_terminate(const siginfo_t *si, void *context ATTR_UNUSED)
+{
+	int signo = si->si_signo;
+
+	if (terminating != 0)
+		raise(signo);
+	terminating = 1;
+
+	/* Perform important cleanups */
+	test_cleanup();
+
+	(void)signal(signo, SIG_DFL);
+	if (signo == SIGTERM)
+		_exit(0);
+	else
+		raise(signo);
+}
+
+static void test_atexit(void)
+{
+	/* NOTICE: This is also called by children, so be careful. */
+
+	/* Perform important cleanups */
+	test_cleanup();
+}
+
+void test_init_no_event(void)
+{
+	if (test_initialized)
+		return;
+	test_initialized = TRUE;
+
 	test_prefix = NULL;
 	failure_count = 0;
 	total_count = 0;
@@ -339,35 +430,78 @@ static void test_init(void)
 	/* Don't set fatal handler until actually needed for fatal testing */
 }
 
+void test_init(void)
+{
+	if (test_initialized)
+		return;
+
+	test_init_no_event();
+	test_event = event_create(NULL);
+	event_set_append_log_prefix(test_event, "test: ");
+}
+
+void test_init_signals(void)
+{
+	lib_signals_init();
+	test_deinit_lib_signals = TRUE;
+
+	atexit(test_atexit);
+	lib_signals_ignore(SIGPIPE, TRUE);
+	lib_signals_set_handler(SIGTERM, 0, test_terminate, NULL);
+	lib_signals_set_handler(SIGQUIT, 0, test_terminate, NULL);
+	lib_signals_set_handler(SIGINT, 0, test_terminate, NULL);
+	lib_signals_set_handler(SIGSEGV, 0, test_terminate, NULL);
+	lib_signals_set_handler(SIGABRT, 0, test_terminate, NULL);
+}
+
 static int test_deinit(void)
 {
 	i_assert(test_prefix == NULL);
 	printf("%u / %u tests failed\n", failure_count, total_count);
+
+	test_dir_deinit();
+	test_subprocesses_deinit();
+
+	event_unref(&test_event);
+
 	if (test_deinit_lib)
 		lib_deinit();
+	if (test_deinit_lib_signals)
+		lib_signals_deinit();
 	return failure_count == 0 ? 0 : 1;
+}
+
+void test_forked_deinit(void)
+{
+	test_dir_deinit_forked();
+
+	event_unref(&test_event);
 }
 
 static void test_run_funcs(void (*const test_functions[])(void))
 {
 	unsigned int i;
 
+	test_running = TRUE;
 	for (i = 0; test_functions[i] != NULL; i++) {
 		T_BEGIN {
 			test_functions[i]();
 		} T_END;
 	}
+	test_running = FALSE;
 }
 static void test_run_named_funcs(const struct named_test tests[],
 				 const char *match)
 {
 	unsigned int i;
 
+	test_running = TRUE;
 	for (i = 0; tests[i].func != NULL; i++) {
 		if (strstr(tests[i].name, match) != NULL) T_BEGIN {
 			tests[i].func();
 		} T_END;
 	}
+	test_running = FALSE;
 }
 
 static void run_one_fatal(test_fatal_func_t *fatal_function)
@@ -405,21 +539,25 @@ static void test_run_fatals(test_fatal_func_t *const fatal_functions[])
 {
 	unsigned int i;
 
+	test_running = TRUE;
 	for (i = 0; fatal_functions[i] != NULL; i++) {
 		T_BEGIN {
 			run_one_fatal(fatal_functions[i]);
 		} T_END;
 	}
+	test_running = FALSE;
 }
 static void test_run_named_fatals(const struct named_fatal fatals[], const char *match)
 {
 	unsigned int i;
 
+	test_running = TRUE;
 	for (i = 0; fatals[i].func != NULL; i++) {
 		if (strstr(fatals[i].name, match) != NULL) T_BEGIN {
 			run_one_fatal(fatals[i].func);
 		} T_END;
 	}
+	test_running = FALSE;
 }
 
 int test_run(void (*const test_functions[])(void))
@@ -455,22 +593,28 @@ int test_run_named_with_fatals(const char *match, const struct named_test tests[
 
 void test_forked_end(void)
 {
+	test_forked_deinit();
+
 	i_set_error_handler(default_error_handler);
 	i_set_fatal_handler(default_fatal_handler);
 
 	i_free_and_null(expected_error_str);
 	i_free_and_null(expected_fatal_str);
 	i_free_and_null(test_prefix);
-	t_pop_last_unsafe(); /* as we were within a T_BEGIN { tests[i].func(); } T_END */
+	if (test_running)
+		t_pop_last_unsafe(); /* as we were within a T_BEGIN { tests[i].func(); } T_END */
 }
 
 void ATTR_NORETURN
 test_exit(int status)
 {
+	test_forked_deinit();
+
 	i_free_and_null(expected_error_str);
 	i_free_and_null(expected_fatal_str);
 	i_free_and_null(test_prefix);
-	t_pop_last_unsafe(); /* as we were within a T_BEGIN { tests[i].func(); } T_END */
+	if (test_running)
+		t_pop_last_unsafe(); /* as we were within a T_BEGIN { tests[i].func(); } T_END */
 	lib_deinit();
 	lib_exit(status);
 }
@@ -486,4 +630,9 @@ int test_create_temp_fd(void)
 		i_fatal("safe_mkstemp(%s) failed: %m", str_c(str));
 	i_unlink(str_c(str));
 	return fd;
+}
+
+void test_set_cleanup_callback(void (*callback)(void))
+{
+	test_cleanup_callback = callback;
 }

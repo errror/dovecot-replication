@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "seq-range-array.h"
@@ -160,6 +160,8 @@ bool cmd_store(struct client_command_context *cmd)
 
 	if (client->mailbox_examined) {
 		mail_search_args_unref(&search_args);
+		if (ctx.keywords != NULL)
+			mailbox_keywords_unref(&ctx.keywords);
 		if (ctx.max_modseq < (uint64_t)-1)
 			reply = "NO CONDSTORE failed: Mailbox is read-only.";
 		else

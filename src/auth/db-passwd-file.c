@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 
@@ -486,14 +486,9 @@ int db_passwd_file_lookup(struct db_passwd_file *db,
 	if (!db->vars)
 		pw = db->default_file;
 	else {
-		const struct var_expand_params params = {
-			.table = auth_request_get_var_expand_table(request),
-			.providers = auth_request_var_expand_providers,
-			.context = request,
-			.event = authdb_event(request),
-		};
 		dest = t_str_new(256);
-		if (var_expand_program_execute(dest, db->prog, &params, &error) < 0) {
+		if (auth_request_var_expand_program_execute(dest, db->prog,
+							    request, &error) < 0) {
 			e_error(authdb_event(request),
 				"Failed to expand passwd-file path %s: %s",
 				db->path, error);

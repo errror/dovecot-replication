@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "str.h"
@@ -55,6 +55,15 @@ escape_none(const char *string,
 	    const struct auth_request *request ATTR_UNUSED)
 {
 	return string;
+}
+
+static int
+auth_request_escape_wrapper(const char *input, const char **output_r,
+			    void *context, const char **error_r ATTR_UNUSED)
+{
+	const struct auth_request_var_expand_ctx *ctx = context;
+	*output_r = ctx->escape_func(input, ctx->auth_request);
+	return 0;
 }
 
 const char *
@@ -248,9 +257,9 @@ int auth_request_var_expand_with_table(string_t *dest, const char *str,
 	const struct var_expand_params params = {
 		.table = table,
 		.providers = auth_request_var_expand_providers,
-		.escape_func = (var_expand_escape_func_t *)ctx.escape_func,
+		.escape_func = auth_request_escape_wrapper,
 		.context = &ctx,
-		.escape_context = (void *)auth_request,
+		.escape_context = &ctx,
 		.event = auth_request->event,
 	};
 
@@ -267,6 +276,24 @@ int t_auth_request_var_expand(const char *str,
 					  escape_func, error_r);
 	*value_r = str_c(dest);
 	return ret;
+}
+
+int auth_request_var_expand_program_execute(string_t *dest,
+					    const struct var_expand_program *program,
+					    const struct auth_request *auth_request,
+					    const char **error_r)
+{
+	struct auth_request_var_expand_ctx ctx = {
+		.auth_request = auth_request,
+	};
+	const struct var_expand_params params = {
+		.table = auth_request_get_var_expand_table(auth_request),
+		.providers = auth_request_var_expand_providers,
+		.context = &ctx,
+		.event = authdb_event(auth_request),
+	};
+
+	return var_expand_program_execute(dest, program, &params, error_r);
 }
 
 static void

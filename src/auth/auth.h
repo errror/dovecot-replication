@@ -6,6 +6,8 @@
 
 #define PASSWORD_HIDDEN_STR "<hidden>"
 
+struct sasl_server_instance;
+
 ARRAY_DEFINE_TYPE(auth, struct auth *);
 extern ARRAY_TYPE(auth) auths;
 
@@ -76,7 +78,9 @@ struct auth {
 	const char *protocol;
 	const struct auth_settings *protocol_set;
 
-	const struct mechanisms_register *reg;
+	struct sasl_server_instance *sasl_inst;
+	const struct sasl_server_mech *sasl_mech_dovecot_token;
+
 	struct auth_passdb *masterdbs;
 	struct auth_passdb *passdbs;
 	struct auth_userdb *userdbs;
@@ -86,6 +90,9 @@ struct auth {
 
 extern bool shutting_down;
 
+bool auth_passdb_list_have_verify_plain(const struct auth *auth);
+bool auth_passdb_list_have_lookup_credentials(const struct auth *auth);
+
 struct auth *auth_find_protocol(const char *name);
 struct auth *auth_default_protocol(void);
 
@@ -94,7 +101,6 @@ void auth_userdbs_generate_md5(unsigned char md5[STATIC_ARRAY MD5_RESULTLEN]);
 
 void auths_preinit(struct event *parent_event,
 		   const struct auth_settings *set,
-		   const struct mechanisms_register *reg,
 		   const char *const *protocols);
 void auths_init(void);
 void auths_deinit(void);

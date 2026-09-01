@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "module-dir.h"
@@ -125,6 +125,7 @@ cmd_quota_recalc_run(struct doveadm_mail_cmd_context *ctx ATTR_UNUSED,
 		if ((*root)->backend.v.flush != NULL)
 			(*root)->backend.v.flush(*root);
 	}
+	quota_recalc_call_callbacks(quser->quota);
 	return 0;
 }
 

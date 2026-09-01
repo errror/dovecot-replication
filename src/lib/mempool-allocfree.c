@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /* @UNSAFE: whole file */
 #include "lib.h"
@@ -146,6 +146,7 @@ static const struct pool static_allocfree_pool = {
 pool_t pool_allocfree_create(const char *name ATTR_UNUSED)
 {
 	struct allocfree_pool *pool;
+	int old_errno = errno;
 
 	(void) COMPILE_ERROR_IF_TRUE(SIZEOF_POOLBLOCK >
 				     (SSIZE_T_MAX - POOL_MAX_ALLOC_SIZE));
@@ -154,6 +155,7 @@ pool_t pool_allocfree_create(const char *name ATTR_UNUSED)
 	if (pool == NULL)
 		i_fatal_status(FATAL_OUTOFMEM, "calloc(1, %zu): Out of memory",
 			       SIZEOF_ALLOCFREE_POOL);
+	errno = old_errno;
 #ifdef DEBUG
 	pool->name = strdup(name);
 #endif
@@ -175,6 +177,8 @@ pool_t pool_allocfree_create_clean(const char *name)
 
 static void pool_allocfree_destroy(struct allocfree_pool *apool)
 {
+	int old_errno = errno;
+
 	pool_allocfree_clear(&apool->pool);
 	if (apool->clean_frees)
 		safe_memset(apool, 0, SIZEOF_ALLOCFREE_POOL);
@@ -182,6 +186,7 @@ static void pool_allocfree_destroy(struct allocfree_pool *apool)
 	free(apool->name);
 #endif
 	free(apool);
+	errno = old_errno;
 }
 
 static const char *pool_allocfree_get_name(pool_t pool ATTR_UNUSED)
@@ -256,11 +261,13 @@ static void *pool_allocfree_malloc(pool_t pool, size_t size)
 {
 	struct allocfree_pool *apool =
 		container_of(pool, struct allocfree_pool, pool);
+	int old_errno = errno;
 
 	struct pool_block *block = calloc(1, SIZEOF_POOLBLOCK + size);
 	if (block == NULL)
 		i_fatal_status(FATAL_OUTOFMEM, "calloc(1, %zu): Out of memory",
 			       SIZEOF_POOLBLOCK + size);
+	errno = old_errno;
 	block->size = size;
 	return pool_block_attach(apool, block);
 }
@@ -269,10 +276,12 @@ static void pool_allocfree_free(pool_t pool, void *mem)
 {
 	struct allocfree_pool *apool =
 		container_of(pool, struct allocfree_pool, pool);
+	int old_errno = errno;
 	struct pool_block *block = pool_block_detach(apool, mem);
 	if (apool->clean_frees)
 		safe_memset(block, 0, SIZEOF_POOLBLOCK+block->size);
 	free(block);
+	errno = old_errno;
 }
 
 static void *pool_allocfree_realloc(pool_t pool, void *mem,
@@ -281,6 +290,7 @@ static void *pool_allocfree_realloc(pool_t pool, void *mem,
 	struct allocfree_pool *apool =
 		container_of(pool, struct allocfree_pool, pool);
 	unsigned char *new_mem;
+	int old_errno = errno;
 
 	struct pool_block *block = pool_block_detach(apool, mem);
 	if (old_size == SIZE_MAX)
@@ -288,6 +298,7 @@ static void *pool_allocfree_realloc(pool_t pool, void *mem,
 	if ((new_mem = realloc(block, SIZEOF_POOLBLOCK+new_size)) == NULL)
 		i_fatal_status(FATAL_OUTOFMEM, "realloc(block, %zu)",
 			       SIZEOF_POOLBLOCK+new_size);
+	errno = old_errno;
 
 	/* zero out new memory */
 	if (new_size > old_size)
@@ -303,6 +314,10 @@ static void pool_allocfree_clear(pool_t pool)
 	struct allocfree_pool *apool =
 		container_of(pool, struct allocfree_pool, pool);
 	struct pool_block *block, *next;
+
+	/* the pool's contents are being freed, so anything referring to the
+	   external pools is gone as well */
+	pool_external_refs_unref(&apool->pool);
 
 	for (block = apool->blocks; block != NULL; block = next) {
 		next = block->next;

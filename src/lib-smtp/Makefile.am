@@ -1,3 +1,6 @@
+NOCHILDREN_TESTS = test-smtp-submit
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libsmtp.la
 
 AM_CPPFLAGS = \
@@ -5,6 +8,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-test \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-master \
+	-I$(top_srcdir)/src/lib-auth \
 	-I$(top_srcdir)/src/lib-sasl \
 	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
@@ -95,9 +99,10 @@ fuzz_programs += \
 	fuzz-smtp-server
 endif
 
-noinst_PROGRAMS = $(fuzz_programs) $(test_programs) $(test_nocheck_programs)
+noinst_PROGRAMS += $(fuzz_programs) $(test_nocheck_programs)
 
 EXTRA_DIST = \
+	fuzz-smtp-server.dict \
 	test-bin/sendmail-exit-1.sh \
 	test-bin/sendmail-success.sh
 
@@ -114,13 +119,17 @@ test_libs = \
 	../lib-settings/libsettings.la \
 	../lib-dns/libdns.la \
 	../lib-sasl/libsasl.la \
+	../lib-oauth2/liboauth2.la \
+	../lib-http/libhttp.la \
+	../lib-dcrypt/libdcrypt.la \
+	../lib-dict/libdict.la \
 	../lib-auth/libauth.la \
-	../lib-otp/libotp.la \
 	../lib-json/libjson.la \
 	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la \
-	$(MODULE_LIBS)
+	$(LIBDOVECOT_TEST_LIBS)
 
 test_deps = \
 	$(noinst_LTLIBRARIES) \
@@ -135,9 +144,14 @@ test_deps = \
 	../lib-settings/libsettings.la \
 	../lib-dns/libdns.la \
 	../lib-sasl/libsasl.la \
+	../lib-oauth2/liboauth2.la \
+	../lib-http/libhttp.la \
+	../lib-dcrypt/libdcrypt.la \
+	../lib-dict/libdict.la \
 	../lib-auth/libauth.la \
 	../lib-json/libjson.la \
 	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 
@@ -193,12 +207,3 @@ fuzz_smtp_server_LDFLAGS = $(FUZZER_LDFLAGS)
 fuzz_smtp_server_SOURCES = fuzz-smtp-server.c
 fuzz_smtp_server_LDADD = $(test_libs)
 fuzz_smtp_server_DEPENDENCIES = $(test_deps)
-
-check-local:
-	for bin in $(test_programs); do \
-	  if test "$$bin" = "test-smtp-submit"; then \
-	    if ! env NOCHILDREN=yes $(RUN_TEST) ./$$bin; then exit 1; fi; \
-          else \
-	    if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	  fi \
-	done

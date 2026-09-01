@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -32,8 +32,8 @@ int quoted_printable_q_decode(const unsigned char *src, size_t src_size,
 			break;
 
 		/* =<hex> */
-		hexbuf[0] = src[src_pos+1];
-		hexbuf[1] = src[src_pos+2];
+		hexbuf[0] = (char) src[src_pos+1];
+		hexbuf[1] = (char) src[src_pos+2];
 
 		if (hex_to_binary(hexbuf, dest) == 0) {
 			src_pos += 2;

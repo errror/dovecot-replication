@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -541,6 +541,24 @@ http_message_parse_body_encoded(struct http_message_parser *parser,
 	const struct http_transfer_coding *coding;
 	bool seen_chunked = FALSE;
 
+	if (parser->msg.have_content_length) {
+		/* RFC 7230, Section 3.3.3: Message Body Length
+
+		   If a message is received with both a Transfer-Encoding and a
+		   Content-Length header field, the Transfer-Encoding overrides
+		   the Content-Length. Such a message might indicate an attempt
+		   to perform request smuggling (Section 9.5 of [RFC7230]) or
+		   response splitting (Section 9.4 of [RFC7230]) and ought to be
+		   handled as an error. A sender MUST remove the received
+		   Content-Length field prior to forwarding such a message
+		   downstream.
+		 */
+		parser->error_code = HTTP_MESSAGE_PARSE_ERROR_BROKEN_MESSAGE;
+		parser->error =
+			"Message has both a Transfer-Encoding and a Content-Length header";
+		return -1;
+	}
+
 	array_foreach(&parser->msg.transfer_encoding, coding) {
 		if (http_message_parse_body_coding(parser, coding,
 						   &seen_chunked) < 0)
@@ -549,7 +567,9 @@ http_message_parse_body_encoded(struct http_message_parser *parser,
 
 	if (seen_chunked) {
 		parser->payload = http_transfer_chunked_istream_create(
-			parser->input, parser->max_payload_size);
+			parser->input, parser->max_payload_size,
+			&parser->header_limits,
+			(parser->flags & HTTP_MESSAGE_PARSE_FLAG_STRICT) != 0);
 	} else if (!request) {
 		/* RFC 7230, Section 3.3.3: Message Body Length
 
@@ -576,20 +596,6 @@ http_message_parse_body_encoded(struct http_message_parser *parser,
 			"Final Transfer-Encoding in request is not chunked";
 		return -1;
 	}
-
-	/* RFC 7230, Section 3.3.3: Message Body Length
-
-	   If a message is received with both a Transfer-Encoding and a
-	   Content-Length header field, the Transfer-Encoding overrides the
-	   Content-Length. Such a message might indicate an attempt to perform
-	   request smuggling (Section 9.5 of [RFC7230]) or response splitting
-	   (Section 9.4 of [RFC7230]) and ought to be handled as an error. A
-	   sender MUST remove the received Content-Length field prior to
-	   forwarding such a message downstream.
-	 */
-	// FIXME: make this an error?
-	if (parser->msg.have_content_length)
-		http_header_field_delete(parser->msg.header, "Content-Length");
 
 	return 0;
 }

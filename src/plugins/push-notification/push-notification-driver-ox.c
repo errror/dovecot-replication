@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "hash.h"
@@ -32,15 +32,9 @@
 static const char *const default_events[] = { "MessageNew", NULL };
 static const char *const default_mboxes[] = { "INBOX", NULL };
 
-/* This is data that is shared by all plugin users. */
-struct push_notification_driver_ox_global {
-	struct http_client *http_client;
-	int refcount;
-};
-static struct push_notification_driver_ox_global *ox_global = NULL;
-
 /* This is data specific to an OX driver. */
 struct push_notification_driver_ox_config {
+	struct http_client *http_client;
 	struct http_url *http_url;
 	struct event *event;
 	unsigned int cached_ox_metadata_lifetime_secs;
@@ -56,29 +50,29 @@ struct push_notification_driver_ox_txn {
 };
 
 static bool
-push_notification_driver_ox_init_global(struct mail_user *user, const char *name)
+push_notification_driver_ox_init_http_client(
+	struct push_notification_driver_ox_config *dconfig,
+	struct mail_user *user, const char *name)
 {
-	if (ox_global->http_client == NULL) {
-		const char *error;
+	const char *error;
 
-		struct event *event = event_create(user->event);
-		char *filter_name = p_strdup_printf(
-				event_get_pool(event), "%s/%s",
-				PUSH_NOTIFICATION_SETTINGS_FILTER_NAME,
-				settings_section_escape(name));
-		event_set_ptr(event, SETTINGS_EVENT_FILTER_NAME, filter_name);
+	struct event *event = event_create(user->event);
+	char *filter_name = p_strdup_printf(
+			event_get_pool(event), "%s/%s",
+			PUSH_NOTIFICATION_SETTINGS_FILTER_NAME,
+			settings_section_escape(name));
+	settings_event_add_filter_name(event, filter_name);
+	settings_event_add_filter_name(event,
+				       PUSH_NOTIFICATION_SETTINGS_OX_FILTER_NAME);
 
-		if (http_client_init_auto(event, &ox_global->http_client,
-					  &error) < 0) {
-			e_error(user->event,
-				"Unable to initialize the HTTP client: %s",
-				error);
-			event_unref(&event);
-			return FALSE;
-		}
+	if (http_client_init_auto(event, &dconfig->http_client, &error) < 0) {
+		e_error(user->event,
+			"Unable to initialize the HTTP client: %s",
+			error);
 		event_unref(&event);
+		return FALSE;
 	}
-
+	event_unref(&event);
 	return TRUE;
 }
 
@@ -100,17 +94,17 @@ push_notification_driver_ox_init(struct mail_user *user, pool_t pool,
 	event_add_category(dconfig->event, &event_category_push_notification);
 	event_set_append_log_prefix(dconfig->event, "push-notification-ox: ");
 
-	/* The settings check is deliberately only validating a url if it is   
-	   given in the settings. Otherwise any file that does not contain     
-	   push-notification specific settings would fail the validation.      
-	   Thus we need to check here, whether the parsed url exists. */       
-	if (ox_settings->parsed_url == NULL) {                            
+	/* The settings check is deliberately only validating a url if it is
+	   given in the settings. Otherwise any file that does not contain
+	   push-notification specific settings would fail the validation.
+	   Thus we need to check here, whether the parsed url exists. */
+	if (ox_settings->parsed_url == NULL) {
 		*error_r = "push_notification_ox_url is missing or empty";
-		event_unref(&dconfig->event);                                  
-		settings_free(ox_settings);                               
-		return -1;                                                     
+		event_unref(&dconfig->event);
+		settings_free(ox_settings);
+		return -1;
 	}
-	
+
 	dconfig->http_url = http_url_clone_with_userinfo(pool, ox_settings->parsed_url);
 	e_debug(dconfig->event, "Using URL %s",
 		http_url_create(dconfig->http_url));
@@ -123,17 +117,11 @@ push_notification_driver_ox_init(struct mail_user *user, pool_t pool,
 	e_debug(dconfig->event, "Using user %s",
 		dconfig->use_unsafe_username ? "stored in METADATA" : "sent by OX endpoint");
 
-	if (ox_global == NULL) {
-		ox_global = i_new(struct push_notification_driver_ox_global, 1);
-		ox_global->refcount = 0;
-	}
-
-	++ox_global->refcount;
 	*context = dconfig;
 
 	settings_free(ox_settings);
 
-	if (!push_notification_driver_ox_init_global(user, name))
+	if (!push_notification_driver_ox_init_http_client(dconfig, user, name))
 		return -1;
 
 	return 0;
@@ -372,7 +360,7 @@ push_notification_driver_ox_process_msg(
 		return;
 
 	http_req = http_client_request_url(
-		ox_global->http_client, "PUT", dconfig->http_url,
+		dconfig->http_client, "PUT", dconfig->http_url,
 		push_notification_driver_ox_http_callback, dconfig);
 	http_client_request_set_event(http_req, dtxn->ptxn->event);
 	http_client_request_add_header(http_req, "Content-Type",
@@ -425,23 +413,11 @@ push_notification_driver_ox_deinit(
 	struct push_notification_driver_ox_config *dconfig = duser->context;
 
 	i_free(dconfig->cached_ox_metadata);
-	if (ox_global != NULL) {
-		if (ox_global->http_client != NULL)
-			http_client_wait(ox_global->http_client);
-		i_assert(ox_global->refcount > 0);
-		--ox_global->refcount;
+	if (dconfig->http_client != NULL) {
+		http_client_wait(dconfig->http_client);
+		http_client_deinit(&dconfig->http_client);
 	}
 	event_unref(&dconfig->event);
-}
-
-static void push_notification_driver_ox_cleanup(void)
-{
-	if ((ox_global != NULL) && (ox_global->refcount <= 0)) {
-		if (ox_global->http_client != NULL) {
-			http_client_deinit(&ox_global->http_client);
-		}
-		i_free_and_null(ox_global);
-	}
 }
 
 /* Driver definition */
@@ -455,6 +431,5 @@ struct push_notification_driver push_notification_driver_ox = {
 		.begin_txn = push_notification_driver_ox_begin_txn,
 		.process_msg = push_notification_driver_ox_process_msg,
 		.deinit = push_notification_driver_ox_deinit,
-		.cleanup = push_notification_driver_ox_cleanup,
 	},
 };

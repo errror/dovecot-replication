@@ -1,4 +1,4 @@
-/* Copyright (c) 2024 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -196,6 +196,16 @@ static int var_expand_date(const char *key, const char **value_r,
 static int var_expand_time(const char *key, const char **value_r,
 			   void *context ATTR_UNUSED, const char **error_r)
 {
+	if (strcmp(key, "unix") == 0) {
+		/* Current time as a "<seconds>.<nanoseconds>" UNIX timestamp.
+		   Use the epoch and date filters to convert it. */
+		uint64_t ns = i_nanoseconds();
+		*value_r = t_strdup_printf("%ju.%09ju",
+					   (uintmax_t)(ns / 1000000000),
+					   (uintmax_t)(ns % 1000000000));
+		return 0;
+	}
+
 	struct tm tm;
 	struct timeval tv;
 	i_gettimeofday(&tv);
@@ -338,6 +348,7 @@ void var_expand_state_set_transfer(struct var_expand_state *state, const char *v
 void var_expand_state_unset_transfer(struct var_expand_state *state)
 {
 	str_truncate(state->transfer, 0);
+	state->transfer_safe = FALSE;
 	state->transfer_set = FALSE;
 }
 

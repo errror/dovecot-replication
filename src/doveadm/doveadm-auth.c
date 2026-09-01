@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -158,8 +158,8 @@ cmd_user_input(struct auth_master_connection *conn,
 
 static void
 auth_callback(struct auth_client_request *request,
-	      enum auth_request_status status, const char *data_base64,
-	      const char *const *args, void *context)
+	      enum auth_request_status status, const char *log_error,
+	      const char *data_base64, const char *const *args, void *context)
 {
 	struct authtest_input *input = context;
 	const unsigned char *sasl_output;
@@ -191,12 +191,13 @@ auth_callback(struct auth_client_request *request,
 			}
 		}
 		if (!input->internal_failure) {
-			printf("passdb: %s auth failed\n", input->username);
+			printf("passdb: %s auth failed: %s\n",
+			       input->username, log_error);
 			break;
 		}
 		/* fall through */
 	case AUTH_REQUEST_STATUS_INTERNAL_FAIL:
-		e_error(input->event, "internal auth failure");
+		e_error(input->event, "internal auth failure: %s", log_error);
 		break;
 	case AUTH_REQUEST_STATUS_CONTINUE:
 		input_len = strlen(data_base64);
@@ -204,12 +205,12 @@ auth_callback(struct auth_client_request *request,
 		if (base64_decode(data_base64, input_len, buf) < 0)
 			i_fatal("Server sent invalid base64 input");
 		if (dsasl_client_input(input->sasl_client, buf->data, buf->used,
-				       &error) < 0) {
+				       &error) != DSASL_CLIENT_RESULT_OK) {
 			e_error(input->event, "internal auth failure: %s", error);
 			auth_client_request_abort(&request, error);
 			break;
 		} else if (dsasl_client_output(input->sasl_client, &sasl_output,
-					       &sasl_output_len, &error) < 0) {
+					       &sasl_output_len, &error) != DSASL_CLIENT_RESULT_OK) {
 			e_error(input->event, "internal auth failure: %s", error);
 			auth_client_request_abort(&request, error);
 			break;
@@ -266,7 +267,7 @@ auth_channel_bind_callback(const char *type, void *context,
 }
 
 static void auth_connected(struct auth_client *client,
-			   bool connected, void *context)
+			   const char *connect_error, void *context)
 {
 	struct authtest_input *input = context;
 	const char *mech = dsasl_client_mech_get_name(input->sasl_mech);
@@ -276,16 +277,17 @@ static void auth_connected(struct auth_client *client,
 	string_t *sasl_output_base64;
 	const char *error;
 
-	if (!connected) {
-		if (master_service_is_killed(master_service))
+	if (connect_error != NULL) {
+		if (doveadm_is_killed())
 			return;
-		i_fatal("Couldn't connect to auth socket");
+		i_fatal("Couldn't connect to auth socket: %s", connect_error);
 	}
 	if (auth_client_find_mech(client, mech) == NULL)
 		i_fatal("SASL mechanism '%s' not supported by server", mech);
 
 	if (dsasl_client_output(input->sasl_client, &sasl_output,
-				&sasl_output_len, &error) < 0)
+				&sasl_output_len,
+				&error) != DSASL_CLIENT_RESULT_OK)
 		i_fatal("Failed to create initial SASL reply: %s", error);
 	sasl_output_base64 =
 		t_str_new(MAX_BASE64_ENCODED_SIZE(sasl_output_len));
@@ -331,6 +333,7 @@ static void cmd_auth_init_sasl_client(struct authtest_input *input)
 		input->sasl_mech = &dsasl_client_mech_plain;
 
 	i_zero(&sasl_set);
+	sasl_set.event_parent = input->event;
 	if (input->master_user == NULL)
 		sasl_set.authid = input->username;
 	else {
@@ -338,6 +341,23 @@ static void cmd_auth_init_sasl_client(struct authtest_input *input)
 		sasl_set.authzid = input->username;
 	}
 	sasl_set.password = input->password;
+
+	/* Translate to SASL/GSSAPI/Kerberos service name (IANA-registered) */
+	if (strcasecmp(input->info.protocol, "POP3") == 0)
+		sasl_set.protocol = "pop";
+	else if (strcasecmp(input->info.protocol, "Submission") == 0 ||
+		 strcasecmp(input->info.protocol, "LMTP") == 0)
+		sasl_set.protocol = "smtp";
+	else
+		sasl_set.protocol = input->info.protocol;
+
+	if (input->info.local_name != NULL)
+		sasl_set.host = input->info.local_name;
+	else if (input->info.local_ip.family != 0)
+		sasl_set.host = net_ip2addr(&input->info.local_ip);
+	else
+		sasl_set.host = "localhost";
+	sasl_set.port = input->info.local_port;
 
 	input->sasl_client = dsasl_client_new(input->sasl_mech, &sasl_set);
 	dsasl_client_enable_channel_binding(
@@ -462,17 +482,17 @@ static void cmd_auth_cache_flush(struct doveadm_cmd_context *cctx)
 {
 	const char *master_socket_path;
 	struct auth_master_connection *conn;
-	const char *const *users = NULL;
+	const char *const *user_masks = NULL;
 	unsigned int count;
 
 	if (!doveadm_cmd_param_str(cctx, "socket-path", &master_socket_path)) {
 		master_socket_path = t_strconcat(doveadm_settings->base_dir,
 						 "/auth-master", NULL);
 	}
-	(void)doveadm_cmd_param_array(cctx, "user", &users);
+	(void)doveadm_cmd_param_array(cctx, "user-mask", &user_masks);
 
 	conn = doveadm_get_auth_master_conn(master_socket_path);
-	if (auth_master_cache_flush(conn, users, &count) < 0) {
+	if (auth_master_cache_flush(conn, user_masks, &count) < 0) {
 		e_error(cctx->event, "Cache flush failed");
 		doveadm_exit_code = EX_TEMPFAIL;
 	} else {
@@ -481,8 +501,62 @@ static void cmd_auth_cache_flush(struct doveadm_cmd_context *cctx)
 	auth_master_deinit(&conn);
 }
 
+static void cmd_auth_cache_status(struct doveadm_cmd_context *cctx)
+{
+	const char *master_socket_path;
+	struct auth_master_connection *conn;
+	struct auth_master_cache_status status;
+	bool reset = FALSE;
+	unsigned int total, hit_pct;
+
+	if (!doveadm_cmd_param_str(cctx, "socket-path", &master_socket_path)) {
+		master_socket_path = t_strconcat(doveadm_settings->base_dir,
+						 "/auth-master", NULL);
+	}
+	(void)doveadm_cmd_param_bool(cctx, "reset", &reset);
+
+	conn = doveadm_get_auth_master_conn(master_socket_path);
+	if (auth_master_cache_get_status(conn, reset, &status) < 0) {
+		e_error(cctx->event, "Cache status query failed");
+		doveadm_exit_code = EX_TEMPFAIL;
+		auth_master_deinit(&conn);
+		return;
+	}
+
+	total = status.hit_count + status.miss_count;
+	hit_pct = total == 0 ? 100 : (status.hit_count * 100 / total);
+
+	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
+	doveadm_print_header_simple("hits");
+	doveadm_print_header_simple("misses");
+	doveadm_print_header_simple("hit_ratio_percent");
+	doveadm_print_header_simple("pos_entries");
+	doveadm_print_header_simple("neg_entries");
+	doveadm_print_header_simple("pos_size");
+	doveadm_print_header_simple("neg_size");
+	doveadm_print_header_simple("used_size");
+	doveadm_print_header_simple("max_size");
+
+	doveadm_print(dec2str(status.hit_count));
+	doveadm_print(dec2str(status.miss_count));
+	doveadm_print(dec2str(hit_pct));
+	doveadm_print(dec2str(status.pos_entries));
+	doveadm_print(dec2str(status.neg_entries));
+	doveadm_print(dec2str(status.pos_size));
+	doveadm_print(dec2str(status.neg_size));
+	doveadm_print(dec2str(status.used_size));
+	doveadm_print(dec2str(status.max_size));
+
+	auth_master_deinit(&conn);
+}
+
 static void authtest_input_init(struct authtest_input *input)
 {
+	dsasl_clients_init();
+#ifdef BUILTIN_GSSAPI
+	dsasl_clients_init_gssapi();
+#endif
+
 	i_zero(input);
 	input->pool = pool_alloconly_create("auth input", 256);
 	input->info.protocol = "doveadm";
@@ -494,6 +568,8 @@ static void authtest_input_init(struct authtest_input *input)
 static void authtest_input_deinit(struct authtest_input *input)
 {
 	pool_unref(&input->pool);
+
+	dsasl_clients_deinit();
 }
 
 static void cmd_auth_test(struct doveadm_cmd_context *cctx)
@@ -924,10 +1000,19 @@ DOVEADM_CMD_PARAMS_END
 {
 	.cmd = cmd_auth_cache_flush,
 	.name = "auth cache flush",
-	.usage = "[-a <master socket path>] [<user> [...]]",
+	.usage = "[-a <master socket path>] [<user-mask> [...]]",
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_PARAM('a', "socket-path", CMD_PARAM_STR, 0)
-DOVEADM_CMD_PARAM('\0', "user", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "user-mask", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+},
+{
+	.cmd = cmd_auth_cache_status,
+	.name = "auth cache status",
+	.usage = "[-a <master socket path>] [--reset]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAM('a', "socket-path", CMD_PARAM_STR, 0)
+DOVEADM_CMD_PARAM('\0', "reset", CMD_PARAM_BOOL, 0)
 DOVEADM_CMD_PARAMS_END
 },
 {

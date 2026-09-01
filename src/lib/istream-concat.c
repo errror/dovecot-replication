@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -175,7 +175,21 @@ static ssize_t i_stream_concat_read(struct istream_private *stream)
 		   this isn't easy for seekable concat-istreams, because due to
 		   seeking it's not necessarily the cur_input that needs to be
 		   snapshotted. */
-		i_assert(cur_data_pos == data_size);
+		if (cur_data_pos != data_size) {
+			/* The child istream returned less data than it had
+			   already provided to us earlier. This can happen when
+			   the child's stat()-reported size is larger than the
+			   amount of data it can actually return (e.g. a
+			   corrupted or truncated stream). */
+			i_assert(cur_data_pos > data_size);
+			io_stream_set_error(&cstream->istream.iostream,
+				"read(%s) returned less data than expected "
+				"(%zu < %zu)",
+				i_stream_get_name(cstream->cur_input),
+				data_size, cur_data_pos);
+			stream->istream.stream_errno = EIO;
+			return -1;
+		}
 		ret = i_stream_read(cstream->cur_input);
 		if (ret == -2 || ret == 0)
 			return ret;
@@ -396,5 +410,7 @@ struct istream *i_stream_create_concat(struct istream *input[])
 	cstream->istream.istream.readable_fd = FALSE;
 	cstream->istream.istream.blocking = blocking;
 	cstream->istream.istream.seekable = seekable;
-	return i_stream_create(&cstream->istream, NULL, -1, 0);
+
+	return i_stream_create(&cstream->istream, NULL, -1,
+			       ISTREAM_HIDDEN_INPUTS_PANIC, 0);
 }

@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Copyright (c) 2019 Dovecot authors, see the included COPYING file */
+# Copyright (c) Dovecot authors, see top-level COPYING file
 #
 # This script is intended to be called by the script service and to be
 # connected to a socket using a service configuration like this:
@@ -16,13 +16,17 @@ timeout=10
 
 # timeout the read via trap for POSIX shell compatibility
 trap "exit 0" QUIT
+trap 'kill $timeout_pid 2>/dev/null' EXIT INT TERM
+
 {
 	sleep $timeout
 	kill -3 $$ 2>/dev/null
 } &
-read -r input
+timeout_pid=$!
 
+read -r input
 exit_code=$?
+
 cleaned_input=$(echo ${input} | sed "s/[^a-zA-Z0-9]//g")
 
 if [ ${exit_code} -eq 0 ] && [ "${cleaned_input}" = "PING" ];then

@@ -1,4 +1,4 @@
-/* Copyright (c) 2019 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -265,7 +265,7 @@ test_mailbox_list_get_hierarchy_sep(struct mailbox_list *list ATTR_UNUSED)
 }
 
 static void
-test_maibox_list_name_init(struct mailbox_list *list,
+test_mailbox_list_name_init(struct mailbox_list *list,
 			   const struct test_mailbox_list_name *test,
 			   bool mutf7)
 {
@@ -427,6 +427,18 @@ static void test_mailbox_list_get_names(void)
 		  .storage_name = "A/B.C%D",
 		  .ns_sep = '/', .list_sep = '.',
 		  .vname_escape_char = '%' },
+		/* invalid UTF-8 bytes escaped in mailbox_list_utf8=yes mode */
+		{ .vname = "broken%ffbox",
+		  .storage_name = "broken\xff""box",
+		  .flags = TEST_FLAG_NO_MUTF7,
+		  .ns_sep = '/', .list_sep = '.',
+		  .vname_escape_char = '%' },
+		/* valid multibyte UTF-8 kept, invalid byte escaped */
+		{ .vname = "\xC3\xA4%ff",
+		  .storage_name = "\xC3\xA4\xff",
+		  .flags = TEST_FLAG_NO_MUTF7,
+		  .ns_sep = '/', .list_sep = '.',
+		  .vname_escape_char = '%' },
 
 		/* INBOX: */
 		{ .vname = "inBox",
@@ -483,7 +495,7 @@ static void test_mailbox_list_get_names(void)
 	test_begin("mailbox list get names");
 	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
 		if ((tests[i].flags & TEST_FLAG_NO_MUTF7) == 0) {
-			test_maibox_list_name_init(&list, &tests[i], TRUE);
+			test_mailbox_list_name_init(&list, &tests[i], TRUE);
 			if ((tests[i].flags & TEST_FLAG_NO_STORAGE_NAME) == 0) {
 				test_assert_strcmp_idx(mailbox_list_default_get_storage_name(&list, tests[i].vname),
 						       tests[i].storage_name, i);
@@ -494,7 +506,7 @@ static void test_mailbox_list_get_names(void)
 			}
 		}
 		if ((tests[i].flags & TEST_FLAG_NO_UTF8) == 0) {
-			test_maibox_list_name_init(&list, &tests[i], FALSE);
+			test_mailbox_list_name_init(&list, &tests[i], FALSE);
 			if ((tests[i].flags & TEST_FLAG_NO_STORAGE_NAME) == 0) {
 				test_assert_strcmp_idx(mailbox_list_default_get_storage_name(&list, tests[i].vname),
 						       tests[i].storage_name, i);
@@ -508,12 +520,106 @@ static void test_mailbox_list_get_names(void)
 	test_end();
 }
 
+static void test_mailbox_list_escape_name_params(void)
+{
+	const struct {
+		const char *input;
+		char list_sep;
+		char escape_char;
+		const char *maildir_name;
+		bool first_part;
+		const char *expected;
+	} tests[] = {
+		/* leading '~' escaped only when first_part=TRUE */
+		{ "~foo", '/', '+', "", TRUE, "+7efoo" },
+		{ "~foo", '/', '+', "", FALSE, "~foo" },
+		/* '~' in the middle never escaped */
+		{ "foo~bar", '/', '+', "", TRUE, "foo~bar" },
+		{ "foo~bar", '/', '+', "", FALSE, "foo~bar" },
+		/* dirstart checks are per-part: "." and ".." escaped */
+		{ ".", '/', '+', "", TRUE, "+2e" },
+		{ ".", '/', '+', "", FALSE, "+2e" },
+		{ "..", '/', '+', "", TRUE, "+2e." },
+		{ "..", '/', '+', "", FALSE, "+2e." },
+		/* ".." is escaped regardless of the list separator, since the
+		   storage name may still end up used as a filesystem path */
+		{ "..", '.', '+', "", TRUE, "+2e+2e" },
+		{ "..", ':', '+', "", FALSE, "+2e." },
+		/* leading '.' followed by other chars is not escaped */
+		{ ".hidden", '/', '+', "", FALSE, ".hidden" },
+		/* maildir_name at part start always escaped */
+		{ "dbox-Mails", '/', '+', "dbox-Mails", FALSE,
+		  "+64box-Mails" },
+		/* literal list_sep escaped - the name is a single hierarchy
+		   part, so list_sep can't be a separator here */
+		{ "a.b", '.', '+', "", TRUE, "a+2eb" },
+		{ "a/b", '/', '+', "", TRUE, "a+2fb" },
+		/* literal escape_char escaped */
+		{ "a+b", '.', '+', "", TRUE, "a+2bb" },
+		/* '/' escaped even when it isn't the list_sep */
+		{ "a/b", '.', '+', "", TRUE, "a+2fb" },
+		/* escaped '/' still starts a new dirstart check */
+		{ "a/..", ':', '+', "", TRUE, "a+2f+2e." },
+	};
+	const char *result;
+
+	test_begin("mailbox_list_escape_name_params");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		result = mailbox_list_escape_name_params(tests[i].input,
+			tests[i].list_sep,
+			tests[i].escape_char, tests[i].maildir_name,
+			tests[i].first_part);
+		test_assert_strcmp_idx(result, tests[i].expected, i);
+	}
+	test_end();
+}
+
+static void test_mailbox_list_escape_unescape_roundtrip(void)
+{
+	const struct {
+		const char *input;
+		char ns_sep;
+		char list_sep;
+		char escape_char;
+		bool first_part;
+	} tests[] = {
+		{ "~foo", '/', '/', '+', TRUE },
+		{ "~foo", '/', '/', '+', FALSE },
+		{ "foo~bar", '/', '/', '+', TRUE },
+		{ "a+b+c", '/', '/', '+', TRUE },
+		{ "plain", '/', '/', '+', TRUE },
+		/* parts containing chars that look like mUTF-7 escape hex */
+		{ "+49NBOX", '/', '.', '+', TRUE },
+		{ "+49NBOX", '/', '.', '+', FALSE },
+		/* arbitrary bytes that escape via dirstart rules */
+		{ ".", '/', '.', '+', TRUE },
+		{ "..", '/', '.', '+', TRUE },
+	};
+	const char *escaped, *roundtrip;
+
+	test_begin("mailbox_list_escape/unescape round-trip");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) {
+		escaped = mailbox_list_escape_name_params(tests[i].input,
+			tests[i].list_sep, tests[i].escape_char, "",
+			tests[i].first_part);
+		/* unescape uses ns_sep<-list_sep mapping; pass the same
+		   separators so the round-trip restores the input. */
+		roundtrip = mailbox_list_unescape_name_params(escaped,
+			tests[i].ns_sep, tests[i].list_sep,
+			tests[i].escape_char);
+		test_assert_strcmp_idx(roundtrip, tests[i].input, i);
+	}
+	test_end();
+}
+
 int main(void)
 {
 	void (*const tests[])(void) = {
 		test_mailbox_list_errors,
 		test_mailbox_list_last_error_push_pop,
 		test_mailbox_list_get_names,
+		test_mailbox_list_escape_name_params,
+		test_mailbox_list_escape_unescape_roundtrip,
 		NULL
 	};
 	return test_run(tests);

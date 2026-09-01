@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -89,7 +89,7 @@ struct pop3_migration_settings {
 	SETTING_DEFINE_STRUCT_##type("pop3_migration_"#name, name, \
 		struct pop3_migration_settings)
 static const struct setting_define pop3_migration_setting_defines[] = {
-	DEF(STR, mailbox),
+	DEF(STR_NFC, mailbox),
 	DEF(BOOL, all_mailboxes),
 	DEF(BOOL, ignore_missing_uidls),
 	DEF(BOOL, ignore_extra_uidls),

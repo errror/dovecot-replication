@@ -1,12 +1,8 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "dict-private.h"
 #include "test-common.h"
-
-struct dict dict_driver_client;
-struct dict dict_driver_file;
-struct dict dict_driver_redis;
 
 static void test_dict_escape(void)
 {

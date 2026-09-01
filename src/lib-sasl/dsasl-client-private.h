@@ -1,6 +1,7 @@
 #ifndef DSASL_CLIENT_PRIVATE_H
 #define DSASL_CLIENT_PRIVATE_H
 
+#include "sasl-common.h"
 #include "dsasl-client.h"
 
 enum dsasl_mech_security_flags {
@@ -10,6 +11,8 @@ enum dsasl_mech_security_flags {
 
 struct dsasl_client {
 	pool_t pool;
+	struct event *event;
+
 	struct dsasl_client_settings set;
 	char *password;
 	const struct dsasl_client_mech *mech;
@@ -24,12 +27,14 @@ struct dsasl_client_mech {
 	size_t struct_size;
 	enum dsasl_mech_security_flags flags;
 
-	int (*input)(struct dsasl_client *client,
-		     const unsigned char *input, size_t input_len,
-		     const char **error_r);
-	int (*output)(struct dsasl_client *client,
-		      const unsigned char **output_r, size_t *output_len_r,
-		      const char **error_r);
+	enum dsasl_client_result
+		(*input)(struct dsasl_client *client,
+			 const unsigned char *input, size_t input_len,
+			 const char **error_r);
+	enum dsasl_client_result
+		(*output)(struct dsasl_client *client,
+			  const unsigned char **output_r, size_t *output_len_r,
+			  const char **error_r);
 	int (*set_parameter)(struct dsasl_client *client,
 			     const char *key, const char *value,
 			     const char **error_r);
@@ -40,6 +45,8 @@ struct dsasl_client_mech {
 };
 
 extern const struct dsasl_client_mech dsasl_client_mech_anonymous;
+extern const struct dsasl_client_mech dsasl_client_mech_cram_md5;
+extern const struct dsasl_client_mech dsasl_client_mech_digest_md5;
 extern const struct dsasl_client_mech dsasl_client_mech_external;
 extern const struct dsasl_client_mech dsasl_client_mech_login;
 extern const struct dsasl_client_mech dsasl_client_mech_oauthbearer;
@@ -53,9 +60,9 @@ void dsasl_client_mech_register(const struct dsasl_client_mech *mech);
 void dsasl_client_mech_unregister(const struct dsasl_client_mech *mech);
 
 static inline int
-dasl_client_get_channel_binding(struct dsasl_client *client,
-				const char *type, const buffer_t **data_r,
-				const char **error_r)
+dsasl_client_get_channel_binding(struct dsasl_client *client,
+				 const char *type, const buffer_t **data_r,
+				 const char **error_r)
 {
 	if (client->channel_version == SSL_IOSTREAM_PROTOCOL_VERSION_UNKNOWN ||
 	    client->cbinding_callback == NULL) {

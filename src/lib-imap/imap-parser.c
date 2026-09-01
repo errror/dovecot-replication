@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -39,6 +39,7 @@ struct imap_parser {
 	struct istream *input;
 	struct ostream *output;
 	size_t max_line_size;
+	unsigned int list_count_limit;
         enum imap_parser_flags flags;
 
 	/* reset by imap_parser_reset(): */
@@ -46,12 +47,13 @@ struct imap_parser {
 	ARRAY_TYPE(imap_arg_list) root_list;
         ARRAY_TYPE(imap_arg_list) *cur_list;
 	struct imap_arg *list_arg;
+	unsigned int list_count;
 
 	enum arg_parse_type cur_type;
 	size_t cur_pos; /* parser position in input buffer */
 	bool cur_resp_text; /* we're parsing [resp-text-code] */
 
-	int str_first_escape; /* ARG_PARSE_STRING: index to first '\' */
+	bool str_have_escape; /* ARG_PARSE_STRING: a '\' escape was seen */
 	uoff_t literal_size; /* ARG_PARSE_LITERAL: string size */
 
 	enum imap_parser_error error;
@@ -69,7 +71,8 @@ struct imap_parser {
 
 struct imap_parser *
 imap_parser_create(struct istream *input, struct ostream *output,
-		   size_t max_line_size)
+		   size_t max_line_size,
+		   const struct imap_parser_params *params)
 {
 	struct imap_parser *parser;
 
@@ -80,6 +83,10 @@ imap_parser_create(struct istream *input, struct ostream *output,
 	parser->input = input;
 	parser->output = output;
 	parser->max_line_size = max_line_size;
+	if (params != NULL && params->list_count_limit > 0)
+		parser->list_count_limit = params->list_count_limit;
+	else
+		parser->list_count_limit = UINT_MAX;
 
 	p_array_init(&parser->root_list, parser->pool, LIST_INIT_COUNT);
 	parser->cur_list = &parser->root_list;
@@ -121,12 +128,13 @@ void imap_parser_reset(struct imap_parser *parser)
 	p_array_init(&parser->root_list, parser->pool, LIST_INIT_COUNT);
 	parser->cur_list = &parser->root_list;
 	parser->list_arg = NULL;
+	parser->list_count = 0;
 
 	parser->cur_type = ARG_PARSE_NONE;
 	parser->cur_pos = 0;
 	parser->cur_resp_text = FALSE;
 
-	parser->str_first_escape = 0;
+	parser->str_have_escape = FALSE;
 	parser->literal_size = 0;
 
 	parser->error = IMAP_PARSE_ERROR_NONE;
@@ -183,8 +191,15 @@ static struct imap_arg *imap_arg_create(struct imap_parser *parser)
 	return arg;
 }
 
-static void imap_parser_open_list(struct imap_parser *parser)
+static bool imap_parser_open_list(struct imap_parser *parser)
 {
+	if (parser->list_count >= parser->list_count_limit) {
+		parser->error_msg = "Too many '('";
+		parser->error = IMAP_PARSE_ERROR_BAD_SYNTAX;
+		return FALSE;
+	}
+	parser->list_count++;
+
 	parser->list_arg = imap_arg_create(parser);
 	parser->list_arg->type = IMAP_ARG_LIST;
 	p_array_init(&parser->list_arg->_data.list, parser->pool,
@@ -192,6 +207,7 @@ static void imap_parser_open_list(struct imap_parser *parser)
 	parser->cur_list = &parser->list_arg->_data.list;
 
 	parser->cur_type = ARG_PARSE_NONE;
+	return TRUE;
 }
 
 static bool imap_parser_close_list(struct imap_parser *parser)
@@ -266,7 +282,7 @@ static void imap_parser_save_arg(struct imap_parser *parser,
 		str = p_strndup(parser->pool, data+1, size-1);
 
 		/* remove the escapes */
-		if (parser->str_first_escape >= 0 &&
+		if (parser->str_have_escape &&
 		    (parser->flags & IMAP_PARSE_FLAG_NO_UNESCAPE) == 0)
 			(void)str_unescape(str);
 		arg->_data.str = str;
@@ -374,9 +390,8 @@ static bool imap_parser_read_string(struct imap_parser *parser,
 				break;
 			}
 
-			/* save the first escaped char */
-			if (parser->str_first_escape < 0)
-				parser->str_first_escape = i;
+			/* remember that the string contains an escape */
+			parser->str_have_escape = TRUE;
 
 			/* skip the escaped char */
 			i++;
@@ -630,7 +645,7 @@ static bool imap_parser_read_arg(struct imap_parser *parser)
 			return FALSE;
 		case '"':
 			parser->cur_type = ARG_PARSE_STRING;
-			parser->str_first_escape = -1;
+			parser->str_have_escape = FALSE;
 			break;
 		case '~':
 			/* This could be either literal8 or atom */
@@ -659,7 +674,8 @@ static bool imap_parser_read_arg(struct imap_parser *parser)
 			parser->literal8 = FALSE;
 			break;
 		case '(':
-			imap_parser_open_list(parser);
+			if (!imap_parser_open_list(parser))
+				return FALSE;
 			if ((parser->flags & IMAP_PARSE_FLAG_STOP_AT_LIST) != 0) {
 				i_stream_skip(parser->input, 1);
 				return FALSE;
@@ -745,16 +761,17 @@ static bool imap_parser_read_arg(struct imap_parser *parser)
 
 static void list_add_ghost_eol(struct imap_arg *list_arg)
 {
-	struct imap_arg *arg;
+	/* Walk the parent chain iteratively rather than recursing once per
+	   nesting level, so a deeply nested list cannot grow the C stack. */
+	for (; list_arg != NULL; list_arg = list_arg->parent) {
+		struct imap_arg *arg;
 
-	i_assert(list_arg->type == IMAP_ARG_LIST);
+		i_assert(list_arg->type == IMAP_ARG_LIST);
 
-	arg = array_append_space(&list_arg->_data.list);
-	arg->type = IMAP_ARG_EOL;
-	array_pop_back(&list_arg->_data.list);
-
-	if (list_arg->parent != NULL)
-		list_add_ghost_eol(list_arg->parent);
+		arg = array_append_space(&list_arg->_data.list);
+		arg->type = IMAP_ARG_EOL;
+		array_pop_back(&list_arg->_data.list);
+	}
 }
 
 /* ARG_PARSE_NONE checks that last argument isn't only partially parsed. */

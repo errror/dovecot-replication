@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "buffer.h"
@@ -559,6 +559,16 @@ invalid_request_parse_tests[] = {
 			"Date: Sun, 07 Oct 2012 19:52:03 GMT\r\n"
 			"Host: example.com\r\n"
 			"Date: Sun, 13 Oct 2013 13:13:13 GMT\r\n"
+			"\r\n",
+		.flags = HTTP_REQUEST_PARSE_FLAG_STRICT,
+		.error_code = HTTP_REQUEST_PARSE_ERROR_BROKEN_REQUEST
+	},
+	{
+		/* bare LF terminating the request line must be rejected in
+		   strict mode */
+		.request =
+			"GET / HTTP/1.1\n"
+			"Host: example.com\r\n"
 			"\r\n",
 		.flags = HTTP_REQUEST_PARSE_FLAG_STRICT,
 		.error_code = HTTP_REQUEST_PARSE_ERROR_BROKEN_REQUEST

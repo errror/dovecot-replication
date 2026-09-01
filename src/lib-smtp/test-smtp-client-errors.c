@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -214,6 +214,9 @@ static void test_host_lookup_failed(void)
 static void test_server_connection_refused(unsigned int index ATTR_UNUSED)
 {
 	i_close_fd(&fd_listen);
+
+	/* notify client that the listen socket is closed */
+	test_subprocess_notify_signal_send_parent(SIGHUP);
 }
 
 /* client */
@@ -243,6 +246,11 @@ test_client_connection_refused(const struct smtp_client_settings *client_set)
 	struct smtp_client_connection *sconn;
 	struct smtp_client_command *scmd;
 	struct _connection_refused *ctx;
+
+	/* wait until the server closed the listen socket, so that connecting
+	   fails with ECONNREFUSED instead of ending up in the listen backlog */
+	test_subprocess_notify_signal_wait(SIGHUP,
+					   TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 
 	test_expect_errors(2);
 
@@ -283,6 +291,7 @@ static void test_connection_refused(void)
 	test_client_defaults(&smtp_client_set, NULL);
 
 	test_begin("connection refused");
+	test_subprocess_notify_signal_reset(SIGHUP);
 	test_run_client_server(&smtp_client_set,
 			       test_client_connection_refused,
 			       test_server_connection_refused, 1, NULL);
@@ -2208,6 +2217,201 @@ static void test_early_data_reply(void)
 }
 
 /*
+ * Pipelined MAIL failure
+ */
+
+/* server */
+
+static int
+test_pipelined_mail_failure_input_line(struct server_connection *conn,
+				       const char *line)
+{
+	if (debug)
+		i_debug("[%u] GOT LINE: %s", server_index, line);
+
+	switch (conn->state) {
+	case SERVER_CONNECTION_STATE_EHLO:
+		/* Let the default handler announce the capabilities
+		   (including PIPELINING) */
+		return 0;
+	case SERVER_CONNECTION_STATE_MAIL_FROM:
+		/* Withhold the MAIL reply until the pipelined RCPT command
+		   arrives */
+		conn->state = SERVER_CONNECTION_STATE_RCPT_TO;
+		return 1;
+	case SERVER_CONNECTION_STATE_RCPT_TO:
+		/* Reject both commands in a single write, so that the client
+		   parses both replies from the same input buffer */
+		o_stream_nsend_str(
+			conn->conn.output,
+			"451 4.7.1 Service unavailable - try again later\r\n"
+			"503 5.5.1 Error: need MAIL command\r\n");
+		conn->state = SERVER_CONNECTION_STATE_DATA;
+		return 1;
+	case SERVER_CONNECTION_STATE_DATA:
+		/* Stay in this state: no message payload is ever sent, since
+		   the client aborts the transaction locally */
+		o_stream_nsend_str(conn->conn.output,
+				   "503 5.5.1 Error: need RCPT command\r\n");
+		return 1;
+	case SERVER_CONNECTION_STATE_FINISH:
+		break;
+	}
+	return 1;
+}
+
+static void test_server_pipelined_mail_failure(unsigned int index)
+{
+	test_server_input_line = test_pipelined_mail_failure_input_line;
+	test_server_run(index);
+}
+
+/* client */
+
+struct _pipelined_mail_failure {
+	struct smtp_client_connection *conn;
+	struct smtp_client_transaction *trans;
+
+	bool mail_from_callback:1;
+	bool rcpt_to_callback:1;
+	bool rcpt_data_callback:1;
+	bool data_callback:1;
+};
+
+static void
+test_client_pipelined_mail_failure_mail_from_cb(
+	const struct smtp_reply *reply,
+	struct _pipelined_mail_failure *ctx)
+{
+	if (debug)
+		i_debug("MAIL FROM REPLY: %s", smtp_reply_log(reply));
+
+	ctx->mail_from_callback = TRUE;
+	test_assert(reply->status == 451);
+}
+
+static void
+test_client_pipelined_mail_failure_rcpt_to_cb(
+	const struct smtp_reply *reply,
+	struct _pipelined_mail_failure *ctx)
+{
+	if (debug)
+		i_debug("RCPT TO REPLY: %s", smtp_reply_log(reply));
+
+	ctx->rcpt_to_callback = TRUE;
+	/* The RCPT command was already pipelined when MAIL failed, so this is
+	   the MAIL failure propagated locally; the 503 reply the server sends
+	   for the RCPT command itself is never returned to the caller. */
+	test_assert(reply->status == 451);
+}
+
+static void
+test_client_pipelined_mail_failure_rcpt_data_cb(
+	const struct smtp_reply *reply,
+	struct _pipelined_mail_failure *ctx)
+{
+	if (debug)
+		i_debug("RCPT DATA REPLY: %s", smtp_reply_log(reply));
+
+	/* No recipient was ever approved */
+	ctx->rcpt_data_callback = TRUE;
+}
+
+static void
+test_client_pipelined_mail_failure_data_cb(
+	const struct smtp_reply *reply,
+	struct _pipelined_mail_failure *ctx)
+{
+	if (debug)
+		i_debug("DATA REPLY: %s", smtp_reply_log(reply));
+
+	ctx->data_callback = TRUE;
+	test_assert(reply->status == 451);
+}
+
+static void
+test_client_pipelined_mail_failure_finished(
+	struct _pipelined_mail_failure *ctx)
+{
+	if (debug)
+		i_debug("FINISHED");
+
+	test_assert(ctx->mail_from_callback);
+	test_assert(ctx->rcpt_to_callback);
+	test_assert(!ctx->rcpt_data_callback);
+	test_assert(ctx->data_callback);
+
+	ctx->trans = NULL;
+	i_free(ctx);
+	io_loop_stop(ioloop);
+}
+
+static bool
+test_client_pipelined_mail_failure(
+	const struct smtp_client_settings *client_set)
+{
+	static const char *message =
+		"From: stephan@example.com\r\n"
+		"To: timo@example.com\r\n"
+		"Subject: Frop!\r\n"
+		"\r\n"
+		"Frop!\r\n";
+	struct _pipelined_mail_failure *ctx;
+	struct istream *input;
+
+	ctx = i_new(struct _pipelined_mail_failure, 1);
+
+	smtp_client = smtp_client_init(client_set);
+
+	/* Submit the whole transaction in one go, just like smtp_submit does,
+	   so that MAIL, RCPT and DATA end up pipelined. */
+	ctx->conn = smtp_client_connection_create(
+		smtp_client, SMTP_PROTOCOL_SMTP,
+		net_ip2addr(&bind_ip), bind_ports[0],
+		SMTP_CLIENT_SSL_MODE_NONE, NULL);
+	ctx->trans = smtp_client_transaction_create(
+		ctx->conn, &((struct smtp_address){
+			.localpart = "sender",
+			.domain = "example.com"}), NULL, 0,
+		test_client_pipelined_mail_failure_finished, ctx);
+	smtp_client_connection_unref(&ctx->conn);
+
+	smtp_client_transaction_start(
+		ctx->trans, test_client_pipelined_mail_failure_mail_from_cb,
+		ctx);
+	smtp_client_transaction_add_rcpt(
+		ctx->trans, &((struct smtp_address){
+			.localpart = "rcpt",
+			.domain = "example.com"}), NULL,
+		test_client_pipelined_mail_failure_rcpt_to_cb,
+		test_client_pipelined_mail_failure_rcpt_data_cb, ctx);
+
+	input = i_stream_create_from_data(message, strlen(message));
+	i_stream_set_name(input, "message");
+	smtp_client_transaction_send(
+		ctx->trans, input,
+		test_client_pipelined_mail_failure_data_cb, ctx);
+	i_stream_unref(&input);
+
+	return TRUE;
+}
+
+/* test */
+
+static void test_pipelined_mail_failure(void)
+{
+	struct smtp_client_settings smtp_client_set;
+
+	test_client_defaults(&smtp_client_set, NULL);
+
+	test_begin("pipelined mail failure");
+	test_run_client_server(&smtp_client_set,
+			       test_client_pipelined_mail_failure,
+			       test_server_pipelined_mail_failure, 1, NULL);
+	test_end();
+}
+
+/*
  * Bad reply
  */
 
@@ -3642,6 +3846,175 @@ static void test_transaction_timeout(void)
 }
 
 /*
+ * Connection close in failure callback
+ */
+
+/* server */
+
+static int
+test_close_in_failure_input_line(struct server_connection *conn,
+				 const char *line)
+{
+	if (conn->state != SERVER_CONNECTION_STATE_RCPT_TO ||
+	    !str_begins_with(line, "RCPT "))
+		return 0;
+
+	/* Drop the connection while the RCPT commands are still pending. */
+	server_connection_deinit(&conn);
+	return -1;
+}
+
+static void test_server_close_in_failure(unsigned int index)
+{
+	test_server_input_line = test_close_in_failure_input_line;
+	test_server_run(index);
+}
+
+/* client */
+
+#define TEST_CLOSE_IN_FAILURE_RCPT_COUNT 2
+
+struct _close_in_failure {
+	struct smtp_client_connection *conn;
+	struct smtp_client_transaction *trans;
+
+	unsigned int rcpt_to_callbacks;
+
+	bool mail_from_callback:1;
+	bool data_callback:1;
+};
+
+static void
+test_client_close_in_failure_finished(struct _close_in_failure *ctx)
+{
+	if (debug)
+		i_debug("FINISHED");
+
+	ctx->trans = NULL;
+
+	test_assert(ctx->mail_from_callback);
+	test_assert_cmp(ctx->rcpt_to_callbacks, ==,
+			TEST_CLOSE_IN_FAILURE_RCPT_COUNT);
+	test_assert(ctx->data_callback);
+
+	if (ctx->conn != NULL)
+		smtp_client_connection_close(&ctx->conn);
+	i_free(ctx);
+	io_loop_stop(ioloop);
+}
+
+static void
+test_client_close_in_failure_mail_from_cb(const struct smtp_reply *reply,
+					  struct _close_in_failure *ctx)
+{
+	if (debug)
+		i_debug("MAIL FROM REPLY: %s", smtp_reply_log(reply));
+
+	test_assert(smtp_reply_is_success(reply));
+	ctx->mail_from_callback = TRUE;
+}
+
+static void
+test_client_close_in_failure_rcpt_to_cb(const struct smtp_reply *reply,
+					struct _close_in_failure *ctx)
+{
+	if (debug)
+		i_debug("RCPT TO REPLY: %s", smtp_reply_log(reply));
+
+	test_assert(reply->status == SMTP_CLIENT_COMMAND_ERROR_CONNECTION_LOST);
+	ctx->rcpt_to_callbacks++;
+
+	if (ctx->conn == NULL)
+		return;
+
+	/* Close the connection while the transaction failure is still being
+	   handled. The commands that it is still going to fail must not be
+	   freed from under it. */
+	smtp_client_connection_close(&ctx->conn);
+}
+
+static void
+test_client_close_in_failure_rcpt_data_cb(
+	const struct smtp_reply *reply ATTR_UNUSED,
+	struct _close_in_failure *ctx ATTR_UNUSED)
+{
+	/* Not reached: the recipient was never accepted. */
+	test_assert(FALSE);
+}
+
+static void
+test_client_close_in_failure_data_cb(const struct smtp_reply *reply,
+				     struct _close_in_failure *ctx)
+{
+	if (debug)
+		i_debug("DATA REPLY: %s", smtp_reply_log(reply));
+
+	test_assert(reply->status == SMTP_CLIENT_COMMAND_ERROR_CONNECTION_LOST);
+	ctx->data_callback = TRUE;
+}
+
+static bool
+test_client_close_in_failure(const struct smtp_client_settings *client_set)
+{
+	static const char *message =
+		"From: stephan@example.com\r\n"
+		"To: timo@example.com\r\n"
+		"Subject: Frop!\r\n"
+		"\r\n"
+		"Frop!\r\n";
+	struct _close_in_failure *ctx;
+	struct istream *input;
+	unsigned int i;
+
+	ctx = i_new(struct _close_in_failure, 1);
+
+	smtp_client = smtp_client_init(client_set);
+
+	ctx->conn = smtp_client_connection_create(
+		smtp_client, SMTP_PROTOCOL_SMTP,
+		net_ip2addr(&bind_ip), bind_ports[0],
+		SMTP_CLIENT_SSL_MODE_NONE, NULL);
+	ctx->trans = smtp_client_transaction_create(
+		ctx->conn, &((struct smtp_address){
+			.localpart = "sender",
+			.domain = "example.com"}), NULL, 0,
+		test_client_close_in_failure_finished, ctx);
+	smtp_client_transaction_start(
+		ctx->trans, test_client_close_in_failure_mail_from_cb, ctx);
+	for (i = 0; i < TEST_CLOSE_IN_FAILURE_RCPT_COUNT; i++) {
+		smtp_client_transaction_add_rcpt(
+			ctx->trans, &((struct smtp_address){
+				.localpart = t_strdup_printf("rcpt%u", i),
+				.domain = "example.com"}), NULL,
+			test_client_close_in_failure_rcpt_to_cb,
+			test_client_close_in_failure_rcpt_data_cb, ctx);
+	}
+
+	input = i_stream_create_from_data(message, strlen(message));
+	i_stream_set_name(input, "message");
+	smtp_client_transaction_send(
+		ctx->trans, input, test_client_close_in_failure_data_cb, ctx);
+	i_stream_unref(&input);
+
+	return TRUE;
+}
+
+/* test */
+
+static void test_close_in_failure(void)
+{
+	struct smtp_client_settings smtp_client_set;
+
+	test_client_defaults(&smtp_client_set, NULL);
+
+	test_begin("connection close in failure callback");
+	test_run_client_server(&smtp_client_set,
+			       test_client_close_in_failure,
+			       test_server_close_in_failure, 1, NULL);
+	test_end();
+}
+
+/*
  * Invalid SSL certificate
  */
 /* dns */
@@ -3800,6 +4173,7 @@ static void (*const test_functions[])(void) = {
 	test_unexpected_reply,
 	test_premature_reply,
 	test_early_data_reply,
+	test_pipelined_mail_failure,
 	test_partial_reply,
 	test_bad_reply,
 	test_bad_greeting,
@@ -3811,6 +4185,7 @@ static void (*const test_functions[])(void) = {
 	test_dns_lookup_failure,
 	test_authentication,
 	test_transaction_timeout,
+	test_close_in_failure,
 	test_invalid_ssl_certificate,
 	NULL
 };
@@ -4110,10 +4485,11 @@ static void server_connection_accept(void *context ATTR_UNUSED)
 
 	/* accept new client */
 	fd = net_accept(fd_listen, NULL, NULL);
-	if (fd == -1)
+	if (fd == -1) {
+		if (!NET_ACCEPT_ENOCONN(errno))
+			i_fatal("test server: accept() failed: %m");
 		return;
-	if (fd == -2)
-		i_fatal("test server: accept() failed: %m");
+	}
 
 	server_connection_init(fd);
 }
@@ -4342,7 +4718,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	test_subprocesses_init(debug);
+	test_init();
+	event_set_forced_debug(test_event, debug);
+	test_subprocesses_init();
 
 	/* listen on localhost */
 	i_zero(&bind_ip);
@@ -4351,7 +4729,6 @@ int main(int argc, char *argv[])
 
 	ret = test_run(test_functions);
 
-	test_subprocesses_deinit();
 	main_deinit();
 	lib_deinit();
 

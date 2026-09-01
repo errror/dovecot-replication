@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -521,6 +521,7 @@ void smtp_server_cmd_data(struct smtp_server_cmd_ctx *cmd,
 	}
 
 	smtp_server_command_input_lock(cmd);
+	smtp_server_command_pipeline_block(cmd);
 
 	data_cmd = p_new(cmd->pool, struct cmd_data_context, 1);
 	data_cmd->chunk_first = TRUE;
@@ -578,7 +579,6 @@ int smtp_server_connection_data_chunk_add(struct smtp_server_cmd_ctx *cmd,
 	const struct smtp_server_settings *set = &conn->set;
 	struct smtp_server_command *command = cmd->cmd;
 	struct cmd_data_context *data_cmd = command->data;
-	uoff_t new_size;
 
 	i_assert(chunk != NULL);
 	i_assert(data_cmd != NULL);
@@ -590,13 +590,13 @@ int smtp_server_connection_data_chunk_add(struct smtp_server_cmd_ctx *cmd,
 		return -1;
 
 	/* check message size increase early */
-	new_size = conn->state.data_size + chunk_size;
-	if (new_size < conn->state.data_size ||
-	    (set->max_message_size > 0 && new_size > set->max_message_size)) {
+	if (UOFF_T_MAX - conn->state.data_size < chunk_size ||
+	    (set->max_message_size > 0 &&
+	     conn->state.data_size + chunk_size > set->max_message_size)) {
 		smtp_server_cmd_data_size_limit_exceeded(cmd);
 		return -1;
 	}
-	conn->state.data_size = new_size;
+	conn->state.data_size += chunk_size;
 
 	if (chunk_last) {
 		smtp_server_command_remove_hook(
@@ -605,6 +605,7 @@ int smtp_server_connection_data_chunk_add(struct smtp_server_cmd_ctx *cmd,
 		smtp_server_command_add_hook(
 			command, SMTP_SERVER_COMMAND_HOOK_REPLIED,
 			cmd_data_replied, data_cmd);
+		smtp_server_command_pipeline_block(cmd);
 	}
 
 	data_cmd->chunk_input = chunk;
@@ -643,7 +644,8 @@ void smtp_server_cmd_bdat(struct smtp_server_cmd_ctx *cmd,
 	   end-marker = "LAST"
 	 */
 	argv = t_strsplit(params, " ");
-	if (argv[0] == NULL || str_to_uoff(argv[0], &size) < 0) {
+	if (argv[0] == NULL || str_to_uoff(argv[0], &size) < 0 ||
+	    size > INTMAX_MAX) {
 		smtp_server_reply(cmd,
 			501, "5.5.4", "Invalid chunk size parameter");
 		size = 0;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -168,10 +168,10 @@ o_stream_encrypt_keydata_create_v1(struct encrypt_ostream *stream)
 	encrypted_key = t_buffer_create(256);
 	secret = t_buffer_create(256);
 
-	if (!dcrypt_ecdh_derive_secret_peer(stream->pub, ephemeral_key,
-					    secret, &error)) {
+	if (!dcrypt_derive_secret_peer(stream->pub, ephemeral_key,
+				       secret, &error)) {
 		io_stream_set_error(&stream->ostream.iostream,
-				    "Cannot perform ECDH: %s", error);
+				    "Cannot perform derivation: %s", error);
 		return -1;
 	}
 
@@ -285,22 +285,21 @@ o_stream_encrypt_key_for_pubkey_v2(struct encrypt_ostream *stream,
 					    error);
 			return -1;
 		}
-	} else if (ktype == DCRYPT_KEY_EC) {
-		/* R = our ephemeral public key */
+	} else if (ktype == DCRYPT_KEY_EC || ktype == DCRYPT_KEY_KEM) {
 		buffer_t *secret = t_buffer_create(256);
 
 		/* derive ephemeral key and shared secret */
-		if (!dcrypt_ecdh_derive_secret_peer(pubkey, ephemeral_key,
-						    secret, &error)) {
+		if (!dcrypt_derive_secret_peer(pubkey, ephemeral_key,
+					       secret, &error)) {
 			io_stream_set_error(&stream->ostream.iostream,
-					    "Cannot perform ECDH: %s", error);
+					    "Cannot perform derivation: %s", error);
 			return -1;
 		}
 
 		struct dcrypt_context_symmetric *dctx;
 		if (!dcrypt_ctx_sym_create(calg, DCRYPT_MODE_ENCRYPT,
 					   &dctx, &error)) {
-			buffer_clear_safe(temp_key);
+			buffer_clear_safe(secret);
 			io_stream_set_error(&stream->ostream.iostream,
 					    "Cannot perform key encryption: %s",
 					    error);

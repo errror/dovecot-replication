@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 
@@ -13,21 +13,19 @@
 #include "str.h"
 #include "strescape.h"
 #include "time-util.h"
+#include "unichar.h"
 #include "env-util.h"
 #include "settings.h"
 #include "ssl-settings.h"
 #include "userdb.h"
 #include "db-ldap.h"
+#include "db-ldap-sasl.h"
 #include "ldap-utils.h"
 
 #include <unistd.h>
 
 #ifdef LDAP_OPT_X_TLS
 #  define OPENLDAP_TLS_OPTIONS
-#endif
-
-#ifndef LDAP_SASL_QUIET
-#  define LDAP_SASL_QUIET 0 /* Doesn't exist in Solaris LDAP */
 #endif
 
 /* Older versions may require calling ldap_result() twice */
@@ -42,8 +40,6 @@
 
 #define DB_LDAP_REQUEST_MAX_ATTEMPT_COUNT 3
 #define DB_LDAP_ATTR_DN "~dn"
-
-static const char *LDAP_ESCAPE_CHARS = "*,\\#+<>;\"()= ";
 
 struct db_ldap_result {
 	int refcount;
@@ -73,13 +69,6 @@ struct db_ldap_result_iterate_context {
 	LDAP *ld;
 };
 
-struct db_ldap_sasl_bind_context {
-	const char *authcid;
-	const char *passwd;
-	const char *realm;
-	const char *authzid;
-};
-
 static struct ldap_connection *ldap_connections = NULL;
 
 static int db_ldap_bind(struct ldap_connection *conn);
@@ -93,6 +82,8 @@ static bool db_ldap_abort_requests(struct ldap_connection *conn,
 				   unsigned int timeout_secs,
 				   bool error, const char *reason);
 static void db_ldap_request_free(struct ldap_request *request);
+
+extern int db_ldap_bind_sasl_interactive(struct ldap_connection *conn);
 
 static int ldap_get_errno(struct ldap_connection *conn)
 {
@@ -693,42 +684,6 @@ static void ldap_input(struct ldap_connection *conn)
 	}
 }
 
-#ifdef HAVE_LDAP_SASL
-static int
-sasl_interact(LDAP *ld ATTR_UNUSED, unsigned int flags ATTR_UNUSED,
-	      void *defaults, void *interact)
-{
-	struct db_ldap_sasl_bind_context *context = defaults;
-	sasl_interact_t *in;
-	const char *str;
-
-	for (in = interact; in->id != SASL_CB_LIST_END; in++) {
-		switch (in->id) {
-		case SASL_CB_GETREALM:
-			str = context->realm;
-			break;
-		case SASL_CB_AUTHNAME:
-			str = context->authcid;
-			break;
-		case SASL_CB_USER:
-			str = context->authzid;
-			break;
-		case SASL_CB_PASS:
-			str = context->passwd;
-			break;
-		default:
-			str = NULL;
-			break;
-		}
-		if (str != NULL) {
-			in->len = strlen(str);
-			in->result = str;
-		}
-	}
-	return LDAP_SUCCESS;
-}
-#endif
-
 static void ldap_connection_timeout(struct ldap_connection *conn)
 {
 	i_assert(conn->conn_state == LDAP_CONN_STATE_BINDING);
@@ -737,26 +692,11 @@ static void ldap_connection_timeout(struct ldap_connection *conn)
 	db_ldap_conn_close(conn);
 }
 
-#ifdef HAVE_LDAP_SASL
 static int db_ldap_bind_sasl(struct ldap_connection *conn)
 {
-	struct db_ldap_sasl_bind_context context;
 	int ret;
 
-	i_zero(&context);
-	context.authcid = conn->set->auth_dn;
-	context.passwd = conn->set->auth_dn_password;
-	context.realm = conn->set->auth_sasl_realm;
-	context.authzid = conn->set->auth_sasl_authz_id;
-
-	const char *mechs = t_array_const_string_join(
-		&conn->set->auth_sasl_mechanisms, " ");
-
-	/* There doesn't seem to be a way to do SASL binding
-	   asynchronously.. */
-	ret = ldap_sasl_interactive_bind_s(conn->ld, NULL, mechs,
-					   NULL, NULL, LDAP_SASL_QUIET,
-					   sasl_interact, &context);
+	ret = db_ldap_bind_sasl_interactive(conn);
 	if (db_ldap_connect_finish(conn, ret) < 0)
 		return -1;
 
@@ -764,14 +704,6 @@ static int db_ldap_bind_sasl(struct ldap_connection *conn)
 
 	return 0;
 }
-#else
-static int db_ldap_bind_sasl(struct ldap_connection *conn ATTR_UNUSED)
-{
-	i_unreached(); /* already checked at init */
-
-	return -1;
-}
-#endif
 
 static int db_ldap_bind_simple(struct ldap_connection *conn)
 {
@@ -848,7 +780,9 @@ db_ldap_add_connection_callback(LDAP *ld ATTR_UNUSED, Sockbuf *sb ATTR_UNUSED,
 {
 	struct ldap_connection *conn = ctx->lc_arg;
 	const char *prefix = t_strdup_printf("ldap(%s://%s:%d): ",
-		srv->lud_scheme, srv->lud_host, srv->lud_port);
+		srv->lud_scheme != NULL ? srv->lud_scheme : "",
+		srv->lud_host != NULL ? srv->lud_host : "",
+		srv->lud_port);
 
 	if (strcmp(conn->log_prefix, prefix) != 0) {
 		i_free(conn->log_prefix);
@@ -1092,8 +1026,9 @@ void db_ldap_get_attribute_names(pool_t pool,
 		const char *const *vars = var_expand_program_variables(prog);
 		for (; *vars != NULL; vars++) {
 			const char *ldap_attr;
-			if (str_begins(*vars, "ldap:", &ldap_attr) ||
-			    str_begins(*vars, "ldap_multi:", &ldap_attr)) {
+			if ((str_begins(*vars, "ldap:", &ldap_attr) ||
+			     str_begins(*vars, "ldap_multi:", &ldap_attr)) &&
+			    ldap_attr[0] != '\0') {
 				/* when we free program, this name
 				   would be invalid, so dup it here. */
 				ldap_attr = p_strdup(pool, ldap_attr);
@@ -1128,26 +1063,84 @@ void db_ldap_get_attribute_names(pool_t pool,
 		*sensitive_r = array_front(&sensitive_attr_names);
 }
 
-#define IS_LDAP_ESCAPED_CHAR(c) \
-	((((unsigned char)(c)) & 0x80) != 0 || strchr(LDAP_ESCAPE_CHARS, (c)) != NULL)
-
-const char *ldap_escape(const char *str,
-			void *context ATTR_UNUSED)
+int ldap_escape(const char *input, const char **output_r,
+		void *context ATTR_UNUSED, const char **error_r ATTR_UNUSED)
 {
-	string_t *ret = NULL;
+	/* This function escapes both LDAP filters and LDAP DNs. This works,
+	   because both allow using the method of escaping any characters.
+	   However, this isn't really recommended, since apparently some LDAP
+	   servers and perhaps other tools don't handle unnecessary escaping
+	   correctly.
 
-	for (const char *p = str; *p != '\0'; p++) {
-		if (IS_LDAP_ESCAPED_CHAR(*p)) {
-			if (ret == NULL) {
-				ret = t_str_new((size_t) (p - str) + 64);
-				str_append_data(ret, str, (size_t) (p - str));
-			}
-			str_printfa(ret, "\\%02X", (unsigned char)*p);
-		} else if (ret != NULL)
-			str_append_c(ret, *p);
+	   Another issue is what to do with invalid UTF-8. LDAP filter RFC
+	   suggests just escaping invalid UTF-8. LDAP DN RFC doesn't at least
+	   explicitly say that. It instead seems to imply that the string is
+	   just expected to be valid UTF-8. Or perhaps to use #hex-string
+	   encoding, which isn't compatible with LDAP filters. Just to be safe,
+	   we'll replace invalid UTF-8 input with the UTF-8 replacement
+	   character.
+
+	   So this function isn't perhaps the most standards compliant one, but
+	   we don't really care, since this escaping is mainly intended to
+	   prevent untrusted username input from breaking out of the filter or
+	   DN. Valid usernames are unlikely to require escaping or to be
+	   invalid UTF-8. */
+
+	/* Convert invalid UTF-8 characters to replacement characters. */
+	size_t input_len = strlen(input);
+	string_t *str = t_str_new(64);
+	if (!uni_utf8_get_valid_data((const unsigned char *)input,
+				     input_len, str)) {
+		/* Input was not valid UTF-8 */
+		input = t_strdup(str_c(str));
+		input_len = str_len(str);
+		str_truncate(str, 0);
 	}
 
-	return ret == NULL ? str : str_c(ret);
+	const char *escape_chars =
+		/* control characters */
+		"\x01\x02\x03\x04\x05\x06\x07\x08"
+		"\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10"
+		"\x11\x12\x13\x14\x15\x16\x17\x18"
+		"\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+		/* filter + DN */
+		"\\"
+		/* filter only */
+		"*()"
+		/* DN only (not including leading and trailing chars) */
+		",+<>;\"=";
+	size_t pos;
+
+	/* check the leading character separately (required by DN) */
+	if (input[0] == '#' || input[0] == ' ')
+		pos = 0;
+	else {
+		pos = strcspn(input, escape_chars);
+		if (pos == input_len) {
+			/* the last trailing space is escaped
+			   (required by DN) */
+			if (pos > 0 && input[pos - 1] == ' ')
+				pos--;
+			else {
+				*output_r = input;
+				return 0;
+			}
+		}
+	}
+
+	do {
+		str_append_data(str, input, pos);
+		str_printfa(str, "\\%02x", (unsigned char)input[pos]);
+		input += pos + 1;
+		input_len -= pos + 1;
+		pos = strcspn(input, escape_chars);
+		/* the last trailing space is escaped (required by DN) */
+		if (pos == input_len && pos > 0 && input[pos - 1] == ' ')
+			pos--;
+	} while (pos < input_len);
+	str_append_data(str, input, pos);
+	*output_r = str_c(str);
+	return 0;
 }
 
 static bool
@@ -1528,7 +1521,6 @@ void db_ldap_unref(struct ldap_connection **_conn)
 		}
 	}
 
-	db_ldap_abort_requests(conn, UINT_MAX, 0, FALSE, "Shutting down");
 	i_assert(conn->pending_count == 0);
 	db_ldap_conn_close(conn);
 	i_assert(conn->to == NULL);
@@ -1543,6 +1535,11 @@ void db_ldap_unref(struct ldap_connection **_conn)
 	i_free(conn->log_prefix);
 
 	pool_unref(&conn->pool);
+}
+
+void db_ldap_abort_all_requests(struct ldap_connection *conn)
+{
+	db_ldap_abort_requests(conn, UINT_MAX, 0, FALSE, "Shutting down");
 }
 
 #ifndef BUILTIN_LDAP

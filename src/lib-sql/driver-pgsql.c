@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -532,6 +532,20 @@ static void consume_results(struct pgsql_db *db)
 		driver_pgsql_set_idle(db);
 }
 
+static void
+driver_pgsql_result_free_binary_values(struct pgsql_result *result)
+{
+	struct pgsql_binary_value *value;
+
+	if (!array_is_created(&result->binary_values))
+		return;
+
+	array_foreach_modifiable(&result->binary_values, value) {
+		PQfreemem(value->value);
+		i_zero(value);
+	}
+}
+
 static void driver_pgsql_result_free(struct sql_result *_result)
 {
 	struct pgsql_db *db = (struct pgsql_db *)_result->db;
@@ -560,13 +574,8 @@ static void driver_pgsql_result_free(struct sql_result *_result)
 		driver_pgsql_set_idle(db);
 	}
 
-	if (array_is_created(&result->binary_values)) {
-		struct pgsql_binary_value *value;
-
-		array_foreach_modifiable(&result->binary_values, value)
-			PQfreemem(value->value);
-		array_free(&result->binary_values);
-	}
+	driver_pgsql_result_free_binary_values(result);
+	array_free(&result->binary_values);
 
 	event_unref(&result->api.event);
 	i_free(result->query);
@@ -718,8 +727,9 @@ static void do_query(struct pgsql_result *result, const char *query)
 	}
 }
 
-static const char *
-driver_pgsql_escape_string(struct sql_db *_db, const char *string)
+static int
+driver_pgsql_escape_string(struct sql_db *_db, const char *string,
+			   const char **output_r, const char **error_r)
 {
 	struct pgsql_db *db = (struct pgsql_db *)_db;
 	size_t len = strlen(string);
@@ -735,14 +745,24 @@ driver_pgsql_escape_string(struct sql_db *_db, const char *string)
 
 		to = t_buffer_get(len * 2 + 1);
 		len = PQescapeStringConn(db->pg, to, string, len, &error);
-	} else
-#endif
-	{
-		to = t_buffer_get(len * 2 + 1);
-		len = PQescapeString(to, string, len);
+		if (error != 0) {
+			*error_r = last_error(db);
+			return -1;
+		}
+		t_buffer_alloc(len + 1);
+		*output_r = to;
+		return 0;
+	} else {
+		*error_r = SQL_ERRSTR_NOT_CONNECTED;
+		return -1;
 	}
+#else
+	to = t_buffer_get(len * 2 + 1);
+	len = PQescapeString(to, string, len);
 	t_buffer_alloc(len + 1);
-	return to;
+	*output_r = to;
+	return 0;
+#endif
 }
 
 static void exec_callback(struct sql_result *_result,
@@ -874,6 +894,12 @@ static int driver_pgsql_result_next_row(struct sql_result *_result)
 {
 	struct pgsql_result *result = (struct pgsql_result *)_result;
 	struct pgsql_db *db = (struct pgsql_db *)_result->db;
+
+	/* The cached binary values belong to the row we're leaving. The
+	   sql_result API returns field values only until the next row is
+	   fetched, so drop them - otherwise every following row would be
+	   given the first row's values. */
+	driver_pgsql_result_free_binary_values(result);
 
 	if (result->rows != 0) {
 		/* second time we're here */
@@ -1485,6 +1511,9 @@ void driver_pgsql_init(void)
 void driver_pgsql_deinit(void)
 {
 	struct pgsql_db_cache *cache;
+
+	if (!array_is_created(&pgsql_db_cache))
+		return;
 
 	array_foreach_modifiable(&pgsql_db_cache, cache) {
 		settings_free(cache->set);

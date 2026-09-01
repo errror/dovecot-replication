@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -168,7 +168,8 @@ i_stream_create_sized_common(struct istream *input, uoff_t size)
 	sstream->istream.istream.blocking = input->blocking;
 	sstream->istream.istream.seekable = input->seekable;
 	(void)i_stream_create(&sstream->istream, input,
-			      i_stream_get_fd(input), 0);
+			      i_stream_get_fd(input),
+			      ISTREAM_HIDDEN_INPUTS_NONE, 0);
 	return sstream;
 }
 

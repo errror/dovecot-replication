@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2024 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,6 +8,7 @@
 #ifdef HAVE_LDAP
 
 /* <settings checks> */
+#include "ldap-sasl.h"
 #include "ldap-settings-parse.h"
 
 static bool ldap_setting_check(void *_set, pool_t pool, const char **error_r);
@@ -51,9 +52,15 @@ static const struct ldap_settings ldap_default_settings = {
 };
 
 static const struct setting_keyvalue ldap_default_settings_keyvalue[] = {
-	{ "passdb_ldap/passdb_default_password_scheme", "crypt" },
 	{ "passdb_ldap/passdb_fields_import_all", "no" },
 	{ "userdb_ldap/userdb_fields_import_all", "no" },
+
+	/* This now now the same as the default passdb_default_password_scheme,
+	   but it needs to be here explicitly as long as settings-history-core.txt
+	   supports dovecot_config_version with
+	   passdb_default_password_scheme=PLAIN default */
+	{ "passdb_ldap/passdb_default_password_scheme", "CRYPT" },
+
 	{ NULL, NULL }
 };
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "istream.h"
@@ -13,6 +13,12 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+
+/* Timeout for waiting for the pump to finish. Reaching this timeout means the
+   test failed, so it just needs to be long enough that a heavily loaded or
+   stalled machine doesn't reach it before the pump has had the chance to
+   finish. */
+#define PUMP_TIMEOUT_MSECS (30*1000)
 
 struct nonblock_ctx {
 	struct istream *in;
@@ -95,8 +101,8 @@ run_pump(struct istream *in, struct ostream *out, int *counter,
 	iostream_pump_set_completion_callback(pump, completed, counter);
 	iostream_pump_start(pump);
 
-	alarm(5);
-	struct timeout *to = timeout_add(3000, failed, counter);
+	alarm(PUMP_TIMEOUT_MSECS/1000 + 5);
+	struct timeout *to = timeout_add(PUMP_TIMEOUT_MSECS, failed, counter);
 
 	io_loop_run(current_ioloop);
 
@@ -212,7 +218,7 @@ test_iostream_pump_failure_end_read(bool in_block, bool out_block)
 	struct ostream *out;
 	buffer_t *buffer;
 
-	test_begin(t_strdup_printf("iostream_pump failure mid-read "
+	test_begin(t_strdup_printf("iostream_pump failure end-read "
 				   "(in=%sblocking, out=%sblocking)",
 				   (in_block ? "" : "non-"),
 				   (out_block ? "" : "non-")));

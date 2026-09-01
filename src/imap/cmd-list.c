@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "array.h"
@@ -39,16 +39,28 @@ mailbox_flags2str(struct cmd_list_context *ctx, string_t *str,
 {
 	size_t orig_len = str_len(str);
 
+	if (ctx->lsub) {
+		/* LSUB won't allow \NoSelect flag, since it has a
+		   special meaning. */
+		flags &= ENUM_NEGATE(MAILBOX_NOSELECT);
+	}
+
 	if ((flags & MAILBOX_NONEXISTENT) != 0 && !ctx->used_listext) {
-		flags |= MAILBOX_NOSELECT;
 		flags &= ENUM_NEGATE(MAILBOX_NONEXISTENT);
+		if (!ctx->lsub) {
+			/* Convert to \Noselect flag in LIST reply. It can't
+			   be converted to \Noselect in LSUB reply though,
+			   because that means a child mailbox is subscribed. */
+			flags |= MAILBOX_NOSELECT;
+		}
 	}
 
 	if ((ctx->list_flags & MAILBOX_LIST_ITER_RETURN_CHILDREN) == 0)
 		flags &= ENUM_NEGATE(MAILBOX_CHILDREN | MAILBOX_NOCHILDREN);
 
 	if ((flags & MAILBOX_CHILD_SUBSCRIBED) != 0 &&
-	    (flags & MAILBOX_SUBSCRIBED) == 0 && !ctx->used_listext) {
+	    (flags & MAILBOX_SUBSCRIBED) == 0 && !ctx->used_listext &&
+	    ctx->lsub) {
 		/* LSUB uses \Noselect for this */
 		flags |= MAILBOX_NOSELECT;
 	} else if ((ctx->list_flags & MAILBOX_LIST_ITER_RETURN_SUBSCRIBED) == 0)
@@ -261,6 +273,7 @@ list_send_options(struct cmd_list_context *ctx,
 static bool cmd_list_continue(struct client_command_context *cmd)
 {
         struct cmd_list_context *ctx = cmd->context;
+	enum imap_quote_flags qflags = (cmd->utf8 ? IMAP_QUOTE_FLAG_UTF8 : 0);
 	const struct mailbox_info *info;
 	enum mailbox_info_flags flags;
 	string_t *str, *mutf7_name;
@@ -286,9 +299,12 @@ static bool cmd_list_continue(struct client_command_context *cmd)
 			continue;
 		}
 
-		str_truncate(mutf7_name, 0);
-		if (imap_utf8_to_utf7(name, mutf7_name) < 0)
-			i_panic("LIST: Mailbox name not UTF-8: %s", name);
+		if (!cmd->utf8) {
+			str_truncate(mutf7_name, 0);
+			if (imap_utf8_to_utf7(name, mutf7_name) < 0)
+				i_panic("LIST: Mailbox name not UTF-8: %s", name);
+			name = str_c(mutf7_name);
+		}
 
 		str_truncate(str, 0);
 		str_printfa(str, "* %s (", ctx->lsub ? "LSUB" : "LIST");
@@ -297,7 +313,7 @@ static bool cmd_list_continue(struct client_command_context *cmd)
 		list_reply_append_ns_sep_param(str,
 			mail_namespace_get_sep(info->ns));
 		str_append_c(str, ' ');
-		imap_append_astring(str, str_c(mutf7_name));
+		imap_append_astring(str, name, qflags);
 		mailbox_childinfo2str(ctx, str, flags);
 
 		/* send LIST/LSUB response */
@@ -308,8 +324,8 @@ static bool cmd_list_continue(struct client_command_context *cmd)
 		/* send optional responses (if any) */
 		if (list_has_options(ctx)) {
 			struct imap_list_return_flag_params params = {
-				.name = name,
-				.mutf7_name = str_c(mutf7_name),
+				.name = info->vname,
+				.mutf7_name = name,
 				.mbox_flags = flags,
 				.list_flags = ctx->list_flags,
 			};
@@ -373,8 +389,9 @@ static void cmd_list_init(struct cmd_list_context *ctx,
 						  ctx->list_flags);
 }
 
-static void cmd_list_ref_root(struct client *client, const char *ref)
+static void cmd_list_ref_root(struct client *client, const char *ref, bool utf8)
 {
+	enum imap_quote_flags qflags = (utf8 ? IMAP_QUOTE_FLAG_UTF8 : 0);
 	struct mail_namespace *ns;
 	const char *ns_prefix;
 	char ns_sep;
@@ -385,7 +402,10 @@ static void cmd_list_ref_root(struct client *client, const char *ref)
 	   Otherwise we'll emulate UW-IMAP behavior. */
 	ns = mail_namespace_find_visible(client->user->namespaces, ref);
 	if (ns != NULL) {
-		ns_prefix = ns_prefix_mutf7(ns);
+		if (utf8)
+			ns_prefix = ns->prefix;
+		else
+			ns_prefix = ns_prefix_mutf7(ns);
 		ns_sep = mail_namespace_get_sep(ns);
 	} else {
 		ns_prefix = "";
@@ -399,7 +419,7 @@ static void cmd_list_ref_root(struct client *client, const char *ref)
 	str_printfa(str, "%c\" ", ns_sep);
 	if (*ns_prefix != '\0') {
 		/* non-hidden namespace, use it as the root name */
-		imap_append_astring(str, ns_prefix);
+		imap_append_astring(str, ns_prefix, qflags);
 	} else {
 		/* Hidden namespace or empty namespace prefix. We could just
 		   return an empty root name, but it's safer to emulate what
@@ -409,8 +429,10 @@ static void cmd_list_ref_root(struct client *client, const char *ref)
 
 		if (p == NULL)
 			str_append(str, "\"\"");
-		else
-			imap_append_astring(str, t_strdup_until(ref, p + 1));
+		else {
+			imap_append_astring(str, t_strdup_until(ref, p + 1),
+					    qflags);
+		}
 	}
 	client_send_line(client, str_c(str));
 }
@@ -424,6 +446,7 @@ bool cmd_list_full(struct client_command_context *cmd, bool lsub)
 	ARRAY(const char *) patterns = ARRAY_INIT;
 	const char *ref, *pattern, *const *patterns_strarr;
 	string_t *str;
+	bool invalid_ref = FALSE;
 
 	/* [(<selection options>)] <reference> <pattern>|(<pattern list>)
 	   [RETURN (<return options>)] */
@@ -450,8 +473,14 @@ bool cmd_list_full(struct client_command_context *cmd, bool lsub)
 		return TRUE;
 	}
 	str = t_str_new(64);
-	if (imap_utf7_to_utf8(ref, str) == 0)
+	if (cmd->utf8) {
+		if (!uni_utf8_str_is_valid(ref))
+			invalid_ref = TRUE;
+	} else if (imap_utf7_to_utf8(ref, str) == 0) {
 		ref = p_strdup(cmd->pool, str_c(str));
+	} else {
+		invalid_ref = TRUE;
+	}
 	str_truncate(str, 0);
 
 	if (imap_arg_get_list_full(&args[1], &list_args, &arg_count)) {
@@ -464,9 +493,13 @@ bool cmd_list_full(struct client_command_context *cmd, bool lsub)
 					"Invalid pattern list.");
 				return TRUE;
 			}
-			if (imap_utf7_to_utf8(pattern, str) == 0)
+			if (cmd->utf8) {
+				if (uni_utf8_str_is_valid(pattern))
+					array_push_back(&patterns, &pattern);
+			} else if (imap_utf7_to_utf8(pattern, str) == 0) {
 				pattern = p_strdup(cmd->pool, str_c(str));
-			array_push_back(&patterns, &pattern);
+				array_push_back(&patterns, &pattern);
+			}
 			str_truncate(str, 0);
 		}
 		args += 2;
@@ -475,11 +508,14 @@ bool cmd_list_full(struct client_command_context *cmd, bool lsub)
 			client_send_command_error(cmd, "Invalid pattern.");
 			return TRUE;
 		}
-		if (imap_utf7_to_utf8(pattern, str) == 0)
-			pattern = p_strdup(cmd->pool, str_c(str));
-
 		p_array_init(&patterns, cmd->pool, 1);
-		array_push_back(&patterns, &pattern);
+		if (cmd->utf8) {
+			if (uni_utf8_str_is_valid(pattern))
+				array_push_back(&patterns, &pattern);
+		} else if (imap_utf7_to_utf8(pattern, str) == 0) {
+			pattern = p_strdup(cmd->pool, str_c(str));
+			array_push_back(&patterns, &pattern);
+		}
 		args += 2;
 
 		if (lsub) {
@@ -515,6 +551,15 @@ bool cmd_list_full(struct client_command_context *cmd, bool lsub)
 		/* non-extended LIST: use default flags */
 		ctx->list_flags |= MAILBOX_LIST_ITER_RETURN_CHILDREN |
 			MAILBOX_LIST_ITER_RETURN_SPECIALUSE;
+	} else if (HAS_ALL_BITS(client_enabled_mailbox_features(client),
+				MAILBOX_FEATURE_IMAP4REV2)) {
+		/* IMAP4rev2 includes the special-use attributes in the
+		   regular mailbox attributes (RFC 9051 section 7.3.1), but
+		   it doesn't have the SPECIAL-USE return option to request
+		   them with an extended LIST. Return them always, so an
+		   IMAP4rev2-only client can get them e.g. together with
+		   RETURN (STATUS ...). */
+		ctx->list_flags |= MAILBOX_LIST_ITER_RETURN_SPECIALUSE;
 	}
 
 	if (!IMAP_ARG_IS_EOL(args)) {
@@ -524,9 +569,13 @@ bool cmd_list_full(struct client_command_context *cmd, bool lsub)
 
 	array_append_zero(&patterns); /* NULL-terminate */
 	patterns_strarr = array_front(&patterns);
-	if (!ctx->used_listext && !lsub && *patterns_strarr[0] == '\0') {
+	if (invalid_ref || patterns_strarr[0] == NULL) {
+		/* invalid ref/pattern */
+		client_send_tagline(cmd, "OK List completed.");
+	} else if (!ctx->used_listext && !lsub &&
+		   *patterns_strarr[0] == '\0') {
 		/* Only LIST ref "" gets us here */
-		cmd_list_ref_root(client, ref);
+		cmd_list_ref_root(client, ref, cmd->utf8);
 		client_send_tagline(cmd, "OK List completed.");
 	} else {
 		patterns_strarr =

@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -72,7 +72,8 @@ vfile_object_modify_right(struct acl_object *aclobj, unsigned int idx,
 				    update->rights.neg_rights,
 				    update->neg_modify_mode);
 
-	if (right->rights == NULL && right->neg_rights == NULL) {
+	if ((right->rights == NULL || right->rights[0] == NULL) &&
+	    (right->neg_rights == NULL || right->neg_rights[0] == NULL)) {
 		/* this identifier no longer exists */
 		array_delete(&aclobj->rights, idx, 1);
 		c1 = TRUE;
@@ -119,6 +120,7 @@ vfile_write_right(string_t *dest, const struct acl_rights *right,
 	if (neg) str_append_c(dest,'-');
 	acl_rights_write_id(dest, right);
 
+	i_assert(acl_id_is_valid(str_c(dest)));
 	if (strchr(str_c(dest), ' ') != NULL) T_BEGIN {
 		/* need to escape it */
 		const char *escaped = t_strdup(str_escape(str_c(dest)));
@@ -241,8 +243,8 @@ int acl_backend_vfile_object_update(struct acl_object *_aclobj,
 		return -1;
 	}
 	if (orig_mtime < update->last_change && update->last_change != 0) {
-		/* set mtime to last_change, if it's higher than the file's
-		   original mtime. if original mtime is higher, then we're
+		/* set mtime to last_change, if it's greater than the file's
+		   original mtime. if original mtime is greater, then we're
 		   merging some changes and it's better for the mtime to get
 		   updated. */
 		ut.actime = ioloop_time;

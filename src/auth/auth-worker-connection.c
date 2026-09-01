@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "ioloop.h"
@@ -341,7 +341,8 @@ static int auth_worker_request_handle(struct auth_worker_connection *worker,
 	if (!_request->callback(worker, args, _request->context)) {
 		worker->timeout_pending_resume = FALSE;
 		timeout_remove(&worker->to_lookup);
-		return -1;
+		connection_input_halt(&worker->conn);
+		return 0;
 	}
 	return 1;
 }

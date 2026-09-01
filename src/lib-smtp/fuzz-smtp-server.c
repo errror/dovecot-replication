@@ -1,10 +1,11 @@
-/* Copyright (c) 2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "fuzzer.h"
 #include "istream.h"
 #include "ioloop.h"
 #include "smtp-server.h"
+#include "settings-consts.h"
 
 static struct {
 	struct istream *data_input;
@@ -26,12 +27,11 @@ server_cmd_data_continue(void *conn_ctx ATTR_UNUSED,
 			 struct smtp_server_transaction *trans ATTR_UNUSED)
 {
 	struct istream *data_input = state.data_input;
-	const unsigned char *data;
 	size_t size;
 	ssize_t ret;
 
 	while ((ret = i_stream_read(data_input)) > 0 || ret == -2) {
-		data = i_stream_get_data(data_input, &size);
+		size = i_stream_get_data_size(data_input);
 		i_stream_skip(data_input, size);
 		if (!smtp_server_cmd_data_check_size(cmd))
 			return -1;
@@ -77,6 +77,7 @@ FUZZ_BEGIN_FD
 		.max_client_idle_time_msecs = 500,
 		.max_pipelined_commands = 16,
 		.auth_optional = TRUE,
+		.max_recipients = SET_UINT_UNLIMITED,
 	};
 	struct smtp_server_callbacks server_callbacks = {
 		.conn_cmd_rcpt = server_cmd_rcpt,
@@ -90,7 +91,7 @@ FUZZ_BEGIN_FD
 	to = timeout_add_short(10, test_server_continue, &fuzz_ctx);
 	smtp_server = smtp_server_init(&smtp_server_set);
 
-	conn = smtp_server_connection_create(smtp_server, fuzz_ctx.fd, fuzz_ctx.fd, NULL, 0,
+	conn = smtp_server_connection_create(smtp_server, fuzz_ctx.fd, fuzz_ctx.fd, NULL, 0, NULL, 0,
 					     FALSE, NULL, &server_callbacks, &fuzz_ctx);
 	smtp_server_connection_start(conn);
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -15,7 +15,9 @@
 #include "mail-namespace.h"
 #include "mail-storage-private.h"
 #include "mail-storage-settings.h"
+#include "master-interface.h"
 #include "iostream-ssl.h"
+#include "doc.h"
 
 static bool mail_storage_settings_apply(struct event *event, void *_set, const char *key, const char **value, enum setting_apply_flags, const char **error_r);
 static bool mail_storage_settings_ext_check(struct event *event, void *_set, pool_t pool, const char **error_r);
@@ -35,7 +37,7 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	{ .type = SET_FILTER_NAME, .key = "layout_fs" },
 	{ .type = SET_FILTER_NAME, .key = "mail_ext_attachment",
 	  .required_setting = "fs", },
-	DEF(STR, mail_ext_attachment_path),
+	DEF(PATH_DIR, mail_ext_attachment_path),
 	DEF(STR_NOVARS_HIDDEN, mail_ext_attachment_hash),
 	DEF(SIZE, mail_ext_attachment_min_size),
 	DEF(BOOLLIST, mail_attachment_detection_options),
@@ -84,6 +86,7 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	DEF(BOOL_HIDDEN, mailbox_list_drop_noselect),
 	DEF(BOOL_HIDDEN, mailbox_list_validate_fs_names),
 	DEF(BOOL_HIDDEN, mailbox_list_utf8),
+	DEF(BOOL_HIDDEN, mailbox_list_normalize_names_to_nfc),
 	DEF(STR, mailbox_list_visible_escape_char),
 	DEF(STR, mailbox_list_storage_escape_char),
 	DEF(STR_HIDDEN, mailbox_list_lost_mailbox_prefix),
@@ -92,14 +95,14 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	DEF(STR_HIDDEN, mailbox_root_directory_name),
 	DEF(STR_HIDDEN, mailbox_subscriptions_filename),
 	DEF(STR, mail_driver),
-	DEF(STR, mail_path),
-	DEF(STR, mail_inbox_path),
-	DEF(STR, mail_index_path),
-	DEF(STR, mail_index_private_path),
-	DEF(STR_HIDDEN, mail_cache_path),
-	DEF(STR, mail_control_path),
-	DEF(STR, mail_volatile_path),
-	DEF(STR, mail_alt_path),
+	DEF(PATH_DIR, mail_path),
+	DEF(PATH_DIR, mail_inbox_path),
+	DEF(PATH_DIR, mail_index_path),
+	DEF(PATH_DIR, mail_index_private_path),
+	DEF(PATH_DIR_HIDDEN, mail_cache_path),
+	DEF(PATH_DIR, mail_control_path),
+	DEF(PATH_DIR, mail_volatile_path),
+	DEF(PATH_DIR, mail_alt_path),
 	DEF(BOOL_HIDDEN, mail_alt_check),
 	DEF(BOOL_HIDDEN, mail_full_filesystem_access),
 	DEF(BOOL, maildir_stat_dirs),
@@ -141,8 +144,8 @@ const struct mail_storage_settings mail_storage_default_settings = {
 	.mail_max_keyword_length = 50,
 	.mail_max_lock_timeout = 0,
 	.mail_temp_scan_interval = 7*24*60*60,
-	.mail_vsize_bg_after_count = 0,
-	.mail_sort_max_read_count = 0,
+	.mail_vsize_bg_after_count = SET_UINT_UNLIMITED,
+	.mail_sort_max_read_count = SET_UINT_UNLIMITED,
 	.mail_save_crlf = FALSE,
 	.mail_fsync = "optimized:never:always",
 	.mmap_disable = FALSE,
@@ -158,11 +161,12 @@ const struct mail_storage_settings mail_storage_default_settings = {
 	.mailbox_list_drop_noselect = TRUE,
 	.mailbox_list_validate_fs_names = TRUE,
 	.mailbox_list_utf8 = FALSE,
+	.mailbox_list_normalize_names_to_nfc = TRUE,
 	.mailbox_list_visible_escape_char = "",
 	.mailbox_list_storage_escape_char = "",
 	.mailbox_list_lost_mailbox_prefix = "recovered-lost-folder-",
 	.mailbox_directory_name = "",
-	.mailbox_directory_name_legacy = TRUE,
+	.mailbox_directory_name_legacy = FALSE,
 	.mailbox_root_directory_name = "",
 	.mailbox_subscriptions_filename = "subscriptions",
 	.mail_driver = "",
@@ -202,6 +206,15 @@ static const struct setting_keyvalue mail_storage_default_settings_keyvalue[] = 
 	{ "mail_always_cache_fields", MAIL_CACHE_FIELDS_DEFAULT },
 #endif
 	{ "mail_never_cache_fields", "imap.envelope" },
+	{ "mail_attachment_detection_options", "add-flags content-type=!application/signature" },
+	/* This breaks mbox format in various ways */
+	{ "mbox/mail_attachment_detection_options", "" },
+	/* It may be confusing to enable with imapc, and it's unlikely to be
+	   useful. Even when using imapc with shared folders, the missing
+	   attachment flags would normally be added by the remote server. */
+	{ "imapc/mail_attachment_detection_options", "" },
+	/* The unprefixed default breaks store to new/ directory */
+	{ "maildir/mail_attachment_detection_options", "" },
 	{ NULL, NULL }
 };
 
@@ -269,7 +282,7 @@ const struct setting_parser_info mailbox_list_layout_setting_parser_info = {
 	SETTING_DEFINE_STRUCT_##type("mailbox_"#name, name, struct mailbox_settings)
 
 static const struct setting_define mailbox_setting_defines[] = {
-	DEF(STR, name),
+	DEF(STR_NFC, name),
 	{ .type = SET_ENUM, .key = "mailbox_auto",
 	  .offset = offsetof(struct mailbox_settings, autocreate) } ,
 	DEF(BOOLLIST, special_use),
@@ -311,7 +324,7 @@ static const struct setting_define mail_namespace_setting_defines[] = {
 	DEF(STR, name),
 	DEF(ENUM, type),
 	DEF(STR, separator),
-	DEF(STR, prefix),
+	DEF(STR_NFC, prefix),
 	DEF(STR, alias_for),
 
 	DEF(BOOL, inbox),
@@ -420,9 +433,9 @@ static const struct mail_user_settings mail_user_default_settings = {
 	.valid_chroot_dirs = ARRAY_INIT,
 
 	.first_valid_uid = 500,
-	.last_valid_uid = 0,
+	.last_valid_uid = SET_UINT_UNLIMITED,
 	.first_valid_gid = 1,
-	.last_valid_gid = 0,
+	.last_valid_gid = SET_UINT_UNLIMITED,
 
 	.mail_plugins = ARRAY_INIT,
 	.mail_plugin_dir = MODULEDIR,
@@ -434,29 +447,23 @@ static const struct mail_user_settings mail_user_default_settings = {
 	.postmaster_address = "postmaster@%{user|domain|default(hostname)}",
 };
 
+static const struct setting_keyvalue mail_user_default_settings_keyvalue[] = {
+	{ "mail_access_groups", "$SET:default_internal_group" },
+
+	{ NULL, NULL }
+};
 const struct setting_parser_info mail_user_setting_parser_info = {
 	.name = "mail_user",
 
 	.defines = mail_user_setting_defines,
 	.defaults = &mail_user_default_settings,
+	.default_settings = mail_user_default_settings_keyvalue,
 
 	.struct_size = sizeof(struct mail_user_settings),
 	.pool_offset1 = 1 + offsetof(struct mail_user_settings, pool),
 	.setting_apply = mail_user_settings_apply,
 	.check_func = mail_user_settings_check,
 };
-
-static struct mail_user *mail_storage_event_get_user(struct event *event)
-{
-	struct mail_user *user;
-
-	for (; event != NULL; event = event_get_parent(event)) {
-		user = event_get_ptr(event, SETTINGS_EVENT_MAIL_USER);
-		if (user != NULL)
-			return user;
-	}
-	i_panic("mail_user not found from event");
-}
 
 static void
 fix_base_path(struct mail_user_settings *set, pool_t pool, const char **str)
@@ -534,53 +541,11 @@ static bool
 mail_storage_settings_apply(struct event *event ATTR_UNUSED, void *_set,
 			    const char *key, const char **value,
 			    enum setting_apply_flags flags,
-			    const char **error_r)
+			    const char **error_r ATTR_UNUSED)
 {
 	struct mail_storage_settings *set = _set;
 	enum mailbox_list_path_type type;
 	const char *unexpanded_value = *value;
-
-	unsigned int key_len = strlen(key);
-	if (key_len > 5 && strcmp(key + key_len - 5, "_path") == 0) {
-		unsigned int value_len = strlen(*value);
-		bool truncate = FALSE;
-
-		/* drop trailing '/' and convert ~/ to %{home}/ */
-		if (value_len > 0 && (*value)[value_len-1] == '/')
-			truncate = TRUE;
-		if ((str_begins_with(*value, "~/") ||
-		     strcmp(*value, "~") == 0) &&
-		    (flags & SETTING_APPLY_FLAG_NO_EXPAND) == 0) {
-#ifndef CONFIG_BINARY
-			struct mail_user *user =
-				mail_storage_event_get_user(event);
-			const char *home;
-			if (mail_user_get_home(user, &home) > 0)
-				;
-			else if (user->nonexistent) {
-				/* Nonexistent shared user. Don't fail the user
-				   creation due to this. */
-				home = "";
-			} else {
-				*error_r = t_strdup_printf(
-					"%s setting used home directory (~/) but there is no "
-					"mail_home and userdb didn't return it", key);
-				return FALSE;
-			}
-			if (!truncate)
-				*value = p_strconcat(set->pool, home, *value + 1, NULL);
-			else T_BEGIN {
-				*value = p_strconcat(set->pool, home,
-					t_strndup(*value + 1, value_len - 2), NULL);
-			} T_END;
-#else
-			*error_r = "~/ expansion not supported in config binary";
-			return FALSE;
-#endif
-		} else if (truncate) {
-			*value = p_strndup(set->pool, *value, value_len - 1);
-		}
-	}
 
 	if (mailbox_list_get_path_setting(key, &unexpanded_value,
 					  set->pool, &type)) {
@@ -592,8 +557,8 @@ mail_storage_settings_apply(struct event *event ATTR_UNUSED, void *_set,
 }
 
 static bool
-mail_storage_settings_ext_check(struct event *event ATTR_UNUSED,
-				void *_set, pool_t pool, const char **error_r)
+mail_storage_settings_ext_check(struct event *event, void *_set, pool_t pool,
+				const char **error_r)
 {
 	struct mail_storage_settings *set = _set;
 	struct hash_format *format;
@@ -604,6 +569,28 @@ mail_storage_settings_ext_check(struct event *event ATTR_UNUSED,
 		*error_r = "mailbox_idle_check_interval must not be 0";
 		return FALSE;
 	}
+	if (set->mail_sort_max_read_count == 0) {
+		*error_r = "mail_sort_max_read_count must not be 0";
+		return FALSE;
+	}
+	if (set->mail_vsize_bg_after_count == 0) {
+		*error_r = "mail_vsize_bg_after_count must not be 0";
+		return FALSE;
+	}
+
+	if (set->mail_cache_max_header_name_length == 0) {
+		*error_r = "mail_cache_max_header_name_length must not be 0";
+		return FALSE;
+	}
+	if (set->mail_cache_max_header_name_length == SET_UINT_UNLIMITED)
+		set->mail_cache_max_header_name_length = 0;
+
+	if (set->mail_cache_max_headers_count == 0) {
+		*error_r = "mail_cache_max_headers_count must not be 0";
+		return FALSE;
+	}
+	if (set->mail_cache_max_headers_count == SET_UINT_UNLIMITED)
+		set->mail_cache_max_headers_count = 0;
 
 	if (strcmp(set->mail_fsync, "optimized") == 0)
 		set->parsed_fsync_mode = FSYNC_MODE_OPTIMIZED;
@@ -771,13 +758,11 @@ mail_storage_settings_ext_check(struct event *event ATTR_UNUSED,
 			set->mailbox_root_directory_name, "/", NULL);
 	}
 
-	if (set->mailbox_list_visible_escape_char != set_value_unknown &&
-	    strlen(set->mailbox_list_visible_escape_char) > 1) {
+	if (strlen(set->mailbox_list_visible_escape_char) > 1) {
 		*error_r = "mailbox_list_visible_escape_char value must be a single character";
 		return FALSE;
 	}
-	if (set->mailbox_list_storage_escape_char != set_value_unknown &&
-	    strlen(set->mailbox_list_storage_escape_char) > 1) {
+	if (strlen(set->mailbox_list_storage_escape_char) > 1) {
 		*error_r = "mailbox_list_storage_escape_char value must be a single character";
 		return FALSE;
 	}
@@ -790,6 +775,14 @@ mail_storage_settings_ext_check(struct event *event ATTR_UNUSED,
 			set->mail_inbox_path = p_strdup_printf(pool, "%s/%s",
 				set->mail_path, set->mail_inbox_path);
 		}
+	}
+
+	if (getenv(MASTER_IS_PARENT_ENV) != NULL &&
+	    set->mailbox_directory_name_legacy) {
+		e_warning(event,
+			  "mailbox_directory_name_legacy=yes has been deprecated and will eventually be removed. See "
+			  DOC_LINK("core/config/mailbox_formats/dbox.html#migrating-away-from-mailbox-directory-name-legacy")
+			  " for an upgrade guide.");
 	}
 	return TRUE;
 }
@@ -846,11 +839,6 @@ static bool namespace_settings_ext_check(struct event *event,
 			ns->name);
 		return FALSE;
 	}
-	if (!uni_utf8_str_is_valid(ns->prefix)) {
-		*error_r = t_strdup_printf("Namespace %s: prefix not valid UTF8: %s",
-					   ns->name, ns->prefix);
-		return FALSE;
-	}
 
 	return namespace_parse_mailboxes(event, pool, ns, error_r) == 0;
 }
@@ -897,15 +885,10 @@ mailbox_special_use_check(struct mailbox_settings *set)
 }
 
 static bool mailbox_settings_check(void *_set, pool_t pool ATTR_UNUSED,
-				   const char **error_r)
+				   const char **error_r ATTR_UNUSED)
 {
 	struct mailbox_settings *set = _set;
 
-	if (!uni_utf8_str_is_valid(set->name)) {
-		*error_r = t_strdup_printf("mailbox %s: name isn't valid UTF-8",
-					   set->name);
-		return FALSE;
-	}
 	mailbox_special_use_check(set);
 	return TRUE;
 }
@@ -972,6 +955,14 @@ static bool mail_user_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 	(void)parse_postmaster_address(set->postmaster_address, pool,
 				       set, &error);
 #else
+	if (set->last_valid_uid == 0) {
+		*error_r = "last_valid_uid must not be 0";
+		return FALSE;
+	}
+	if (set->last_valid_gid == 0) {
+		*error_r = "last_valid_gid must not be 0";
+		return FALSE;
+	}
 	if (array_is_created(&set->mail_plugins) &&
 	    array_not_empty(&set->mail_plugins) &&
 	    faccessat(AT_FDCWD, set->mail_plugin_dir, R_OK | X_OK, AT_EACCESS) < 0) {
@@ -1058,7 +1049,9 @@ mail_storage_2nd_setting_reset_def(struct settings_instance *instance,
 		value = *v ? "yes" : "no";
 		break;
 	}
-	case SET_STR: {
+	case SET_STR:
+	case SET_PATH_FILE:
+	case SET_PATH_DIR: {
 		const char *const *v =
 			CONST_PTR_OFFSET(&mail_storage_default_settings,
 					 def->offset);

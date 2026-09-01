@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -13,12 +13,6 @@ static bool iter_use_index(struct mailbox_list *list,
 {
 	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT_REQUIRE(list);
 
-	if ((flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0) {
-		/* for now we don't use indexes when listing subscriptions,
-		   because it needs to list also the nonexistent subscribed
-		   mailboxes, which don't exist in the index. */
-		return FALSE;
-	}
 	if ((flags & MAILBOX_LIST_ITER_RAW_LIST) != 0 &&
 	    ilist->has_backing_store) {
 		/* no indexing wanted with raw lists */
@@ -54,7 +48,6 @@ mailbox_list_index_iter_init(struct mailbox_list *list,
 	ctx->ctx.flags = flags;
 	ctx->ctx.glob = imap_match_init_multiple(pool, patterns, TRUE, ns_sep);
 	array_create(&ctx->ctx.module_contexts, pool, sizeof(void *), 5);
-	ctx->info_pool = pool_alloconly_create("mailbox list index iter info", 128);
 	ctx->ctx.index_iteration = TRUE;
 
 	/* listing mailboxes from index */
@@ -67,25 +60,12 @@ mailbox_list_index_iter_init(struct mailbox_list *list,
 }
 
 static void
-mailbox_list_get_escaped_mailbox_name(struct mailbox_list *list,
-				      const char *raw_name,
-				      string_t *escaped_name)
-{
-	const char escape_chars[] = {
-		list->mail_set->mailbox_list_storage_escape_char[0],
-		mailbox_list_get_hierarchy_sep(list),
-		'\0'
-	};
-	mailbox_list_name_escape(raw_name, escape_chars, escaped_name);
-}
-
-static void
 mailbox_list_index_update_info(struct mailbox_list_index_iterate_context *ctx)
 {
+	struct mailbox_list_index *ilist =
+		INDEX_LIST_CONTEXT_REQUIRE(ctx->ctx.list);
 	struct mailbox_list_index_node *node = ctx->next_node;
 	struct mailbox *box;
-
-	p_clear(ctx->info_pool);
 
 	str_truncate(ctx->path, ctx->parent_len);
 	/* the root directory may have an empty name. in that case we'll still
@@ -95,7 +75,7 @@ mailbox_list_index_update_info(struct mailbox_list_index_iterate_context *ctx)
 		str_append_c(ctx->path,
 			     mailbox_list_get_hierarchy_sep(ctx->ctx.list));
 	}
-	mailbox_list_get_escaped_mailbox_name(ctx->ctx.list, node->raw_name,
+	mailbox_list_get_escaped_mailbox_name(ctx->ctx.list, node,
 					      ctx->path);
 
 	ctx->info.vname = mailbox_list_get_vname(ctx->ctx.list, str_c(ctx->path));
@@ -103,7 +83,7 @@ mailbox_list_index_update_info(struct mailbox_list_index_iterate_context *ctx)
 		MAILBOX_CHILDREN : MAILBOX_NOCHILDREN;
 	if (strcmp(ctx->info.vname, "INBOX") != 0) {
 		/* non-INBOX */
-		ctx->info.vname = p_strdup(ctx->info_pool, ctx->info.vname);
+		ctx->info.vname = p_strdup(ctx->ctx.info_pool, ctx->info.vname);
 	} else if (!ctx->prefix_inbox_list) {
 		/* listing INBOX itself */
 		ctx->info.vname = "INBOX";
@@ -114,9 +94,13 @@ mailbox_list_index_update_info(struct mailbox_list_index_iterate_context *ctx)
 		}
 	} else {
 		/* listing INBOX/INBOX */
-		ctx->info.vname = p_strconcat(ctx->info_pool,
+		ctx->info.vname = p_strconcat(ctx->ctx.info_pool,
 			ctx->ctx.list->ns->prefix, "INBOX", NULL);
-		ctx->info.flags |= MAILBOX_NONEXISTENT;
+		if (node->raw_name != ilist->raw_inbox_inbox_name_ptr) {
+			/* We can't access it without escape character
+			   configured. */
+			ctx->info.flags |= MAILBOX_NONEXISTENT;
+		}
 	}
 	if ((node->flags & MAILBOX_LIST_INDEX_FLAG_NONEXISTENT) != 0)
 		ctx->info.flags |= MAILBOX_NONEXISTENT;
@@ -124,13 +108,6 @@ mailbox_list_index_update_info(struct mailbox_list_index_iterate_context *ctx)
 		ctx->info.flags |= MAILBOX_NOSELECT;
 	if ((node->flags & MAILBOX_LIST_INDEX_FLAG_NOINFERIORS) != 0)
 		ctx->info.flags |= MAILBOX_NOINFERIORS;
-
-	if ((ctx->ctx.flags & (MAILBOX_LIST_ITER_SELECT_SUBSCRIBED |
-			       MAILBOX_LIST_ITER_RETURN_SUBSCRIBED)) != 0) {
-		mailbox_list_set_subscription_flags(ctx->ctx.list,
-						    ctx->info.vname,
-						    &ctx->info.flags);
-	}
 
 	if ((ctx->ctx.flags & MAILBOX_LIST_ITER_RETURN_NO_FLAGS) == 0) {
 		box = mailbox_alloc(ctx->ctx.list, ctx->info.vname, 0);
@@ -160,43 +137,26 @@ mailbox_list_index_update_next(struct mailbox_list_index_iterate_context *ctx,
 	} else {
 		while (node->next == NULL) {
 			node = node->parent;
-			if (node != NULL) T_BEGIN {
-				/* The storage name kept in the iteration context
-				   is escaped. To calculate the right truncation
-				   margin, the length of the name must be
-				   calculated from the escaped storage name and
-				   not from node->raw_name. */
-				string_t *escaped_name = t_str_new(64);
-				mailbox_list_get_escaped_mailbox_name(ctx->ctx.list,
-								      node->raw_name,
-								      escaped_name);
-				ctx->parent_len -= str_len(escaped_name);
-				if (node->parent != NULL)
-					ctx->parent_len--;
-			} T_END;
 			if (node == NULL) {
 				/* last one */
 				ctx->next_node = NULL;
 				return;
 			}
+
+			/* update parent_len by dropping the last name
+			   from the hierarchy. */
+			str_truncate(ctx->path, ctx->parent_len);
+			const char *p = strrchr(str_c(ctx->path),
+				mailbox_list_get_hierarchy_sep(ctx->ctx.list));
+			if (p != NULL)
+				ctx->parent_len = p - str_c(ctx->path);
+			else {
+				i_assert(node->parent == NULL);
+				ctx->parent_len = 0;
+			}
 		}
 		ctx->next_node = node->next;
 	}
-}
-
-static bool
-iter_subscriptions_ok(struct mailbox_list_index_iterate_context *ctx)
-{
-	if ((ctx->ctx.flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) == 0)
-		return TRUE;
-
-	if ((ctx->info.flags & MAILBOX_SUBSCRIBED) != 0)
-		return TRUE;
-
-	if ((ctx->ctx.flags & MAILBOX_LIST_ITER_SELECT_RECURSIVEMATCH) != 0 &&
-	    (ctx->info.flags & MAILBOX_CHILD_SUBSCRIBED) != 0)
-		return TRUE;
-	return FALSE;
 }
 
 const struct mailbox_info *
@@ -222,7 +182,7 @@ mailbox_list_index_iter_next(struct mailbox_list_iterate_context *_ctx)
 
 		follow_children = (match & (IMAP_MATCH_YES |
 					    IMAP_MATCH_CHILDREN)) != 0;
-		if (match == IMAP_MATCH_YES && iter_subscriptions_ok(ctx)) {
+		if (match == IMAP_MATCH_YES) {
 			/* If this is a) \NoSelect leaf,
 			   b) not mailbox_list_layout=index
 			   and c) NO-NOSELECT is set, try to rmdir the leaf
@@ -240,11 +200,6 @@ mailbox_list_index_iter_next(struct mailbox_list_iterate_context *_ctx)
 				mailbox_list_index_update_next(ctx, TRUE);
 				return &ctx->info;
 			}
-		} else if ((_ctx->flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0 &&
-			   (ctx->info.flags & MAILBOX_CHILD_SUBSCRIBED) == 0) {
-			/* listing only subscriptions, but there are no
-			   subscribed children. */
-			follow_children = FALSE;
 		}
 		mailbox_list_index_update_next(ctx, follow_children);
 	}
@@ -262,7 +217,6 @@ int mailbox_list_index_iter_deinit(struct mailbox_list_iterate_context *_ctx)
 	int ret = ctx->failed ? -1 : 0;
 
 	pool_unref(&ctx->mailbox_pool);
-	pool_unref(&ctx->info_pool);
 	pool_unref(&_ctx->pool);
 	return ret;
 }

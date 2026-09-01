@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lmtp-common.h"
 #include "base64.h"
@@ -183,6 +183,7 @@ struct client *client_create(int fd_in, int fd_out,
 		SMTP_CAPABILITY_8BITMIME |
 		SMTP_CAPABILITY_CHUNKING |
 		SMTP_CAPABILITY_XCLIENT |
+		SMTP_CAPABILITY_SIZE |
 		SMTP_CAPABILITY__ORCPT;
 
 #ifdef EXPERIMENTAL_MAIL_UTF8
@@ -193,12 +194,14 @@ struct client *client_create(int fd_in, int fd_out,
 		lmtp_set.capabilities |= SMTP_CAPABILITY_STARTTLS;
 	lmtp_set.hostname = client->lda_set->hostname;
 	lmtp_set.login_greeting = client->lmtp_set->login_greeting;
-	lmtp_set.max_message_size = UOFF_T_MAX;
+	lmtp_set.max_message_size = mail_user_get_mail_max_size(client->raw_mail_user);
 	lmtp_set.rcpt_param_extensions = rcpt_param_extensions;
 	lmtp_set.rcpt_domain_optional = TRUE;
 	lmtp_set.max_client_idle_time_msecs = CLIENT_IDLE_TIMEOUT_MSECS;
+	lmtp_set.max_pipelined_commands = 5;
 	lmtp_set.rawlog_dir = client->lmtp_set->lmtp_rawlog_dir;
 	lmtp_set.event_parent = client->event;
+	lmtp_set.max_recipients = SET_UINT_UNLIMITED;
 
 	workarounds = client->lmtp_set->parsed_workarounds;
 	if ((workarounds & LMTP_WORKAROUND_WHITESPACE_BEFORE_PATH) != 0) {
@@ -211,7 +214,7 @@ struct client *client_create(int fd_in, int fd_out,
 	}
 
 	client->conn = smtp_server_connection_create(
-		lmtp_server, fd_in, fd_out,
+		lmtp_server, fd_in, fd_out, &conn->local_ip, conn->local_port,
 		&conn->remote_ip, conn->remote_port, conn->ssl,
 		&lmtp_set, &lmtp_callbacks, client);
 	if (smtp_server_connection_is_trusted(client->conn)) {
@@ -381,6 +384,10 @@ client_connection_proxy_data_updated(void *context,
 {
 	struct client *client = context;
 
+	if (data->dest_ip.family != 0)
+		client->local_ip = data->dest_ip;
+	if (data->dest_port != 0)
+		client->local_port = data->dest_port;
 	client->remote_ip = data->source_ip;
 	client->remote_port = data->source_port;
 	client->local_name = data->local_name;

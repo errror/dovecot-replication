@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -149,7 +149,7 @@ imap_msgpart_get_header_fields(pool_t pool, const char *header_list,
 	int result = 0;
 
 	input = i_stream_create_from_data(header_list, strlen(header_list));
-	parser = imap_parser_create(input, NULL, SIZE_MAX);
+	parser = imap_parser_create(input, NULL, SIZE_MAX, NULL);
 
 	if (imap_parser_finish_line(parser, 0, 0, &args) > 0 &&
 	    imap_arg_get_list_full(args, &hdr_list, &list_count) &&
@@ -228,7 +228,7 @@ int imap_msgpart_parse(const char *section, struct imap_msgpart **msgpart_r)
 	} else if (section[i] == '\0') {
 		/* [1.2.3] */
 		if (i > 0 && section[i-1] == '.') {
-			pool_unref(&pool);
+			imap_msgpart_free(&msgpart);
 			return -1;
 		}
 		msgpart->section_number = p_strdup(pool, section);
@@ -236,7 +236,7 @@ int imap_msgpart_parse(const char *section, struct imap_msgpart **msgpart_r)
 	} else {
 		/* [1.2.3.MIME], [1.2.3.HEADER], etc */
 		if (section[i-1] != '.') {
-			pool_unref(&pool);
+			imap_msgpart_free(&msgpart);
 			return -1;
 		}
 		msgpart->section_number = p_strndup(pool, section, i-1);
@@ -258,8 +258,10 @@ int imap_msgpart_parse(const char *section, struct imap_msgpart **msgpart_r)
 	section = t_str_ucase(section);
 
 	if (strcmp(section, "MIME") == 0) {
-		if (msgpart->section_number[0] == '\0')
+		if (msgpart->section_number[0] == '\0') {
+			imap_msgpart_free(&msgpart);
 			return -1;
+		}
 		msgpart->fetch_type = FETCH_MIME;
 		msgpart->wanted_fields |= MAIL_FETCH_STREAM_BODY;
 	} else if (strcmp(section, "TEXT") == 0) {
@@ -814,6 +816,7 @@ imap_msgpart_vsizes_to_binary(struct mail *mail, const struct message_part *part
 
 int imap_msgpart_bodypartstructure(struct mail *mail,
 				   struct imap_msgpart *msgpart,
+				   enum imap_quote_flags qflags,
 				   const char **bpstruct_r)
 {
 	struct message_part *all_parts, *part;
@@ -847,7 +850,8 @@ int imap_msgpart_bodypartstructure(struct mail *mail,
 
 	if (ret >= 0) {
 		bpstruct = t_str_new(256);
-		if (imap_bodystructure_write(part, bpstruct, TRUE, &error) < 0) {
+		if (imap_bodystructure_write(part, bpstruct, TRUE, qflags,
+					     &error) < 0) {
 			error = t_strdup_printf(
 				"Invalid message_part/BODYSTRUCTURE: %s", error);
 			mail_set_cache_corrupted(mail, MAIL_FETCH_MESSAGE_PARTS,

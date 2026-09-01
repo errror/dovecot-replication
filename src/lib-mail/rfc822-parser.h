@@ -3,6 +3,11 @@
 
 #include "unichar.h"
 
+/* Maximum number of parameters to parse. After this the rest of the parameters
+   are skipped. This is to avoid excessive CPU usage that can be caused by
+   merging of these parameters. */
+#define RFC2231_MAX_PARAMS 128
+
 /* This can be used as a common NUL replacement character */
 #define RFC822_NUL_REPLACEMENT_STR UNICODE_REPLACEMENT_CHAR_UTF8
 
@@ -67,9 +72,5 @@ int rfc822_parse_content_type(struct rfc822_parser_context *ctx, string_t *str);
    set, 0 = no more data, -1 = invalid input. */
 int rfc822_parse_content_param(struct rfc822_parser_context *ctx,
 			       const char **key_r, string_t *value);
-
-/* Decode a punycode-encoded domain name and return the UTF8
-   form in result. Returns 0 on success and -1 on failure. */
-void rfc822_decode_punycode(const char *input, size_t len, string_t *result);
 
 #endif

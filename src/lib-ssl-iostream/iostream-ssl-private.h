@@ -36,10 +36,10 @@ struct iostream_ssl_vfuncs {
 			       struct ssl_iostream_context *ctx);
 
 	void (*set_log_prefix)(struct ssl_iostream *ssl_io, const char *prefix);
-	bool (*is_handshaked)(const struct ssl_iostream *ssl_io);
+	enum ssl_iostream_state (*get_state)(const struct ssl_iostream *ssl_io);
 	bool (*has_handshake_failed)(const struct ssl_iostream *ssl_io);
-	bool (*has_valid_client_cert)(const struct ssl_iostream *ssl_io);
-	bool (*has_client_cert)(struct ssl_iostream *ssl_io);
+	enum ssl_iostream_cert_validity
+		(*get_cert_validity)(const struct ssl_iostream *ssl_io);
 	bool (*cert_match_name)(struct ssl_iostream *ssl_io, const char *name,
 				const char **reason_r);
 	bool (*get_allow_invalid_cert)(struct ssl_iostream *ssl_io);
@@ -67,6 +67,8 @@ struct iostream_ssl_vfuncs {
 					 const char **cert_fp_r,
 					 const char **pubkey_fp_r,
 					 const char **error_r);
+
+	void (*get_default_ca_paths)(const char **file_r, const char **dir_r);
 };
 
 void iostream_ssl_module_init(const struct iostream_ssl_vfuncs *vfuncs);
