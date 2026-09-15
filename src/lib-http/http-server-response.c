@@ -1,7 +1,8 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
+#include "str-sanitize.h"
 #include "array.h"
 #include "istream.h"
 #include "ostream-private.h"
@@ -61,6 +62,9 @@ http_server_response_create(struct http_server_request *req,
 	resp->date = (time_t)-1;
 	resp->event = event_create(req->event);
 	http_server_response_update_event(resp);
+
+	if (status != 0)
+		e_debug(resp->event, "Created: %s", str_sanitize(reason, 256));
 
 	if (array_is_created(&resp->perm_headers)) {
 		unsigned int i, count;
@@ -366,7 +370,7 @@ int http_server_response_finish_payload_out(struct http_server_response *resp)
 		o_stream_unref(&resp->payload_output);
 		resp->payload_output = NULL;
 	}
-	if (conn->conn.output != NULL &&
+	if (!conn->conn.output->closed &&
 	    o_stream_get_buffer_used_size(conn->conn.output) > 0) {
 		e_debug(resp->event,
 			"Not quite finished sending response");
@@ -378,7 +382,7 @@ int http_server_response_finish_payload_out(struct http_server_response *resp)
 
 	http_server_connection_ref(conn);
 	conn->output_locked = FALSE;
-	if (conn->conn.output != NULL && !conn->conn.output->closed) {
+	if (!conn->conn.output->closed) {
 		if (resp->payload_corked &&
 			o_stream_uncork_flush(conn->conn.output) < 0)
 			http_server_connection_handle_output_error(conn);
@@ -741,7 +745,6 @@ static int http_server_response_send_real(struct http_server_response *resp)
 	iov[2].iov_base = "\r\n";
 	iov[2].iov_len = 2;
 
-	req->state = HTTP_SERVER_REQUEST_STATE_PAYLOAD_OUT;
 	o_stream_cork(conn->conn.output);
 
 	if (o_stream_sendv(conn->conn.output, iov, N_ELEMENTS(iov)) < 0) {
@@ -750,11 +753,13 @@ static int http_server_response_send_real(struct http_server_response *resp)
 	}
 
 	e_debug(resp->event, "Sent header");
+	req->state = HTTP_SERVER_REQUEST_STATE_SENT_RESPONSE;
 
 	if (resp->payload_stream != NULL)
 		http_server_ostream_output_available(resp->payload_stream);
 	if (resp->payload_output != NULL) {
 		/* Non-blocking payload */
+		req->state = HTTP_SERVER_REQUEST_STATE_PAYLOAD_OUT;
 		ret = http_server_response_send_more(resp);
 		if (ret < 0)
 			return -1;
@@ -762,6 +767,7 @@ static int http_server_response_send_real(struct http_server_response *resp)
 		/* No payload to send */
 		e_debug(resp->event, "No payload to send");
 		if (resp->payload_stream != NULL) {
+			req->state = HTTP_SERVER_REQUEST_STATE_PAYLOAD_OUT;
 			ret = http_server_ostream_continue(resp->payload_stream);
 			if (ret < 0)
 				return -1;
@@ -772,7 +778,7 @@ static int http_server_response_send_real(struct http_server_response *resp)
 			return -1;
 	}
 
-	if (conn->conn.output != NULL && !resp->payload_corked &&
+	if (!conn->conn.output->closed && !resp->payload_corked &&
 	    o_stream_uncork_flush(conn->conn.output) < 0) {
 		http_server_connection_handle_output_error(conn);
 		return -1;

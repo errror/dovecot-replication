@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "fs-api.h"
@@ -333,6 +333,19 @@ static int sdbox_mailbox_alloc_index(struct sdbox_mailbox *mbox)
 	return 0;
 }
 
+static bool sdbox_mailbox_has_uidvalidity(struct mailbox *box)
+{
+	struct mail_index_view *view;
+	bool ret;
+
+	/* Use a fresh view, because box->view may not have been updated by
+	   the syncing done while opening the mailbox. */
+	view = mail_index_view_open(box->index);
+	ret = mail_index_get_header(view)->uid_validity != 0;
+	mail_index_view_close(&view);
+	return ret;
+}
+
 static int sdbox_mailbox_open(struct mailbox *box)
 {
 	struct sdbox_mailbox *mbox = SDBOX_MAILBOX(box);
@@ -373,6 +386,18 @@ static int sdbox_mailbox_open(struct mailbox *box)
 	if (guid_128_is_empty(hdr.mailbox_guid)) {
 		/* regenerate it */
 		if (sdbox_mailbox_create_indexes(box, NULL, NULL) < 0 ||
+		    sdbox_read_header(mbox, &hdr, TRUE, &need_resize) < 0)
+			return -1;
+	} else if (!sdbox_mailbox_has_uidvalidity(box)) {
+		/* The mailbox indexes aren't fully created yet. The dbox
+		   header is written to dovecot.index.log already when the log
+		   file is created, because it's the extension's
+		   initialization data, while UIDVALIDITY is written only
+		   afterwards. Another process can see the mailbox in between,
+		   with a valid mailbox GUID but without UIDVALIDITY. Finish
+		   the creation now, so no mails get saved to a mailbox whose
+		   UIDVALIDITY isn't set yet. */
+		if (dbox_mailbox_create_indexes(box, NULL) < 0 ||
 		    sdbox_read_header(mbox, &hdr, TRUE, &need_resize) < 0)
 			return -1;
 	}
@@ -454,14 +479,12 @@ struct mail_storage sdbox_storage = {
 	.event_category = &event_category_sdbox,
 
 	.v = {
-		sdbox_storage_alloc,
-		sdbox_storage_create,
-		dbox_storage_destroy,
-		NULL,
-		sdbox_storage_autodetect,
-		sdbox_mailbox_alloc,
-		NULL,
-		mail_storage_list_index_rebuild,
+		.alloc = sdbox_storage_alloc,
+		.create = sdbox_storage_create,
+		.destroy = dbox_storage_destroy,
+		.autodetect = sdbox_storage_autodetect,
+		.mailbox_alloc = sdbox_mailbox_alloc,
+		.list_index_rebuild = mail_storage_list_index_rebuild,
 	}
 };
 
@@ -472,14 +495,12 @@ struct mail_storage dbox_storage = {
 	.set_info = &sdbox_setting_parser_info,
 
 	.v = {
-		sdbox_storage_alloc,
-		sdbox_storage_create,
-		dbox_storage_destroy,
-		NULL,
-		sdbox_storage_autodetect,
-		sdbox_mailbox_alloc,
-		NULL,
-		mail_storage_list_index_rebuild,
+		.alloc = sdbox_storage_alloc,
+		.create = sdbox_storage_create,
+		.destroy = dbox_storage_destroy,
+		.autodetect = sdbox_storage_autodetect,
+		.mailbox_alloc = sdbox_mailbox_alloc,
+		.list_index_rebuild = mail_storage_list_index_rebuild,
 	}
 };
 

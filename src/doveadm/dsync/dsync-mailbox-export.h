@@ -8,16 +8,25 @@ enum dsync_mailbox_exporter_flags {
 	DSYNC_MAILBOX_EXPORTER_FLAG_TIMESTAMPS		= 0x08,
 	DSYNC_MAILBOX_EXPORTER_FLAG_NO_HDR_HASHES	= 0x20,
 	DSYNC_MAILBOX_EXPORTER_FLAG_VSIZES		= 0x40,
+	/* Export all mailbox attributes, not only the changed ones. */
+	DSYNC_MAILBOX_EXPORTER_FLAG_ALL_ATTRS		= 0x80,
+};
+
+struct dsync_mailbox_export_settings {
+	uint32_t last_common_uid;
+	enum dsync_mailbox_exporter_flags flags;
+	unsigned int hdr_hash_version;
+	const char *const *hashed_headers;
+	time_t sync_since_timestamp;
+	time_t sync_until_timestamp;
+	uoff_t sync_max_size;
+	struct event *parent_event;
 };
 
 struct dsync_mailbox_exporter *
 dsync_mailbox_export_init(struct mailbox *box,
 			  struct dsync_transaction_log_scan *log_scan,
-			  uint32_t last_common_uid,
-			  enum dsync_mailbox_exporter_flags flags,
-			  unsigned int hdr_hash_version,
-			  const char *const *hashed_headers,
-			  struct event *parent_event);
+			  const struct dsync_mailbox_export_settings *set);
 /* Returns 1 if attribute was returned, 0 if no more attributes, -1 on error */
 int dsync_mailbox_export_next_attr(struct dsync_mailbox_exporter *exporter,
 				   const struct dsync_mailbox_attribute **attr_r);

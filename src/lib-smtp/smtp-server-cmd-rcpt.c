@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -9,6 +9,7 @@
 #include "smtp-syntax.h"
 
 #include "smtp-server-private.h"
+#include "settings-consts.h"
 
 /* RCPT command */
 
@@ -41,8 +42,10 @@ cmd_rcpt_check_state(struct smtp_server_cmd_ctx *cmd, bool next_to_reply)
 			503, "5.5.0", "MAIL needed first");
 		return FALSE;
 	}
-	if (conn->set.max_recipients > 0 && trans != NULL &&
-		smtp_server_transaction_rcpt_count(trans) >=
+	i_assert(conn->set.max_recipients != 0);
+	if (conn->set.max_recipients != SET_UINT_UNLIMITED &&
+	    trans != NULL &&
+	    smtp_server_transaction_rcpt_count(trans) >=
 			conn->set.max_recipients) {
 		smtp_server_reply(cmd,
 			451, "4.5.3", "Too many recipients");
@@ -50,6 +53,16 @@ cmd_rcpt_check_state(struct smtp_server_cmd_ctx *cmd, bool next_to_reply)
 	}
 
 	return TRUE;
+}
+
+static void
+cmd_rcpt_replied(struct smtp_server_cmd_ctx *cmd,
+		 struct smtp_server_cmd_rcpt *data)
+{
+	struct smtp_server_recipient *rcpt = data->rcpt;
+
+	smtp_server_recipient_replied(
+		rcpt, smtp_server_command_get_reply(cmd->cmd, 0));
 }
 
 static void
@@ -200,6 +213,8 @@ void smtp_server_cmd_rcpt(struct smtp_server_cmd_ctx *cmd,
 
 	smtp_server_command_add_hook(command, SMTP_SERVER_COMMAND_HOOK_NEXT,
 				     cmd_rcpt_recheck, rcpt_data);
+	smtp_server_command_add_hook(command, SMTP_SERVER_COMMAND_HOOK_REPLIED,
+				     cmd_rcpt_replied, rcpt_data);
 	smtp_server_command_add_hook(command, SMTP_SERVER_COMMAND_HOOK_COMPLETED,
 				     cmd_rcpt_completed, rcpt_data);
 	smtp_server_command_add_hook(command, SMTP_SERVER_COMMAND_HOOK_DESTROY,

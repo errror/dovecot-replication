@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -91,6 +91,12 @@ void doveadm_print(const char *value)
 	doveadm_print_sticky_headers();
 	ctx->v->print(value);
 	ctx->header_idx++;
+}
+
+void doveadm_print_empty(unsigned int count)
+{
+	for (unsigned int i = 0; i < count; i++)
+		doveadm_print("");
 }
 
 void doveadm_print_num(uintmax_t value)

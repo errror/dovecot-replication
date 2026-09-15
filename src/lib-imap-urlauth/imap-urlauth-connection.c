@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -671,12 +671,14 @@ imap_urlauth_fetch_reply_set_literal_stream(
 static int
 imap_urlauth_connection_read_literal(struct imap_urlauth_connection *conn)
 {
-	struct imap_urlauth_request *urlreq = conn->targets_head->requests_head;
 	struct imap_urlauth_fetch_reply reply;
 	imap_urlauth_request_callback_t *callback;
 	int ret;
 
 	i_assert(conn->reading_literal);
+	i_assert(conn->targets_head != NULL);
+
+	struct imap_urlauth_request *urlreq = conn->targets_head->requests_head;
 	i_assert(urlreq != NULL);
 
 	if (conn->literal_size > 0) {

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
@@ -116,6 +116,13 @@ exec_child(const char *bin_path, const char *const *args,
 		array_append_zero(envs);
 		env_put_array(array_front(envs));
 	}
+
+	/* Drop any privileges */
+
+	struct restrict_access_settings rset;
+
+	restrict_access_init(&rset);
+	restrict_access(&rset, 0, NULL);
 
 	/* Execute */
 

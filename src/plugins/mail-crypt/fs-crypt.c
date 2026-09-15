@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "randgen.h"
@@ -55,8 +55,8 @@ static struct fs *fs_crypt_alloc(void)
 }
 
 static int
-fs_crypt_init(struct fs *_fs, const struct fs_parameters *params,
-	      const char **error_r)
+fs_crypt_init_(struct fs *_fs, const struct fs_parameters *params,
+	       const char **error_r)
 {
 	struct crypt_fs *fs = CRYPT_FS(_fs);
 	const char *error;
@@ -239,15 +239,8 @@ static void fs_crypt_write_stream(struct fs_file *_file)
 		return;
 	}
 
-	enum io_stream_encrypt_flags flags;
-	if (strstr(file->fs->set->crypt_write_algorithm, "gcm") != NULL ||
-	    strstr(file->fs->set->crypt_write_algorithm, "ccm") != NULL ||
-	    str_begins_with(file->fs->set->crypt_write_algorithm,
-			    "chacha20-poly1305")) {
-		flags = IO_STREAM_ENC_INTEGRITY_AEAD;
-	} else {
-		flags = IO_STREAM_ENC_INTEGRITY_HMAC;
-	}
+	enum io_stream_encrypt_flags flags =
+		crypt_settings_to_flags(file->fs->set);
 
 	file->temp_output =
 		iostream_temp_create_named(_file->fs->temp_path_prefix,
@@ -308,7 +301,7 @@ const struct fs fs_class_crypt = {
 	.name = "crypt",
 	.v = {
 		.alloc = fs_crypt_alloc,
-		.init = fs_crypt_init,
+		.init = fs_crypt_init_,
 		.deinit = NULL,
 		.free = fs_crypt_free,
 		.get_properties = fs_wrapper_get_properties,
@@ -342,3 +335,16 @@ const struct fs fs_class_crypt = {
 		.get_nlinks = fs_wrapper_get_nlinks,
 	}
 };
+
+void fs_crypt_init(void);
+void fs_crypt_deinit(void);
+
+void fs_crypt_init(void)
+{
+	fs_class_register(&fs_class_crypt);
+}
+
+void fs_crypt_deinit(void)
+{
+	fs_class_unregister(&fs_class_crypt);
+}

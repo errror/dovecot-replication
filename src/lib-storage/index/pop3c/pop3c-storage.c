@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -90,8 +90,7 @@ pop3c_client_create_from_set(struct mail_storage *storage,
 	client_set.temp_path_prefix = str_c(str);
 
 	client_set.debug = event_want_debug(storage->event);
-	client_set.rawlog_dir =
-		mail_user_home_expand(storage->user, set->pop3c_rawlog_dir);
+	client_set.rawlog_dir = set->pop3c_rawlog_dir;
 
 	if (!set->pop3c_ssl_verify)
 		client_set.ssl_allow_invalid_cert = TRUE;
@@ -306,14 +305,10 @@ struct mail_storage pop3c_storage = {
 	.set_info = &pop3c_setting_parser_info,
 
 	.v = {
-		pop3c_storage_alloc,
-		pop3c_storage_create,
-		pop3c_storage_destroy,
-		NULL,
-		NULL,
-		pop3c_mailbox_alloc,
-		NULL,
-		NULL,
+		.alloc = pop3c_storage_alloc,
+		.create = pop3c_storage_create,
+		.destroy = pop3c_storage_destroy,
+		.mailbox_alloc = pop3c_mailbox_alloc,
 	}
 };
 

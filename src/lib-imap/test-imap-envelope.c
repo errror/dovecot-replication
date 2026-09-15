@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -132,9 +132,11 @@ msg_parse(pool_t pool, const char *message)
 
 	input = i_stream_create_from_data(message, strlen(message));
 	parser = message_parser_init(pool, input, &parser_set);
+	struct message_part_data_limits limits = MESSAGE_PART_DATA_LIMITS_INIT;
 	while ((ret = message_parser_parse_next_block(parser, &block)) > 0) {
 		i_assert(block.part->parent == NULL);
-		message_part_envelope_parse_from_header(pool, &envlp, block.hdr);
+		message_part_envelope_parse_from_header(pool, &envlp, &limits,
+							block.hdr);
 	}
 	test_assert(ret < 0);
 
@@ -156,7 +158,7 @@ static void test_imap_envelope_write(void)
 		test_begin(t_strdup_printf("imap envelope write [%u]", i));
 		envlp = msg_parse(pool, test->message);
 
-		imap_envelope_write(envlp, str);
+		imap_envelope_write(envlp, str, 0);
 		test_assert_idx(strcmp(str_c(str), test->envelope) == 0, i);
 
 		pool_unref(&pool);
@@ -183,7 +185,7 @@ static void test_imap_envelope_parse(void)
 
 		if (ret) {
 			str_truncate(str, 0);
-			imap_envelope_write(envlp, str);
+			imap_envelope_write(envlp, str, 0);
 			test_assert_idx(strcmp(str_c(str), test->envelope) == 0, i);
 		} else {
 			i_error("Invalid envelope: %s", error);

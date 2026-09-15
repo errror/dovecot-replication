@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -156,7 +156,8 @@ static void http_server_connection_ready(struct http_server_connection *conn)
 
 	if (set->rawlog_dir != NULL &&
 	    stat(set->rawlog_dir, &st) == 0) {
-		iostream_rawlog_create(set->rawlog_dir,
+		iostream_rawlog_create(conn->event, "http_server_rawlog_dir",
+				       set->rawlog_dir,
 				       &conn->conn.input, &conn->conn.output);
 	}
 
@@ -324,7 +325,8 @@ http_server_connection_handle_request(struct http_server_connection *conn,
 	if (req->req.payload != NULL) {
 		/* Send 100 Continue when appropriate */
 		if (req->req.expect_100_continue && !req->payload_halted &&
-		    req->response == NULL) {
+		    (req->response == NULL || !req->response->submitted)) {
+			e_debug(conn->event, "Trigger 100-continue response");
 			http_server_connection_output_trigger(conn);
 		}
 
@@ -781,7 +783,8 @@ http_server_connection_next_response(struct http_server_connection *conn)
 		/* send 100 Continue if appropriate */
 		if (req->state >= HTTP_SERVER_REQUEST_STATE_QUEUED &&
 		    conn->incoming_payload != NULL &&
-		    req->response == NULL && req->req.version_minor >= 1 &&
+		    (req->response == NULL || !req->response->submitted) &&
+		    req->req.version_minor >= 1 &&
 		    req->req.expect_100_continue && !req->payload_halted &&
 		    !req->sent_100_continue) {
 			static const char *response =
@@ -1013,14 +1016,14 @@ http_server_connection_create(struct http_server *server,
 	    net_set_send_buffer_size(fd_out,
 				     conn->set->socket_send_buffer_size) < 0) {
 		e_error(conn->event,
-			"net_set_send_buffer_size(%zu) failed: %m",
+			"net_set_send_buffer_size(%"PRIuUOFF_T") failed: %m",
 			conn->set->socket_send_buffer_size);
 	}
 	if (conn->set->socket_recv_buffer_size > 0 &&
 	    net_set_recv_buffer_size(fd_in,
 				     conn->set->socket_recv_buffer_size) < 0) {
 		e_error(conn->event,
-			"net_set_recv_buffer_size(%zu) failed: %m",
+			"net_set_recv_buffer_size(%"PRIuUOFF_T") failed: %m",
 			conn->set->socket_recv_buffer_size);
 	}
 

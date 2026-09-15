@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -693,9 +693,10 @@ static void mbox_notify_changes(struct mailbox *box)
 }
 
 static bool
-mbox_is_internal_name(struct mailbox_list *list ATTR_UNUSED,
+mbox_is_internal_name(struct mailbox_list *list,
 		      const char *name)
 {
+	struct mbox_mailbox_list *mlist = MBOX_LIST_CONTEXT(list);
 	size_t len;
 
 	/* don't allow *.lock files/dirs */
@@ -703,7 +704,12 @@ mbox_is_internal_name(struct mailbox_list *list ATTR_UNUSED,
 	if (len > 5 && strcmp(name+len-5, ".lock") == 0)
 		return TRUE;
 
-	return strcmp(name, MBOX_INDEX_DIR_NAME) == 0;
+	if (strcmp(name, MBOX_INDEX_DIR_NAME) == 0)
+		return TRUE;
+
+	if (mlist->module_ctx.super.is_internal_name != NULL)
+		return mlist->module_ctx.super.is_internal_name(list, name);
+	return FALSE;
 }
 
 static void mbox_storage_add_list(struct mail_storage *storage ATTR_UNUSED,
@@ -819,14 +825,12 @@ struct mail_storage mbox_storage = {
 	.set_info = &mbox_setting_parser_info,
 
 	.v = {
-		mbox_storage_alloc,
-		mbox_storage_create,
-		mbox_storage_destroy,
-		mbox_storage_add_list,
-		mbox_storage_autodetect,
-		mbox_mailbox_alloc,
-		NULL,
-		NULL,
+		.alloc = mbox_storage_alloc,
+		.create = mbox_storage_create,
+		.destroy = mbox_storage_destroy,
+		.add_list = mbox_storage_add_list,
+		.autodetect = mbox_storage_autodetect,
+		.mailbox_alloc = mbox_mailbox_alloc,
 	}
 };
 

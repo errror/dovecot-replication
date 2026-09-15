@@ -1,9 +1,10 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
 #include "str.h"
 #include "settings.h"
+#include "ssl-settings.h"
 #include "imap-arg.h"
 #include "imap-util.h"
 #include "imap-resp-code.h"
@@ -333,11 +334,17 @@ int imapc_storage_client_create(struct mailbox_list *list,
 	const struct imapc_settings *imapc_set;
 	struct imapc_storage_client *client;
 	struct imapc_parameters params = {};
+	const struct ssl_settings *ssl_set = NULL;
 	string_t *str;
 
 	if (settings_get(list->event, &imapc_setting_parser_info, 0,
 			 &imapc_set, error_r) < 0)
 		return -1;
+	if (strcmp(imapc_set->imapc_ssl, "no") != 0 &&
+	    ssl_client_settings_get(list->event, &ssl_set, error_r) < 0) {
+		settings_free(imapc_set);
+		return -1;
+	}
 
 	if ((ns->flags & NAMESPACE_FLAG_UNUSABLE) != 0 ||
 	    *imapc_set->imapc_host == '\0')
@@ -358,11 +365,13 @@ int imapc_storage_client_create(struct mailbox_list *list,
 							"'%s' is not supported",
 							mech_name);
 				settings_free(imapc_set);
+				settings_free(ssl_set);
 				return -1;
 			} else if (dsasl_client_mech_uses_password(mech) &&
 				   *imapc_set->imapc_password == '\0') {
 				*error_r = "Missing imapc_password";
 				settings_free(imapc_set);
+				settings_free(ssl_set);
 				return -1;
 			}
 		}
@@ -370,8 +379,6 @@ int imapc_storage_client_create(struct mailbox_list *list,
 	params.override_dns_client_socket_path = *ns->user->set->base_dir == '\0' ? "" :
 		t_strconcat(ns->user->set->base_dir, "/",
 			    DNS_CLIENT_SOCKET_NAME, NULL);
-	params.override_rawlog_dir = mail_user_home_expand(ns->user,
-			imapc_set->imapc_rawlog_dir);
 
 	if ((imapc_set->parsed_features & IMAPC_FEATURE_SEND_ID) != 0)
 		params.session_id_prefix = ns->user->session_id;
@@ -383,6 +390,9 @@ int imapc_storage_client_create(struct mailbox_list *list,
 	client = i_new(struct imapc_storage_client, 1);
 	client->refcount = 1;
 	client->set = imapc_set;
+	client->ssl_set = ssl_set;
+	client->disabled =
+		HAS_ALL_BITS(params.flags, IMAPC_PARAMETER_CLIENT_DISABLED);
 	i_array_init(&client->untagged_callbacks, 16);
 	client->client = imapc_client_init(&params, list->event);
 	imapc_client_register_untagged(client->client,
@@ -412,11 +422,49 @@ void imapc_storage_client_unref(struct imapc_storage_client **_client)
 		return;
 	imapc_client_deinit(&client->client);
 	settings_free(client->set);
+	settings_free(client->ssl_set);
 	array_foreach_modifiable(&client->untagged_callbacks, cb)
 		i_free(cb->name);
 	array_free(&client->untagged_callbacks);
 	i_free(client->auth_failed_reason);
 	i_free(client);
+}
+
+static bool
+imapc_storage_match(struct mail_storage *_storage, struct mailbox_list *list)
+{
+	struct imapc_storage *storage = IMAPC_STORAGE(_storage);
+	const struct imapc_settings *imapc_set;
+	const struct ssl_settings *ssl_set;
+	const char *error;
+	bool match;
+
+	if (storage->client->disabled ||
+	    HAS_ANY_BITS(list->ns->flags, NAMESPACE_FLAG_UNUSABLE)) {
+		/* Never share a disabled client, or share a working client
+		   with a namespace that must not access the remote. */
+		return FALSE;
+	}
+	if (settings_get(list->event, &imapc_setting_parser_info, 0,
+			 &imapc_set, &error) < 0) {
+		/* The error is reported when the new storage is created. */
+		return FALSE;
+	}
+	match = settings_equal(&imapc_setting_parser_info, storage->client->set,
+			       imapc_set, NULL);
+	settings_free(imapc_set);
+	if (!match || storage->client->ssl_set == NULL) {
+		/* Either the settings differ, or imapc_ssl=no in both of them
+		   and there are no SSL settings to compare. */
+		return match;
+	}
+
+	if (ssl_client_settings_get(list->event, &ssl_set, &error) < 0)
+		return FALSE;
+	match = settings_equal(&ssl_setting_parser_info,
+			       storage->client->ssl_set, ssl_set, NULL);
+	settings_free(ssl_set);
+	return match;
 }
 
 static int
@@ -442,28 +490,6 @@ imapc_storage_create(struct mail_storage *_storage,
 		_storage->nonbody_access_fields |=
 			MAIL_FETCH_IMAP_BODY | MAIL_FETCH_IMAP_BODYSTRUCTURE;
 	}
-
-	/* serialize all the settings */
-	_storage->unique_root_dir = p_strdup_printf(_storage->pool,
-						    "%s://(%s|%s):%s@%s:%u/%s mechs:%s features:%s "
-						    "rawlog:%s cmd_timeout:%u maxidle:%u maxline:%zuu "
-						    "pop3delflg:%s root_dir:%s",
-						    storage->set->imapc_ssl,
-						    storage->set->imapc_user,
-						    storage->set->imapc_master_user,
-						    storage->set->imapc_password,
-						    storage->set->imapc_host,
-						    storage->set->imapc_port,
-						    storage->set->imapc_list_prefix,
-						    t_array_const_string_join(&storage->set->imapc_sasl_mechanisms,
-									      ","),
-						    t_array_const_string_join(&storage->set->imapc_features, ","),
-						    storage->set->imapc_rawlog_dir,
-						    storage->set->imapc_cmd_timeout_secs,
-						    storage->set->imapc_max_idle_time_secs,
-						    (size_t) storage->set->imapc_max_line_length,
-						    storage->set->pop3_deleted_flag,
-						    ns->list->mail_set->mail_path);
 
 	imapc_storage_client_register_untagged(storage->client, "STATUS",
 					       imapc_untagged_status);
@@ -785,7 +811,8 @@ int imapc_mailbox_select(struct imapc_mailbox *mbox)
 	}
 
 	mbox->client_box =
-		imapc_client_mailbox_open(mbox->storage->client->client, mbox);
+		imapc_client_mailbox_open(mbox->storage->client->client,
+					  mailbox_get_name(&mbox->box), mbox);
 	imapc_client_mailbox_set_reopen_cb(mbox->client_box,
 					   imapc_mailbox_reopen, mbox);
 
@@ -888,8 +915,7 @@ static void imapc_mailbox_close(struct mailbox *box)
 		imapc_client_mailbox_close(&mbox->client_box);
 	if (array_is_created(&mbox->rseq_modseqs))
 		array_free(&mbox->rseq_modseqs);
-	if (mbox->sync_view != NULL)
-		mail_index_view_close(&mbox->sync_view);
+	mail_index_view_close(&mbox->sync_view);
 	timeout_remove(&mbox->to_idle_delay);
 	timeout_remove(&mbox->to_idle_check);
 	imapc_mail_cache_free(&mbox->prev_mail_cache);
@@ -979,6 +1005,8 @@ static void imapc_untagged_status(const struct imapc_untagged_reply *reply,
 			status->uidvalidity = num;
 		else if (strcasecmp(key, "UNSEEN") == 0)
 			status->unseen = num;
+		else if (strcasecmp(key, "DELETED") == 0)
+			status->deleted = num;
 		else if (strcasecmp(key, "HIGHESTMODSEQ") == 0 &&
 			 imapc_mailbox_has_modseqs(storage->cur_status_box))
 			status->highest_modseq = num;
@@ -1152,6 +1180,33 @@ static int imapc_mailbox_delete(struct mailbox *box)
 	return index_storage_mailbox_delete(box);
 }
 
+int imapc_server_unselect(struct imapc_storage_client *client)
+{
+	enum imapc_capability caps;
+	if (imapc_client_get_capabilities(client->client, &caps) < 0)
+		return -1;
+
+	struct imapc_simple_context sctx;
+	imapc_simple_context_init(&sctx, client);
+
+	struct imapc_command *cmd = imapc_client_cmd(client->client,
+						     imapc_simple_callback, &sctx);
+
+	if ((caps & IMAPC_CAPABILITY_UNSELECT) != 0) {
+		imapc_command_set_flags(cmd, IMAPC_COMMAND_FLAG_UNSELECT);
+		imapc_command_sendf(cmd, "UNSELECT");
+	} else {
+		char sep = client->_list->root_sep;
+		char nonexistent_mailbox[] = { sep, sep, sep, '\0' };
+
+		imapc_command_set_flags(cmd, IMAPC_COMMAND_FLAG_SELECT);
+		imapc_command_sendf(cmd, "SELECT %s", nonexistent_mailbox);
+	}
+
+	imapc_simple_run(&sctx, &cmd);
+	return 0;
+}
+
 static int imapc_mailbox_run_status(struct mailbox *box,
 				    enum mailbox_status_items items,
 				    struct mailbox_status *status_r)
@@ -1170,6 +1225,8 @@ static int imapc_mailbox_run_status(struct mailbox *box,
 	if ((items & STATUS_RECENT) != 0 &&
 	    (box->enabled_features & MAILBOX_FEATURE_IMAP4REV2) == 0)
 		str_append(str, " RECENT");
+	if ((items & STATUS_DELETED) != 0)
+		str_append(str, " DELETED");
 	if ((items & STATUS_UIDNEXT) != 0)
 		str_append(str, " UIDNEXT");
 	if ((items & STATUS_UIDVALIDITY) != 0)
@@ -1183,6 +1240,17 @@ static int imapc_mailbox_run_status(struct mailbox *box,
 	if (str_len(str) == 0) {
 		/* nothing requested */
 		return 0;
+	}
+
+	if (imapc_client_is_server_selected(mbox->storage->client->client,
+					    mailbox_get_name(box))) {
+		/* Our local imap session is no longer selecting the folder,
+		   (this is handled in the imap layer above us), but the remote
+		   side still has the mailbox selected. This would cause the
+		   STATUS command below to not work as intended - so, deselect
+		   on the remote side */
+		if (imapc_server_unselect(mbox->storage->client) < 0)
+			return -1;
 	}
 
 	imapc_simple_context_init(&sctx, mbox->storage->client);
@@ -1409,14 +1477,11 @@ struct mail_storage imapc_storage = {
 	.set_info = &imapc_setting_parser_info,
 
 	.v = {
-		imapc_storage_alloc,
-		imapc_storage_create,
-		imapc_storage_destroy,
-		NULL,
-		NULL,
-		imapc_mailbox_alloc,
-		NULL,
-		NULL,
+		.alloc = imapc_storage_alloc,
+		.create = imapc_storage_create,
+		.destroy = imapc_storage_destroy,
+		.mailbox_alloc = imapc_mailbox_alloc,
+		.storage_match = imapc_storage_match,
 	}
 };
 

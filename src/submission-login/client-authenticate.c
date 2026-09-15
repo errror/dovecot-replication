@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "base64.h"
@@ -10,6 +10,7 @@
 #include "safe-memset.h"
 #include "str.h"
 #include "str-sanitize.h"
+#include "settings-parser.h"
 #include "auth-client.h"
 #include "ssl-settings.h"
 #include "client.h"
@@ -40,8 +41,8 @@ static void cmd_helo_reply(struct submission_client *subm_client,
 			unsigned int count, i;
 			string_t *param = t_str_new(128);
 
-			mechs = sasl_server_get_advertised_mechs(client,
-								 &count);
+			mechs = sasl_proxy_get_advertised_mechs(client,
+								&count);
 			for (i = 0; i < count; i++) {
 				if (i > 0)
 					str_append_c(param, ' ');
@@ -76,7 +77,8 @@ static void cmd_helo_reply(struct submission_client *subm_client,
 				reply, "ENHANCEDSTATUSCODES");
 		}
 
-		if (subm_client->set->submission_max_mail_size > 0) {
+		if (subm_client->set->submission_max_mail_size > 0 &&
+		    subm_client->set->submission_max_mail_size != SET_SIZE_UNLIMITED) {
 			smtp_server_reply_ehlo_add_param(reply,
 				"SIZE", "%"PRIuUOFF_T,
 				subm_client->set->submission_max_mail_size);
@@ -118,19 +120,19 @@ void submission_client_auth_result(struct client *client,
 {
 	struct submission_client *subm_client =
 		container_of(client, struct submission_client, common);
-	struct smtp_server_cmd_ctx *cmd = subm_client->pending_auth;
+	struct smtp_server_cmd_ctx *cmd = subm_client->auth_cmd;
 
 	if (subm_client->conn == NULL)
 		return;
 
-	subm_client->pending_auth = NULL;
+	subm_client->auth_cmd = NULL;
 	i_assert(cmd != NULL);
 
 	switch (result) {
 	case CLIENT_AUTH_RESULT_SUCCESS:
 		/* nothing to be done for SMTP */
 		if (client->login_proxy != NULL)
-			subm_client->pending_auth = cmd;
+			subm_client->auth_cmd = cmd;
 		break;
 	case CLIENT_AUTH_RESULT_REFERRAL_NOLOGIN: {
 		const struct smtp_proxy_redirect predir = {
@@ -152,6 +154,24 @@ void submission_client_auth_result(struct client *client,
 		   authentication failed due to a temporary server failure.
 		 */
 		smtp_server_reply(cmd, 454, "4.7.0", "%s", text);
+		break;
+	case CLIENT_AUTH_RESULT_LIMIT_REACHED:
+		/* The user has too many concurrent connections. Reply with
+		   421 4.7.0: 421 means "service shutting down, closing
+		   transmission channel" (RFC 5321 Section 4.2.1) and
+		   signals the client that retrying on this same connection
+		   is pointless. The proxy uses the 421 + 4.7.0 combination
+		   to recognize this specifically as a connection-limit
+		   response (rather than a generic 421 internal/shutdown
+		   reply) and avoid reconnecting.
+
+		   Use reply_immediate() rather than the queued
+		   smtp_server_reply() because the caller (sasl-server)
+		   immediately tears the connection down after this returns,
+		   which would abort a queued reply before it reaches the
+		   wire. */
+		smtp_server_connection_reply_immediate(subm_client->conn,
+			421, "4.7.0 %s", text);
 		break;
 	case CLIENT_AUTH_RESULT_ABORTED:
 		/* RFC4954, Section 4:
@@ -283,8 +303,9 @@ void submission_client_auth_send_challenge(struct client *client,
 {
 	struct submission_client *subm_client =
 		container_of(client, struct submission_client, common);
-	struct smtp_server_cmd_ctx *cmd = subm_client->pending_auth;
+	struct smtp_server_cmd_ctx *cmd = subm_client->auth_cmd;
 
+	i_assert(!subm_client->auth_cmd_implicit);
 	i_assert(cmd != NULL);
 
 	smtp_server_cmd_auth_send_challenge(cmd, data);
@@ -327,18 +348,49 @@ cmd_auth_set_master_data_prefix(struct submission_client *subm_client,
 	client->master_data_prefix = buffer_free_without_data(&buf);
 }
 
+void cmd_auth_begin(struct submission_client *subm_client)
+{
+	subm_client->auth_cmd_deferred = FALSE;
+
+	if (subm_client->auth_cmd == NULL)
+		return;
+
+	struct client *client = &subm_client->common;
+
+	if (subm_client->auth_cmd_implicit) {
+		(void)client_auth_begin_implicit(client,
+						 SASL_MECH_NAME_EXTERNAL, "=");
+	} else {
+		struct smtp_server_cmd_auth *data = subm_client->auth_cmd_data;
+
+		i_assert(data != NULL);
+		(void)client_auth_begin(client, data->sasl_mech,
+					data->initial_response);
+	}
+}
+
 int cmd_auth(void *conn_ctx, struct smtp_server_cmd_ctx *cmd,
 	     struct smtp_server_cmd_auth *data)
 {
 	struct submission_client *subm_client = conn_ctx;
 	struct client *client = &subm_client->common;
 
+	i_assert(!client->authenticating);
+
 	cmd_auth_set_master_data_prefix(subm_client, NULL);
+	subm_client->auth_cmd_deferred = FALSE;
 
-	i_assert(subm_client->pending_auth == NULL);
-	subm_client->pending_auth = cmd;
+	i_assert(subm_client->auth_cmd == NULL);
+	subm_client->auth_cmd = cmd;
+	subm_client->auth_cmd_data = data; /* allocated on cmd pool */
+	subm_client->auth_cmd_implicit = FALSE;
 
-	(void)client_auth_begin(client, data->sasl_mech, data->initial_response);
+	if (!auth_client_is_connected(auth_client)) {
+		subm_client->auth_cmd_deferred = TRUE;
+		return 0;
+	}
+
+	cmd_auth_begin(subm_client);
 	return 0;
 }
 
@@ -353,11 +405,14 @@ void cmd_mail(struct smtp_server_cmd_ctx *cmd, const char *params)
 
 	if (HAS_NO_BITS(workarounds,
 			SUBMISSION_LOGIN_WORKAROUND_IMPLICIT_AUTH_EXTERNAL) ||
-	    sasl_server_find_available_mech(client, "EXTERNAL") == NULL) {
+	    sasl_proxy_find_available_mech(
+			client, SASL_MECH_NAME_EXTERNAL) == NULL) {
 		smtp_server_command_fail(cmd->cmd, 530, "5.7.0",
 					 "Authentication required.");
 		return;
 	}
+
+	i_assert(!client->authenticating);
 
 	e_debug(cmd->event,
 		"Performing implicit EXTERNAL authentication");
@@ -365,9 +420,16 @@ void cmd_mail(struct smtp_server_cmd_ctx *cmd, const char *params)
 	smtp_server_command_input_lock(cmd);
 
 	cmd_auth_set_master_data_prefix(subm_client, params);
+	subm_client->auth_cmd_deferred = FALSE;
 
-	i_assert(subm_client->pending_auth == NULL);
-	subm_client->pending_auth = cmd;
+	i_assert(subm_client->auth_cmd == NULL);
+	subm_client->auth_cmd = cmd;
+	subm_client->auth_cmd_implicit = TRUE;
 
-	(void)client_auth_begin_implicit(client, "EXTERNAL", "=");
+	if (!auth_client_is_connected(auth_client)) {
+		subm_client->auth_cmd_deferred = TRUE;
+		return;
+	}
+
+	cmd_auth_begin(subm_client);
 }

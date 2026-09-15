@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 
@@ -43,6 +43,7 @@ const char *json_content_type_get_name(enum json_content_type ctype)
 
 const char *json_node_get_label(const struct json_node *jnode)
 {
+	i_assert(jnode != NULL);
 	switch (jnode->type) {
 	case JSON_TYPE_NONE:
 		return "<unassigned>";

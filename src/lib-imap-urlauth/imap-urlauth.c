@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "hostpid.h"
@@ -138,11 +138,14 @@ access_applications_have_access(struct imap_urlauth_context *uctx,
 		bool have_userid = FALSE;
 		size_t len = strlen(app);
 
-		if (app[len-1] == '+')
+		if (len > 0 && app[len-1] == '+') {
 			have_userid = TRUE;
+			len--;
+		}
 
 		if (strncasecmp(url->uauth_access_application,
-				app, len-1) == 0) {
+				app, len) == 0 &&
+		    url->uauth_access_application[len] == '\0') {
 			if (!have_userid) {
 				/* This access application must have no userid
 				 */
@@ -178,7 +181,7 @@ imap_urlauth_check_access(struct imap_urlauth_context *uctx,
 				*client_error_r = "URLAUTH `user' access is missing userid";
 				return FALSE;
 			}
-			if (!uctx->access_anonymous ||
+			if (!uctx->access_anonymous &&
 			    strcasecmp(url->uauth_access_user,
 				       uctx->access_user) == 0)
 				return TRUE;
@@ -513,7 +516,8 @@ int imap_urlauth_fetch_parsed(struct imap_urlauth_context *uctx,
 	}
 
 	if ((ret = imap_msgpart_url_open_mailbox(mpurl, &box, error_code_r,
-						 client_error_r)) < 0) {
+						 &error)) < 0) {
+		*client_error_r = t_strdup_printf("Invalid URLAUTH: %s", error);
 		imap_msgpart_url_free(&mpurl);
 		return -1;
 	}

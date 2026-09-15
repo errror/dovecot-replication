@@ -20,9 +20,10 @@ EXTRA_DIST = \
 	run-test-valgrind.supp \
 	dovecot.service.in \
 	dovecot.socket \
-	version \
+	version.txt \
 	build-aux/git-abi-version-gen \
 	build-aux/git-version-gen \
+	build-aux/config.rpath \
 	$(conf_DATA)
 
 noinst_DATA = dovecot-config
@@ -31,7 +32,7 @@ nodist_pkginclude_HEADERS = config.h
 
 distuninstallcheck_listfiles = find . -type f \! -name '*.conf' -print
 
-version:
+version.txt:
 	$(AM_V_GEN)env VERSION=$(PACKAGE_VERSION) $(top_srcdir)/build-aux/git-version-gen > $@
 
 aclocal_DATA = m4/dovecot.m4
@@ -48,6 +49,7 @@ dovecot-config: dovecot-config.in Makefile
 	-e "s|\$$(top_builddir)|$$abs_builddir|g" \
 	-e "s|\$$(incdir)|$$abs_srcdir|g" \
 	-e "s|\$$(MODULE_LIBS)|$(MODULE_LIBS)|g" \
+	-e "s|\$$(LIBPCRE_LIBS)|$(LIBPCRE_LIBS)|g" \
 	-e "s|^\(dovecot_pkgincludedir\)=|\1=$(pkgincludedir)|" \
 	-e "s|^\(dovecot_pkglibdir\)=|\1=$(pkglibdir)|" \
 	-e "s|^\(dovecot_pkglibexecdir\)=|\1=$(libexecdir)/dovecot|" \
@@ -99,6 +101,11 @@ DISTCLEANFILES = \
 	$(top_builddir)/dovecot-version.h \
 	$(top_builddir)/dovecot-config \
 	$(top_builddir)/run-test.sh
+
+check-local:
+	rm -rf $(top_builddir)/.test
+clean-local:
+	rm -rf $(top_builddir)/.test
 
 distcheck-hook:
 	if which scan-build > /dev/null; then \

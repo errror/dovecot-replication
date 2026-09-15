@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
@@ -49,6 +49,8 @@ passwd_file_add_extra_fields(struct auth_request *request,
 			key = fields[i];
 			value = "";
 		}
+		if (key[0] == '\0')
+			continue;
 		if (request->passdb->set->fields_import_all)
 			auth_request_set_field(request, key, value, NULL);
 		auth_fields_add(pwd_fields, key, value, 0);
@@ -128,12 +130,12 @@ passwd_file_lookup_credentials(struct auth_request *request,
 				    request->set->username_format, &pu);
 	if (ret <= 0) {
 		callback(ret < 0 ? PASSDB_RESULT_INTERNAL_FAILURE :
-			 PASSDB_RESULT_USER_UNKNOWN, NULL, 0, request);
+			 PASSDB_RESULT_USER_UNKNOWN, NULL, 0, NULL, request);
 		return;
 	}
 
 	if (passwd_file_save_results(request, pu, &crypted_pass, &scheme) < 0) {
-		callback(PASSDB_RESULT_INTERNAL_FAILURE, NULL, 0, request);
+		callback(PASSDB_RESULT_INTERNAL_FAILURE, NULL, 0, NULL, request);
 		return;
 	}
 
@@ -143,6 +145,7 @@ passwd_file_lookup_credentials(struct auth_request *request,
 
 static int
 passwd_file_preinit(pool_t pool, struct event *event,
+		    const struct passdb_parameters *passdb_params ATTR_UNUSED,
 		    struct passdb_module **module_r, const char **error_r)
 {
 	struct passwd_file_passdb_module *module;

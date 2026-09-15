@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -73,26 +73,26 @@ auth_server_input_mech(struct auth_client_connection *conn,
 	i_zero(&mech_desc);
 	mech_desc.name = p_strdup(conn->pool, args[0]);
 
-	if (strcmp(mech_desc.name, "PLAIN") == 0)
+	if (strcmp(mech_desc.name, SASL_MECH_NAME_PLAIN) == 0)
 		conn->has_plain_mech = TRUE;
 
 	for (args++; *args != NULL; args++) {
 		if (strcmp(*args, "private") == 0)
-			mech_desc.flags |= MECH_SEC_PRIVATE;
+			mech_desc.flags |= SASL_MECH_SEC_PRIVATE;
 		else if (strcmp(*args, "anonymous") == 0)
-			mech_desc.flags |= MECH_SEC_ANONYMOUS;
+			mech_desc.flags |= SASL_MECH_SEC_ANONYMOUS;
 		else if (strcmp(*args, "plaintext") == 0)
-			mech_desc.flags |= MECH_SEC_PLAINTEXT;
+			mech_desc.flags |= SASL_MECH_SEC_PLAINTEXT;
 		else if (strcmp(*args, "dictionary") == 0)
-			mech_desc.flags |= MECH_SEC_DICTIONARY;
+			mech_desc.flags |= SASL_MECH_SEC_DICTIONARY;
 		else if (strcmp(*args, "active") == 0)
-			mech_desc.flags |= MECH_SEC_ACTIVE;
+			mech_desc.flags |= SASL_MECH_SEC_ACTIVE;
 		else if (strcmp(*args, "forward-secrecy") == 0)
-			mech_desc.flags |= MECH_SEC_FORWARD_SECRECY;
+			mech_desc.flags |= SASL_MECH_SEC_FORWARD_SECRECY;
 		else if (strcmp(*args, "mutual-auth") == 0)
-			mech_desc.flags |= MECH_SEC_MUTUAL_AUTH;
+			mech_desc.flags |= SASL_MECH_SEC_MUTUAL_AUTH;
 		else if (strcmp(*args, "channel-binding") == 0)
-			mech_desc.flags |= MECH_SEC_CHANNEL_BINDING;
+			mech_desc.flags |= SASL_MECH_SEC_CHANNEL_BINDING;
 	}
 	array_push_back(&conn->available_auth_mechs, &mech_desc);
 	return 0;
@@ -215,7 +215,7 @@ static void auth_client_connection_handshake_ready(struct connection *_conn)
 
 	timeout_remove(&conn->to);
 	if (conn->client->connect_notify_callback != NULL) {
-		conn->client->connect_notify_callback(conn->client, TRUE,
+		conn->client->connect_notify_callback(conn->client, NULL,
 				conn->client->connect_notify_context);
 	}
 }
@@ -304,6 +304,28 @@ auth_server_input_fail(struct auth_client_connection *conn,
 }
 
 static int
+auth_server_input_cancelled(struct auth_client_connection *conn,
+			    const char *const *args)
+{
+	unsigned int id;
+
+	if (args[0] == NULL || str_to_uint(args[0], &id) < 0) {
+		e_error(conn->conn.event,
+			"BUG: Authentication server input missing ID");
+		return -1;
+	}
+
+	struct auth_client_request *request =
+		hash_table_lookup(conn->requests, POINTER_CAST(id));
+	if (request != NULL && !request->server_finished) {
+		request->server_finished = TRUE;
+		auth_client_request_server_input(&request,
+			AUTH_REQUEST_STATUS_FAIL, args + 1);
+	}
+	return 0;
+}
+
+static int
 auth_client_connection_handle_line(struct auth_client_connection *conn,
 				   const char *line)
 {
@@ -322,6 +344,8 @@ auth_client_connection_handle_line(struct auth_client_connection *conn,
 		return auth_server_input_cont(conn, args + 1);
 	else if (strcmp(args[0], "FAIL") == 0)
 		return auth_server_input_fail(conn, args + 1);
+	else if (strcmp(args[0], "CANCELLED") == 0)
+		return auth_server_input_cancelled(conn, args + 1);
 	else {
 		e_error(conn->conn.event,
 			"Auth server sent unknown response: %s", args[0]);
@@ -430,7 +454,7 @@ void auth_client_connection_disconnect(struct auth_client_connection *conn,
 	auth_client_connection_remove_requests(conn, reason);
 
 	if (conn->client->connect_notify_callback != NULL) {
-		conn->client->connect_notify_callback(conn->client, FALSE,
+		conn->client->connect_notify_callback(conn->client, reason,
 				conn->client->connect_notify_context);
 	}
 }
@@ -576,12 +600,17 @@ auth_client_connection_add_request(struct auth_client_connection *conn,
 	return id;
 }
 
-void auth_client_connection_remove_request(struct auth_client_connection *conn,
+bool auth_client_connection_remove_request(struct auth_client_connection *conn,
 					   struct auth_client_request *request)
 {
 	if (request->removed)
-		return;
+		return TRUE;
 	i_assert(connection_handshake_received(&conn->conn));
+	if (request->sent && !request->server_finished && conn->connected) {
+		/* We still expect a response from the auth server. */
+		return FALSE;
+	}
 	hash_table_remove(conn->requests, POINTER_CAST(request->id));
 	request->removed = TRUE;
+	return TRUE;
 }

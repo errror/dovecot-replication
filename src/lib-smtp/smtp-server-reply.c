@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -51,7 +51,7 @@ static void smtp_server_reply_update_event(struct smtp_server_reply *reply)
 		event_set_append_log_prefix(reply->event,
 			t_strdup_printf("%u reply [%u/%u]: ",
 					reply->content->status,
-					reply->index+1,
+					reply->index + 1,
 					command->replies_expected));
 	} else {
 		event_set_append_log_prefix(reply->event,
@@ -118,7 +118,7 @@ smtp_server_reply_update_prefix(struct smtp_server_reply *reply,
 		reply->content->last_line = str_len(new_text);
 
 		p = strchr(text, '\n');
-		i_assert(p != NULL && p > text && *(p-1) == '\r');
+		i_assert(p != NULL && p > text && *(p - 1) == '\r');
 		p++;
 
 		str_append(new_text, new_prefix);
@@ -291,7 +291,7 @@ void smtp_server_reply_add_text(struct smtp_server_reply *reply,
 			str_append(textbuf, text);
 			text = NULL;
 		} else {
-			if (p > text && *(p-1) == '\r')
+			if (p > text && *(p - 1) == '\r')
 				str_append_data(textbuf, text, p - text - 1);
 			else
 				str_append_data(textbuf, text, p - text);
@@ -533,19 +533,6 @@ void smtp_server_reply_all(struct smtp_server_cmd_ctx *_cmd,
 	va_end(args);
 }
 
-void smtp_server_reply_early(struct smtp_server_cmd_ctx *_cmd,
-			     unsigned int status, const char *enh_code,
-			     const char *fmt, ...)
-{
-	va_list args;
-
-	_cmd->cmd->reply_early = TRUE;
-
-	va_start(args, fmt);
-	smtp_server_reply_allv(_cmd, status, enh_code, fmt, args);
-	va_end(args);
-}
-
 void smtp_server_reply_quit(struct smtp_server_cmd_ctx *_cmd)
 {
 	struct smtp_server_command *cmd = _cmd->cmd;
@@ -580,7 +567,7 @@ smtp_server_reply_write_one_line(const struct smtp_server_reply *reply,
 
 	for (;;) {
 		p = strchr(text, '\n');
-		i_assert(p != NULL && p > text && *(p-1) == '\r');
+		i_assert(p != NULL && p > text && *(p - 1) == '\r');
 		str_append_data(str, text, p - text - 1);
 		line_len = (size_t)(p - text) + 1;
 		i_assert(text_len >= line_len);
@@ -593,6 +580,11 @@ smtp_server_reply_write_one_line(const struct smtp_server_reply *reply,
 		text_len -= prefix_len;
 		text += prefix_len;
 		str_append_c(str, ' ');
+	}
+
+	if (!skip_status) {
+		i_assert(str_len(str) > 3);
+		str_replace(str, 3, 1, " ");
 	}
 }
 
@@ -880,7 +872,7 @@ void smtp_server_reply_ehlo_add_xclient(struct smtp_server_reply *reply)
 {
 	static const char *base_fields =
 		"ADDR PORT PROTO HELO LOGIN SESSION CLIENT-TRANSPORT TTL TIMEOUT "
-		"DESTNAME";
+		"DESTNAME DESTADDR DESTPORT";
 	struct smtp_server_cmd_ctx *cmd = &reply->command->context;
 	struct smtp_server_connection *conn = cmd->conn;
 

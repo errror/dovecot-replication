@@ -32,6 +32,7 @@ struct service_listener {
 			const struct file_listener_settings *set;
 			uid_t uid;
 			gid_t gid;
+			bool pid_listener;
 		} fileset;
 		struct {
 			const struct inet_listener_settings *set;
@@ -39,7 +40,13 @@ struct service_listener {
 		} inetset;
 	} set;
 
-	bool reuse_port;
+	/* This listener is used only by the process with this index number.
+	   Each process gets their own reuse_port listener. This index number
+	   is between 0..(process_limit-1) and valid only for that process
+	   index. The index is assigned while at the process creation order.
+	   If a process exits or retires, it is replaced by a new process with
+	   the same index number. */
+	unsigned int reuse_port_process_index;
 };
 
 struct service {
@@ -70,6 +77,9 @@ struct service {
 
 	/* number of processes currently created for this service */
 	unsigned int process_count;
+	/* number of processes that have retired=TRUE.
+	   Always <= process_count. */
+	unsigned int retired_process_count;
 	/* number of processes currently accepting new clients */
 	unsigned int process_avail;
 	/* number of processes currently idling (idle_start != 0) */
@@ -212,6 +222,9 @@ service_lookup(struct service_list *service_list, const char *name);
 /* Find service by type */
 struct service *
 service_lookup_type(struct service_list *service_list, enum service_type type);
+
+/* Return the number of active (non-retired) processes the service has. */
+unsigned int service_active_process_count(struct service *service);
 
 void service_pids_init(void);
 void service_pids_deinit(void);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "submission-common.h"
 #include "buffer.h"
@@ -6,7 +6,6 @@
 #include "istream.h"
 #include "ostream.h"
 #include "array.h"
-#include "base64.h"
 #include "hostpid.h"
 #include "path-util.h"
 #include "process-title.h"
@@ -206,6 +205,7 @@ client_create_from_input(const struct mail_storage_service_input *input,
 			"(submission_relay_host is unset)";
 		send_error(fd_out, event, set->hostname,
 			   "4.3.5", MAIL_ERRSTR_CRITICAL_MSG);
+		settings_free(set);
 		mail_user_deinit(&mail_user);
 		event_unref(&event);
 		return -1;
@@ -214,6 +214,7 @@ client_create_from_input(const struct mail_storage_service_input *input,
 	if (ret < 0) {
 		send_error(fd_out, event, my_hostname,
 			"4.7.0", MAIL_ERRSTR_CRITICAL_MSG);
+		settings_free(set);
 		mail_user_deinit(&mail_user);
 		event_unref(&event);
 		return -1;
@@ -249,8 +250,7 @@ client_create_from_input(const struct mail_storage_service_input *input,
 static void main_stdio_run(const char *username)
 {
 	struct mail_storage_service_input input;
-	buffer_t *input_buf;
-	const char *value, *error, *input_base64;
+	const char *error;
 
 	i_zero(&input);
 	input.service = "submission";
@@ -259,17 +259,9 @@ static void main_stdio_run(const char *username)
 		input.username = getlogin();
 	if (input.username == NULL)
 		i_fatal("USER environment missing");
-	if ((value = getenv("IP")) != NULL)
-		(void)net_addr2ip(value, &input.remote_ip);
-	if ((value = getenv("LOCAL_IP")) != NULL)
-		(void)net_addr2ip(value, &input.local_ip);
-
-	input_base64 = getenv("CLIENT_INPUT");
-	input_buf = input_base64 == NULL ? NULL :
-		t_base64_decode_str(input_base64);
 
 	if (client_create_from_input(&input, 0, STDIN_FILENO, STDOUT_FILENO,
-				     input_buf, &error) < 0)
+				     NULL, &error) < 0)
 		i_fatal("%s", error);
 }
 
@@ -415,7 +407,12 @@ int main(int argc, char *argv[])
 	master_admin_clients_init(&admin_callbacks);
 	master_service_set_die_callback(master_service, submission_die);
 
-	if (master_service_settings_read_simple(master_service, &error) < 0)
+	struct master_service_settings_input set_input = {
+		.preserve_user = TRUE,
+	};
+	struct master_service_settings_output set_output;
+	if (master_service_settings_read(master_service, &set_input,
+					 &set_output, &error) < 0)
 		i_fatal("%s", error);
 
 	const struct master_service_settings *master_set =
@@ -437,6 +434,7 @@ int main(int argc, char *argv[])
 	smtp_server_set.max_pipelined_commands = 5;
 	smtp_server_set.debug = submission_debug;
 	smtp_server_set.reason_code_module = "submission";
+	smtp_server_set.max_recipients = SET_UINT_UNLIMITED;
 	smtp_server = smtp_server_init(&smtp_server_set);
 	smtp_server_command_register(smtp_server, "BURL", cmd_burl, 0);
 

@@ -1,14 +1,13 @@
-/* Copyright (c) 2024 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-auth.h"
+#include "test-dir.h"
 #include "auth-common.h"
 #include "settings.h"
 #include "auth-settings.h"
 #include "auth-token.h"
 #include "auth-penalty.h"
-#include "mech.h"
-#include "otp.h"
-#include "mech-otp-common.h"
+#include "sasl-server.h"
 #include "db-oauth2.h"
 #include "passdb.h"
 #include "userdb.h"
@@ -16,8 +15,9 @@
 #include <time.h>
 
 static const char *const settings[] = {
-	"base_dir", ".",
-	"auth_mechanisms", "plain xoauth2",
+	"auth_mechanisms",
+		"ANONYMOUS APOP CRAM-MD5 DIGEST-MD5 EXTERNAL LOGIN PLAIN "
+		"OAUTHBEARER SCRAM-SHA-1 SCRAM-SHA-256 XOAUTH2",
 	"auth_username_chars", "",
 	"auth_username_format", "",
 	/* For tests of digest-md5. */
@@ -41,30 +41,31 @@ static const char *const settings[] = {
 	NULL
 };
 
-static struct mechanisms_register *mech_reg;
 static struct settings_simple simple_set;
 
 void test_auth_init(void)
 {
 	const char *const protocols[] = {NULL};
 	process_start_time = time(NULL);
+	test_dir_init("test-auth");
 
 	settings_simple_init(&simple_set, settings);
+	settings_override(simple_set.instance, "base_dir", test_dir_get(), SETTINGS_OVERRIDE_TYPE_CLI_PARAM);
 	global_auth_settings = settings_get_or_fatal(simple_set.event,
 						     &auth_setting_parser_info);
 	/* this is needed to get oauth2 initialized */
 	auth_event = simple_set.event;
-	mech_init(global_auth_settings);
-	mech_reg = mech_register_init(global_auth_settings);
 	passdbs_init();
 	userdbs_init();
 	passdb_mock_mod_init();
 	password_schemes_register_all();
 	password_schemes_allow_weak(TRUE);
 
-	auths_preinit(simple_set.event, global_auth_settings, mech_reg, protocols);
+	auth_sasl_preinit(global_auth_settings);
+	auths_preinit(simple_set.event, global_auth_settings, protocols);
 	auths_init();
 	auth_token_init();
+	auth_sasl_init();
 
 	auth_penalty = auth_penalty_init("missing");
 }
@@ -72,7 +73,6 @@ void test_auth_init(void)
 void test_auth_deinit(void)
 {
 	auth_penalty_deinit(&auth_penalty);
-	mech_otp_deinit();
 	db_oauth2_deinit();
 	auths_deinit();
 	auth_token_deinit();
@@ -81,9 +81,8 @@ void test_auth_deinit(void)
 	passdbs_deinit();
 	userdbs_deinit();
 	event_unref(&auth_event);
-	mech_deinit(global_auth_settings);
-	mech_register_deinit(&mech_reg);
 	auths_free();
+	auth_sasl_deinit();
 	settings_free(global_auth_settings);
 	settings_simple_deinit(&simple_set);
 	i_unlink_if_exists("auth-token-secret.dat");

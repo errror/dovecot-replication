@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -31,9 +31,8 @@
  */
 
 static void
-params_write(const struct message_part_param *params,
-	unsigned int params_count, string_t *str,
-	bool default_charset)
+params_write(const struct message_part_param *params, unsigned int params_count,
+	     string_t *str, bool default_charset, enum imap_quote_flags qflags)
 {
 	unsigned int i;
 	bool seen_charset;
@@ -54,9 +53,9 @@ params_write(const struct message_part_param *params,
 		if (default_charset &&
 			strcasecmp(params[i].name, "charset") == 0)
 			seen_charset = TRUE;
-		imap_append_string(str, params[i].name);
+		imap_append_string(str, params[i].name, qflags);
 		str_append_c(str, ' ');
-		imap_append_string(str, params[i].value);
+		imap_append_string(str, params[i].value, qflags);
 	}
 	if (default_charset && !seen_charset) {
 		if (i > 0)
@@ -70,11 +69,13 @@ params_write(const struct message_part_param *params,
 static int
 part_write_bodystructure_siblings(const struct message_part *part,
 				  string_t *dest, bool extended,
+				  enum imap_quote_flags qflags,
 				  const char **error_r)
 {
 	for (; part != NULL; part = part->next) {
 		str_append_c(dest, '(');
-		if (imap_bodystructure_write(part, dest, extended, error_r) < 0)
+		if (imap_bodystructure_write(part, dest, extended, qflags,
+					     error_r) < 0)
 			return -1;
 		str_append_c(dest, ')');
 	}
@@ -83,18 +84,19 @@ part_write_bodystructure_siblings(const struct message_part *part,
 
 static void
 part_write_bodystructure_common(const struct message_part_data *data,
-				     string_t *str)
+				string_t *str, enum imap_quote_flags qflags)
 {
 	str_append_c(str, ' ');
 	if (data->content_disposition == NULL)
 		str_append(str, "NIL");
 	else {
 		str_append_c(str, '(');
-		imap_append_string(str, data->content_disposition);
+		imap_append_string(str, data->content_disposition, qflags);
 
 		str_append_c(str, ' ');
 		params_write(data->content_disposition_params,
-			data->content_disposition_params_count, str, FALSE);
+			data->content_disposition_params_count, str,
+			FALSE, qflags);
 
 		str_append_c(str, ')');
 	}
@@ -107,22 +109,23 @@ part_write_bodystructure_common(const struct message_part_data *data,
 
 		i_assert(*lang != NULL);
 		str_append_c(str, '(');
-		imap_append_string(str, *lang);
+		imap_append_string(str, *lang, qflags);
 		lang++;
 		while (*lang != NULL) {
 			str_append_c(str, ' ');
-			imap_append_string(str, *lang);
+			imap_append_string(str, *lang, qflags);
 			lang++;
 		}
 		str_append_c(str, ')');
 	}
 
 	str_append_c(str, ' ');
-	imap_append_nstring_nolf(str, data->content_location);
+	imap_append_nstring_nolf(str, data->content_location, qflags);
 }
 
 static int part_write_body_multipart(const struct message_part *part,
 				     string_t *str, bool extended,
+				     enum imap_quote_flags qflags,
 				     const char **error_r)
 {
 	const struct message_part_data *data = part->data;
@@ -131,7 +134,8 @@ static int part_write_body_multipart(const struct message_part *part,
 
 	if (part->children != NULL) {
 		if (part_write_bodystructure_siblings(part->children, str,
-						      extended, error_r) < 0)
+						      extended, qflags,
+						      error_r) < 0)
 			return -1;
 	} else {
 		/* no parts in multipart message,
@@ -144,7 +148,7 @@ static int part_write_body_multipart(const struct message_part *part,
 	}
 
 	str_append_c(str, ' ');
-	imap_append_string(str, data->content_subtype);
+	imap_append_string(str, data->content_subtype, qflags);
 
 	if (!extended)
 		return 0;
@@ -153,9 +157,9 @@ static int part_write_body_multipart(const struct message_part *part,
 
 	str_append_c(str, ' ');
 	params_write(data->content_type_params,
-		data->content_type_params_count, str, FALSE);
+		data->content_type_params_count, str, FALSE, qflags);
 
-	part_write_bodystructure_common(data, str);
+	part_write_bodystructure_common(data, str, qflags);
 	return 0;
 }
 
@@ -190,8 +194,10 @@ static bool part_is_truncated(const struct message_part *part)
 	return FALSE;
 }
 
-static int part_write_body(const struct message_part *part,
-			   string_t *str, bool extended, const char **error_r)
+static int
+part_write_body(const struct message_part *part, string_t *str,
+		bool extended, enum imap_quote_flags qflags,
+		const char **error_r)
 {
 	const struct message_part_data *data = part->data;
 	bool text;
@@ -216,9 +222,9 @@ static int part_write_body(const struct message_part *part,
 			str_append(str, "\"text\" \"plain\"");
 		} else {
 			text = (strcasecmp(data->content_type, "text") == 0);
-			imap_append_string(str, data->content_type);
+			imap_append_string(str, data->content_type, qflags);
 			str_append_c(str, ' ');
-			imap_append_string(str, data->content_subtype);
+			imap_append_string(str, data->content_subtype, qflags);
 		}
 		bool part_is_text = (part->flags & MESSAGE_PART_FLAG_TEXT) != 0;
 		if (text != part_is_text) {
@@ -230,15 +236,15 @@ static int part_write_body(const struct message_part *part,
 	/* ("content type param key" "value" ...) */
 	str_append_c(str, ' ');
 	params_write(data->content_type_params,
-		data->content_type_params_count, str, text);
+		data->content_type_params_count, str, text, qflags);
 
 	str_append_c(str, ' ');
-	imap_append_nstring_nolf(str, data->content_id);
+	imap_append_nstring_nolf(str, data->content_id, qflags);
 	str_append_c(str, ' ');
-	imap_append_nstring_nolf(str, data->content_description);
+	imap_append_nstring_nolf(str, data->content_description, qflags);
 	str_append_c(str, ' ');
 	if (data->content_transfer_encoding != NULL)
-		imap_append_string(str, data->content_transfer_encoding);
+		imap_append_string(str, data->content_transfer_encoding, qflags);
 	else
 		str_append(str, "\"7bit\"");
 	str_printfa(str, " %"PRIuUOFF_T, part->body_size.virtual_size);
@@ -256,11 +262,12 @@ static int part_write_body(const struct message_part *part,
 		child_data = part->children->data;
 
 		str_append(str, " (");
-		imap_envelope_write(child_data->envelope, str);
+		imap_envelope_write(child_data->envelope, str, qflags);
 		str_append(str, ") ");
 
 		if (part_write_bodystructure_siblings(part->children, str,
-						      extended, error_r) < 0)
+						      extended, qflags,
+						      error_r) < 0)
 			return -1;
 		str_printfa(str, " %u", part->body_size.lines);
 	}
@@ -273,19 +280,22 @@ static int part_write_body(const struct message_part *part,
 	/* "md5" ("content disposition" ("disposition" "params"))
 	   ("body" "language" "params") "location" */
 	str_append_c(str, ' ');
-	imap_append_nstring_nolf(str, data->content_md5);
-	part_write_bodystructure_common(data, str);
+	imap_append_nstring_nolf(str, data->content_md5, qflags);
+	part_write_bodystructure_common(data, str, qflags);
 	return 0;
 }
 
 int imap_bodystructure_write(const struct message_part *part,
 			     string_t *dest, bool extended,
+			     enum imap_quote_flags qflags,
 			     const char **error_r)
 {
-	if ((part->flags & MESSAGE_PART_FLAG_MULTIPART) != 0)
-		return part_write_body_multipart(part, dest, extended, error_r);
-	else
-		return part_write_body(part, dest, extended, error_r);
+	if ((part->flags & MESSAGE_PART_FLAG_MULTIPART) != 0) {
+		return part_write_body_multipart(part, dest, extended, qflags,
+						 error_r);
+	} else {
+		return part_write_body(part, dest, extended, qflags, error_r);
+	}
 }
 
 /*
@@ -637,6 +647,13 @@ imap_bodystructure_parse_args_int(
 				 part->children->next == NULL);
 		}
 
+		/* envelope (args[0]) is read below, but args[1] is dereferenced
+		   first. Make sure args[0] exists before indexing args[1] so a
+		   truncated list doesn't read past its IMAP_ARG_EOL terminator. */
+		if (IMAP_ARG_IS_EOL(&args[0])) {
+			*error_r = "Envelope list expected";
+			return -1;
+		}
 		if (!imap_arg_get_list(&args[1], &list_args)) {
 			*error_r = "Child bodystructure list expected";
 			return -1;
@@ -722,7 +739,7 @@ int imap_bodystructure_parse_full(const char *bodystructure,
 	input = i_stream_create_from_data(bodystructure, strlen(bodystructure));
 	(void)i_stream_read(input);
 
-	parser = imap_parser_create(input, NULL, SIZE_MAX);
+	parser = imap_parser_create(input, NULL, SIZE_MAX, NULL);
 	ret = imap_parser_finish_line(parser, 0,
 				      IMAP_PARSE_FLAG_LITERAL_TYPE, &args);
 	if (ret < 0) {
@@ -763,6 +780,25 @@ int imap_bodystructure_parse(const char *bodystructure,
 /*
  * IMAP BODYSTRUCTURE to BODY conversion
  */
+
+/* NOTE: The functions below walk the parsed imap_arg tree recursively, one
+   stack frame per level of list nesting, and there is deliberately no depth
+   limit here. The BODYSTRUCTURE string being converted is not arbitrary input:
+   it can only have been written by
+
+    - imap_bodystructure_write() from a message_part tree built by
+      message-parser, whose nesting is capped by
+      message_parser_settings.max_nested_mime_parts (defaulting to
+      MESSAGE_PARSER_DEFAULT_MAX_NESTED_MIME_PARTS), or
+    - imapc_args_to_bodystructure(), which first parses the remote server's
+      BODYSTRUCTURE with imap_bodystructure_parse_args() - capped by
+      BODYSTRUCTURE_MAX_PARENTHESIS_NESTING - and re-serializes the result, so
+      an over-nested reply from the server never reaches the cache.
+
+   An input nested deeper than that means the cache file has been corrupted or
+   the parser limits have been changed. Adding a limit here wouldn't help
+   either case: it would only turn the corruption into a different error, while
+   breaking any mail that the write path had legitimately accepted. */
 
 static bool str_append_nstring(string_t *str, const struct imap_arg *arg)
 {
@@ -972,7 +1008,7 @@ int imap_body_parse_from_bodystructure(const char *bodystructure,
 	input = i_stream_create_from_data(bodystructure, strlen(bodystructure));
 	(void)i_stream_read(input);
 
-	parser = imap_parser_create(input, NULL, SIZE_MAX);
+	parser = imap_parser_create(input, NULL, SIZE_MAX, NULL);
 	ret = imap_parser_finish_line(parser, 0, IMAP_PARSE_FLAG_NO_UNESCAPE |
 				      IMAP_PARSE_FLAG_LITERAL_TYPE, &args);
 	if (ret < 0) {

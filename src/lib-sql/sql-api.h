@@ -84,7 +84,11 @@ struct sql_settings {
 
 extern const struct setting_parser_info sql_setting_parser_info;
 
+/* Called when query finished, note that result will be automatically
+ * unreferenced after callback finishes. */
 typedef void sql_query_callback_t(struct sql_result *result, void *context);
+/* Called when commit finished, note that result will be freed after
+ * callback finishes. */
 typedef void sql_commit_callback_t(const struct sql_commit_result *result, void *context);
 
 void sql_drivers_init(void);
@@ -114,7 +118,8 @@ int sql_connect(struct sql_db *db);
 void sql_disconnect(struct sql_db *db);
 
 /* Escape the given string if needed and return it. */
-const char *sql_escape_string(struct sql_db *db, const char *string);
+int sql_escape_string(struct sql_db *db, const char *string,
+		      const char **output_r, const char **error_r);
 /* Escape the given data as a string. */
 const char *sql_escape_blob(struct sql_db *db,
 			    const unsigned char *data, size_t size);
@@ -123,7 +128,7 @@ const char *sql_escape_blob(struct sql_db *db,
 void sql_exec(struct sql_db *db, const char *query);
 /* Execute SQL query and return result in callback. If fields list is given,
    the returned fields are validated to be of correct type, and you can use
-   sql_result_next_row_get() */
+   sql_result_next_row_get().  The callback is never called immediately. */
 void sql_query(struct sql_db *db, const char *query,
 	       sql_query_callback_t *callback, void *context);
 #define sql_query(db, query, callback, context) \
@@ -229,7 +234,7 @@ struct sql_transaction_context *sql_transaction_begin(struct sql_db *db);
 /* Don't require transaction to be atomic. Currently this is implemented only
    with Cassandra to use UNLOGGED BATCH operations. */
 void sql_transaction_set_non_atomic(struct sql_transaction_context *ctx);
-/* Commit transaction. */
+/* Commit transaction. The callback is never called immediately. */
 void sql_transaction_commit(struct sql_transaction_context **ctx,
 			    sql_commit_callback_t *callback, void *context);
 #define sql_transaction_commit(ctx, callback, context) \

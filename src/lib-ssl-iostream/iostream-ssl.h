@@ -38,6 +38,30 @@ enum ssl_iostream_flags {
 	SSL_IOSTREAM_FLAG_DISABLE_CA_FILES = BIT(1),
 };
 
+enum ssl_iostream_cert_validity {
+	/* SSL certificate is valid. */
+	SSL_IOSTREAM_CERT_VALIDITY_OK,
+	/* SSL certificate has not been received. */
+	SSL_IOSTREAM_CERT_VALIDITY_NO_CERT,
+	/* SSL certificate is invalid/untrusted. */
+	SSL_IOSTREAM_CERT_VALIDITY_INVALID,
+	/* SSL certificate is valid, but it doesn't match the name. */
+	SSL_IOSTREAM_CERT_VALIDITY_NAME_MISMATCH,
+};
+
+enum ssl_iostream_state {
+	/* Handshake is finished and successful. */
+	SSL_IOSTREAM_STATE_OK,
+	/* Handshake has not finished yet. */
+	SSL_IOSTREAM_STATE_HANDSHAKING,
+	/* Handshake failed due to some error unrelated to SSL certificate. */
+	SSL_IOSTREAM_STATE_HANDSHAKE_FAILURE,
+	/* SSL certificate is missing/invalid/untrusted. */
+	SSL_IOSTREAM_STATE_INVALID_CERT,
+	/* SSL certificate is valid, but it doesn't match the name. */
+	SSL_IOSTREAM_STATE_NAME_MISMATCH,
+};
+
 struct ssl_iostream_cert {
 	struct settings_file cert;
 	struct settings_file key;
@@ -89,10 +113,19 @@ struct ssl_iostream_settings {
 /* Load SSL module */
 int ssl_module_load(const char **error_r);
 
-/* Returns 0 if ok, -1 and sets error_r if failed. The returned error string
-   becomes available via ssl_iostream_get_last_error(). The callback most
-   likely should be calling ssl_iostream_check_cert_validity(). */
-typedef int
+/* Returns the system default CA file and directory paths, honoring the same
+   SSL_CERT_FILE / SSL_CERT_DIR environment overrides as
+   SSL_CTX_set_default_verify_paths(). Either may be set to NULL if not
+   available. Useful for TLS backends (e.g. OpenLDAP/GnuTLS) that don't load the
+   system trust store on their own. */
+int ssl_iostream_get_default_ca_paths(const char **file_r, const char **dir_r,
+				      const char **error_r);
+
+/* If returned state is not SSL_IOSTREAM_STATE_OK, error_r is also returned.
+   The returned error string becomes available via
+   ssl_iostream_get_last_error(). The callback most likely should be calling
+   ssl_iostream_check_cert_validity(). */
+typedef enum ssl_iostream_state
 ssl_iostream_handshake_callback_t(const char **error_r, void *context);
 /* Called when TLS SNI becomes available. */
 typedef int ssl_iostream_sni_callback_t(const char *name, const char **error_r,
@@ -173,12 +206,20 @@ void ssl_iostream_set_sni_callback(struct ssl_iostream *ssl_io,
 void ssl_iostream_change_context(struct ssl_iostream *ssl_io,
 				 struct ssl_iostream_context *ctx);
 
+/* Returns the SSL iostream (handshake) state. */
+enum ssl_iostream_state
+ssl_iostream_get_state(const struct ssl_iostream *ssl_io);
+
+/* Returns TRUE if SSL iostream handshake is finished and certificate is valid.
+   This is the same as state being SSL_IOSTREAM_STATE_OK. */
 bool ssl_iostream_is_handshaked(const struct ssl_iostream *ssl_io);
-/* Returns TRUE if the remote cert is invalid, or handshake callback returned
-   failure. */
-bool ssl_iostream_has_handshake_failed(const struct ssl_iostream *ssl_io);
-bool ssl_iostream_has_valid_client_cert(const struct ssl_iostream *ssl_io);
-bool ssl_iostream_has_client_cert(struct ssl_iostream *ssl_io);
+/* Returns TRUE if SSL (client or server) certificate was received,
+   valid or not. */
+bool ssl_iostream_has_cert(struct ssl_iostream *ssl_io);
+/* Returns TRUE if a valid SSL (client or server) certificate was received.
+   Certificate name validity isn't checked, ssl_iostream_cert_match_name() must
+   be used for that. */
+bool ssl_iostream_has_valid_cert(const struct ssl_iostream *ssl_io);
 /* Checks certificate validity based, also performs name checking. Called by
    default in handshake, unless handshake callback is set with
    ssl_iostream_check_cert_validity().
@@ -186,11 +227,12 @@ bool ssl_iostream_has_client_cert(struct ssl_iostream *ssl_io);
    Host should be set as the name you want to validate the certificate name(s)
    against. Usually this is the host name you connected to.
 
-   This function is same as calling ssl_iostream_has_valid_client_cert()
+   This function is same as calling ssl_iostream_has_valid_cert()
    and ssl_iostream_cert_match_name().
  */
-int ssl_iostream_check_cert_validity(struct ssl_iostream *ssl_io,
-				     const char *host, const char **error_r);
+enum ssl_iostream_cert_validity
+ssl_iostream_check_cert_validity(struct ssl_iostream *ssl_io,
+				 const char *host, const char **error_r);
 /* Returns TRUE if the given name matches the SSL stream's certificate.
    The returned reason is a human-readable string explaining what exactly
    matched the name, or why nothing matched. Note that this function works

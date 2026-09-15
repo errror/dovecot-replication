@@ -23,9 +23,11 @@ print '#include "unichar.h"'."\n";
 print '#include "uri-util.h"'."\n";
 print '#include "hash-method.h"'."\n";
 print '#include "settings.h"'."\n";
+print '#include "master-interface.h"'."\n";
 print '#include "message-header-parser.h"'."\n";
 print '#include "imap-urlauth-worker-common.h"'."\n";
 print '#include "mailbox-list.h"'."\n";
+print '#include "doc.h"'."\n";
 print '#include "all-settings.h"'."\n";
 print '#include <unistd.h>'."\n";
 print '#define CONFIG_BINARY'."\n";
@@ -65,15 +67,21 @@ foreach my $file (@ARGV) {
           /struct .*_default_settings = \{/ ||
           /struct setting_keyvalue.*_default_settings_keyvalue\[\] = \{/) {
         # settings-related structure - copy.
+        # For variable definitions (containing = {), add __attribute__((weak))
+        # so ASAN doesn't report ODR violations when the same symbol is also
+        # present in a dlopen()'d plugin .so.
+        s/(\w+(?:\[\])?)(\s*=\s*\{)/$1 __attribute__((weak))$2/ if /= \{/ && !/^\s*static\b/;
         $state = "copy-to-end-of-block";
       } elsif (/^struct service_settings (.*) = \{/) {
         # service settings - copy and add to list of services.
+        s/(\w+(?:\[\])?)(\s*=\s*\{)/$1 __attribute__((weak))$2/ if !/^\s*static\b/;
         $state = "copy-to-end-of-block";
         push @services, $1;
       } elsif (/^const struct setting_keyvalue (.*_defaults)\[\] = \{/) {
         # service's default settings as keyvalues - copy and add to list of
         # defaults.
         $service_defaults{$1} = 1;
+        s/(\w+(?:\[\])?)(\s*=\s*\{)/$1 __attribute__((weak))$2/ if !/^\s*static\b/;
         $state = "copy-to-end-of-block";
       } elsif (/^const struct setting_parser_info (.*) = \{/) {
         # info structure for settings
@@ -82,6 +90,7 @@ foreach my $file (@ARGV) {
         # Add forward declaration for the info struct. This may be needed by
         # the ext_check() functions.
         $externs .= "extern const struct setting_parser_info $cur_name;\n";
+        s/(\w+(?:\[\])?)(\s*=\s*\{)/$1 __attribute__((weak))$2/ if !/^\s*static\b/;
         $state = "copy-to-end-of-block";
       } elsif (/\/\* <settings checks> \*\//) {
         # Anything inside <settings check> ... </settings check> is copied.
@@ -104,6 +113,7 @@ foreach my $file (@ARGV) {
       $write = 1;
       $state = "root" if (!/\\$/);
     } elsif ($state eq "copy-to-end-of-settings-checks") {
+      s/(\w+(?:\[\])?)(\s*=\s*\{)/$1 __attribute__((weak))$2/ if /^const .*= \{/;
       $code .= $_;
       if (/\/\* <\/settings checks> \*\//) {
         $state = "root";

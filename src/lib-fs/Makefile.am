@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libfs.la
 
 AM_CPPFLAGS = \
@@ -42,11 +44,10 @@ headers = \
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
-noinst_PROGRAMS = $(test_programs)
-
 test_programs = \
 	test-fs-metawrap \
-	test-fs-posix
+	test-fs-posix \
+	test-fs-abort
 
 test_deps = \
 	$(noinst_LTLIBRARIES) \
@@ -54,12 +55,13 @@ test_deps = \
 	../lib-settings/libsettings.la \
 	../lib-dns/libdns.la \
 	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 
 test_libs = \
 	$(test_deps) \
-	$(MODULE_LIBS)
+	$(LIBDOVECOT_TEST_LIBS)
 
 test_fs_metawrap_SOURCES = test-fs-metawrap.c
 test_fs_metawrap_LDADD = $(test_libs)
@@ -69,7 +71,6 @@ test_fs_posix_SOURCES = test-fs-posix.c
 test_fs_posix_LDADD = $(test_libs)
 test_fs_posix_DEPENDENCIES = $(test_deps)
 
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done
+test_fs_abort_SOURCES = test-fs-abort.c
+test_fs_abort_LDADD = $(test_libs)
+test_fs_abort_DEPENDENCIES = $(test_deps)

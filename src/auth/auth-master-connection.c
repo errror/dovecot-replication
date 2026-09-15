@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "buffer.h"
@@ -17,6 +17,7 @@
 #include "userdb.h"
 #include "userdb-blocking.h"
 #include "passdb-cache.h"
+#include "auth-cache.h"
 #include "auth-request-handler.h"
 #include "auth-client-connection.h"
 #include "auth-master-connection.h"
@@ -154,12 +155,57 @@ static int master_input_request(struct auth_master_connection *conn,
 	return 1;
 }
 
+static int master_input_cache_status(struct auth_master_connection *conn,
+				     const char *const *args)
+{
+	string_t *str;
+	bool reset = FALSE;
+	unsigned int i;
+
+	/* <id> [reset] */
+	if (args[0] == NULL) {
+		e_error(conn->conn.event, "BUG: doveadm sent broken CACHE-STATUS");
+		return -1;
+	}
+	for (i = 1; args[i] != NULL; i++) {
+		if (strcmp(args[i], "reset") == 0)
+			reset = TRUE;
+		else {
+			e_error(conn->conn.event,
+				"BUG: doveadm sent unknown CACHE-STATUS arg: %s",
+				args[i]);
+			return -1;
+		}
+	}
+
+	str = t_str_new(128);
+	str_printfa(str, "OK\t%s", args[0]);
+	if (passdb_cache != NULL) {
+		struct auth_cache_status status;
+
+		auth_cache_get_status(passdb_cache, &status);
+		str_printfa(str, "\thits=%u\tmisses=%u",
+			    status.hit_count, status.miss_count);
+		str_printfa(str, "\tpos_entries=%u\tneg_entries=%u",
+			    status.pos_entries, status.neg_entries);
+		str_printfa(str, "\tpos_size=%llu\tneg_size=%llu",
+			    status.pos_size, status.neg_size);
+		str_printfa(str, "\tused_size=%zu\tmax_size=%zu",
+			    status.used_size, status.max_size);
+		if (reset)
+			auth_cache_reset_counters(passdb_cache);
+	}
+	str_append_c(str, '\n');
+	o_stream_nsend(conn->conn.output, str_data(str), str_len(str));
+	return 1;
+}
+
 static int master_input_cache_flush(struct auth_master_connection *conn,
 				     const char *const *args)
 {
 	unsigned int count;
 
-	/* <id> [<user> [<user> [..]] */
+	/* <id> [<user-mask> [<user-mask> [..]] */
 	if (args[0] == NULL) {
 		e_error(conn->conn.event, "BUG: doveadm sent broken CACHE-FLUSH");
 		return -1;
@@ -195,7 +241,7 @@ static int master_input_auth_request(struct auth_master_connection *conn,
 		return -1;
 	}
 
-	auth_request = auth_request_new_dummy(auth_event);
+	auth_request = auth_request_new(auth_event);
 	auth_request->id = id;
 	auth_request->master = conn;
 	auth_master_connection_ref(conn);
@@ -401,6 +447,7 @@ static void auth_master_pass_proxy_finish(bool success,
 static void pass_callback(enum passdb_result result,
 			  const unsigned char *credentials ATTR_UNUSED,
 			  size_t size ATTR_UNUSED,
+			  const char *scheme ATTR_UNUSED,
 			  struct auth_request *auth_request)
 {
 	int ret;
@@ -447,7 +494,7 @@ static int master_input_pass(struct auth_master_connection *conn,
 			return -1;
 		e_info(auth_request->event, "passdb: %s", error);
 		pass_callback(PASSDB_RESULT_USER_UNKNOWN, uchar_empty_ptr, 0,
-			      auth_request);
+			      NULL, auth_request);
 	} else if (conn->userdb_restricted_uid != 0) {
 		/* no permissions to do this lookup */
 		e_error(auth_request->event,
@@ -456,7 +503,7 @@ static int master_input_pass(struct auth_master_connection *conn,
 			"a PASS lookup: %s",
 			auth_restricted_reason(conn));
 		pass_callback(PASSDB_RESULT_INTERNAL_FAILURE, uchar_empty_ptr,
-			      0, auth_request);
+			      0, NULL, auth_request);
 	} else {
 		auth_request_set_state(auth_request,
 				       AUTH_REQUEST_STATE_MECH_CONTINUE);
@@ -618,7 +665,7 @@ static int master_input_list(struct auth_master_connection *conn,
 		return 1;
 	}
 
-	auth_request = auth_request_new_dummy(auth_event);
+	auth_request = auth_request_new(auth_event);
 	auth_request->id = id;
 	auth_request->master = conn;
 	auth_master_connection_ref(conn);
@@ -682,6 +729,8 @@ static int auth_master_input_args(struct connection *_conn,
 			return master_input_request(conn, args + 1);
 		if (strcmp(args[0], "CACHE-FLUSH") == 0)
 			return master_input_cache_flush(conn, args + 1);
+		if (strcmp(args[0], "CACHE-STATUS") == 0)
+			return master_input_cache_status(conn, args + 1);
 		if (strcmp(args[0], "CPID") == 0) {
 			e_error(_conn->event,
 				"Authentication client trying to connect to "

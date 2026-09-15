@@ -29,10 +29,13 @@ typedef void verify_plain_continue_callback_t(struct auth_request *request,
 					      verify_plain_callback_t *callback);
 typedef void lookup_credentials_callback_t(enum passdb_result result,
 					   const unsigned char *credentials,
-					   size_t size,
+					   size_t size, const char *scheme,
 					   struct auth_request *request);
-typedef void set_credentials_callback_t(bool success,
-					struct auth_request *request);
+
+struct passdb_parameters {
+	/* Enable cache for the passdb */
+	bool use_cache;
+};
 
 struct passdb_module_interface {
 	const char *name;
@@ -40,6 +43,7 @@ struct passdb_module_interface {
 	/* Create a new passdb_module based on the settings looked up via the
 	   given event. */
 	int (*preinit)(pool_t pool, struct event *event,
+		       const struct passdb_parameters *passdb_params,
 		       struct passdb_module **module_r, const char **error_r);
 	void (*init)(struct passdb_module *module);
 	void (*deinit)(struct passdb_module *module);
@@ -52,11 +56,6 @@ struct passdb_module_interface {
 	   auth_request->credentials. */
 	void (*lookup_credentials)(struct auth_request *request,
 				   lookup_credentials_callback_t *callback);
-
-	/* Update credentials */
-	void (*set_credentials)(struct auth_request *request,
-				const char *new_credentials,
-				set_credentials_callback_t *callback);
 };
 
 struct passdb_module {
@@ -91,16 +90,22 @@ const char *passdb_result_to_string(enum passdb_result result);
 bool passdb_get_credentials(struct auth_request *auth_request,
 			    const char *input, const char *input_scheme,
 			    const unsigned char **credentials_r,
-			    size_t *size_r);
+			    size_t *size_r, const char **scheme_r);
 
 void passdb_handle_credentials(enum passdb_result result,
 			       const char *password, const char *scheme,
 			       lookup_credentials_callback_t *callback,
                                struct auth_request *auth_request);
 
+int passdb_set_cache_key(struct passdb_module *module,
+			 const struct passdb_parameters *passdb_params,
+			 pool_t pool, const char *query,
+			 const ARRAY_TYPE(const_string) *fields,
+			 const char *exclude_driver, const char **error_r);
+
 struct passdb_module *
 passdb_preinit(pool_t pool, struct event *event,
-	       const struct auth_passdb_settings *set);
+	       const struct auth_passdb_settings *set, bool use_cache);
 void passdb_init(struct passdb_module *passdb);
 void passdb_deinit(struct passdb_module *passdb);
 

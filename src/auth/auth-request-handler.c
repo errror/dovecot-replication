@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "ioloop.h"
@@ -10,7 +10,9 @@
 #include "str.h"
 #include "strescape.h"
 #include "str-sanitize.h"
+#include "sasl-server.h"
 #include "master-interface.h"
+#include "auth-sasl.h"
 #include "auth-penalty.h"
 #include "auth-request.h"
 #include "auth-token.h"
@@ -565,12 +567,48 @@ auth_penalty_callback(unsigned int penalty, struct auth_request *request)
 	}
 }
 
+static int
+auth_request_handler_find_mech(struct auth_request_handler *handler,
+			       struct auth_request *request,
+			       const char *mech_name,
+			       const struct sasl_server_mech **mech_r)
+{
+	struct auth *auth = auth_request_get_auth(request);
+	const struct sasl_server_mech *mech;
+
+	if (handler->token_auth) {
+		mech = auth->sasl_mech_dovecot_token;
+		if (strcmp(sasl_server_mech_get_name(mech), mech_name) == 0) {
+			*mech_r = mech;
+			return 0;
+		}
+		/* unsupported mechanism */
+		e_error(handler->conn->conn.event,
+			"BUG: Authentication client %u requested invalid "
+			"authentication mechanism %s (DOVECOT-TOKEN required)",
+			handler->client_pid,
+			str_sanitize(mech_name, AUTH_SASL_MAX_MECH_NAME_LEN));
+		return -1;
+	}
+
+	mech = sasl_server_mech_find(auth->sasl_inst, mech_name);
+	if (mech == NULL) {
+		/* unsupported mechanism */
+		e_error(handler->conn->conn.event,
+			"BUG: Authentication client %u requested unsupported "
+			"authentication mechanism %s", handler->client_pid,
+			str_sanitize(mech_name, AUTH_SASL_MAX_MECH_NAME_LEN));
+		return -1;
+	}
+	*mech_r = mech;
+	return 0;
+}
+
 int auth_request_handler_auth_begin(struct auth_request_handler *handler,
 				    const char *const *args)
 {
-	const struct mech_module *mech;
 	struct auth_request *request;
-	const char *name, *arg, *initial_resp;
+	const char *mech_name, *name, *arg, *initial_resp;
 	void *initial_resp_data;
 	unsigned int id;
 	buffer_t *buf;
@@ -585,31 +623,9 @@ int auth_request_handler_auth_begin(struct auth_request_handler *handler,
 			"sent broken AUTH request", handler->client_pid);
 		return -1;
 	}
+	mech_name = args[1];
 
-	if (handler->token_auth) {
-		mech = &mech_dovecot_token;
-		if (strcmp(args[1], mech->mech_name) != 0) {
-			/* unsupported mechanism */
-			e_error(handler->conn->conn.event,
-				"BUG: Authentication client %u requested invalid "
-				"authentication mechanism %s (DOVECOT-TOKEN required)",
-				handler->client_pid, str_sanitize(args[1], MAX_MECH_NAME_LEN));
-			return -1;
-		}
-	} else {
-		struct auth *auth_default = auth_default_protocol();
-		mech = mech_register_find(auth_default->reg, args[1]);
-		if (mech == NULL) {
-			/* unsupported mechanism */
-			e_error(handler->conn->conn.event,
-				"BUG: Authentication client %u requested unsupported "
-				"authentication mechanism %s", handler->client_pid,
-				str_sanitize(args[1], MAX_MECH_NAME_LEN));
-			return -1;
-		}
-	}
-
-	request = auth_request_new(mech, handler->conn->conn.event);
+	request = auth_request_new(handler->conn->event);
 	request->handler = handler;
 	request->connect_uid = handler->connect_uid;
 	request->client_pid = handler->client_pid;
@@ -662,7 +678,15 @@ int auth_request_handler_auth_begin(struct auth_request_handler *handler,
 		auth_request_unref(&request);
 		return -1;
 	}
-	auth_request_init(request);
+
+	const struct sasl_server_mech *mech;
+
+	if (auth_request_handler_find_mech(handler, request, mech_name,
+					   &mech) < 0) {
+		auth_request_unref(&request);
+		return -1;
+	}
+	auth_request_init_sasl(request, mech);
 
 	request->to_abort = timeout_add(MASTER_AUTH_SERVER_TIMEOUT_SECS * 1000,
 					auth_request_timeout, request);
@@ -727,6 +751,9 @@ int auth_request_handler_auth_begin(struct auth_request_handler *handler,
 			auth_request_handler_auth_fail_code(handler, request,
 				AUTH_CLIENT_FAIL_CODE_INVALID_BASE64,
 				"Invalid base64 data in initial response");
+			/* The base64 input came from untrusted client. It's
+			   an expected auth failure, so don't disconnect the
+			   auth client. */
 			return 1;
 		}
 		initial_resp_data =
@@ -799,7 +826,10 @@ int auth_request_handler_auth_continue(struct auth_request_handler *handler,
 			auth_request_handler_auth_fail_code(handler, request,
 				AUTH_CLIENT_FAIL_CODE_INVALID_BASE64,
 				"Invalid base64 data in continued response");
-			return -1;
+			/* The base64 input came from untrusted client. It's
+			   an expected auth failure, so don't disconnect the
+			   auth client. */
+			return 1;
 		}
 	}
 
@@ -829,7 +859,7 @@ static void auth_str_append_userdb_extra_fields(struct auth_request *request,
 		auth_str_add_keyvalue(dest, "master_user",
 				      request->fields.master_user);
 	}
-	auth_str_add_keyvalue(dest, "auth_mech", request->mech->mech_name);
+	auth_str_add_keyvalue(dest, "auth_mech", request->fields.mech_name);
 	if (*request->set->anonymous_username != '\0' &&
 	    strcmp(request->fields.user, request->set->anonymous_username) == 0) {
 		/* this is an anonymous login, either via ANONYMOUS
@@ -840,11 +870,16 @@ static void auth_str_append_userdb_extra_fields(struct auth_request *request,
 	/* generate auth_token when master service provided session_pid */
 	if (request->request_auth_token &&
 	    request->session_pid != (pid_t)-1) {
+		const char *auth_token_pid = dec2str(request->session_pid);
 		const char *auth_token =
-			auth_token_get(request->fields.protocol,
-				       dec2str(request->session_pid),
+			auth_token_get(request->fields.protocol, auth_token_pid,
 				       request->fields.user,
 				       request->fields.session_id);
+		e_debug(request->event, "Token requested: service=%s "
+			"username=%s session_pid=%s session_id=%s "
+			"token=%s", request->fields.protocol,
+			request->fields.user, auth_token_pid,
+			request->fields.session_id, auth_token);
 		auth_str_add_keyvalue(dest, "auth_token", auth_token);
 	}
 	if (request->fields.master_user != NULL) {
@@ -946,8 +981,14 @@ bool auth_request_handler_master_request(struct auth_request_handler *handler,
 		(void)auth_request_import_master(request, name, param);
 	}
 
-	/* verify session pid if specified and possible */
-	if (request->session_pid != (pid_t)-1 &&
+	/* verify session pid if specified and possible. Skip the check if a
+	   trusted (unrestricted) master connection vouches for it - an auth
+	   proxy (e.g. cluster) connects to auth on behalf of the session
+	   process, so the peer pid won't match session_pid. */
+	bool session_pid_vouched = request->session_pid_trusted &&
+		master->userdb_restricted_uid == 0;
+	if (!session_pid_vouched &&
+	    request->session_pid != (pid_t)-1 &&
 	    net_getunixcred(master->conn.fd_in, &cred) == 0 &&
 	    cred.pid != (pid_t)-1 && request->session_pid != cred.pid) {
 		e_error(master->conn.event,
@@ -992,6 +1033,11 @@ void auth_request_handler_cancel_request(struct auth_request_handler *handler,
 	request = hash_table_lookup(handler->requests, POINTER_CAST(client_id));
 	if (request != NULL)
 		auth_request_handler_remove(handler, request);
+
+	if (handler->conn->conn.minor_version >= AUTH_CLIENT_MINOR_VERSION_CANCELLED) {
+		const char *str = t_strdup_printf("CANCELLED\t%u", client_id);
+		handler->callback(str, handler->conn);
+	}
 }
 
 void auth_request_handler_flush_failures(bool flush_all)

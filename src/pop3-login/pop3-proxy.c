@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "connection.h"
@@ -44,10 +44,13 @@ static int proxy_send_login(struct pop3_client *client, struct ostream *output)
                         }
 		}
 
-		str_printfa(str, "XCLIENT ADDR=%s PORT=%u SESSION=%s TTL=%u "
+		str_printfa(str, "XCLIENT ADDR=%s PORT=%u "
+			    "DESTADDR=%s DESTPORT=%u SESSION=%s TTL=%u "
 			    "CLIENT-TRANSPORT=%s",
 			    net_ip2addr(&client->common.ip),
 			    client->common.remote_port,
+			    net_ip2addr(&client->common.local_ip),
+			    client->common.local_port,
 			    client_get_session_id(&client->common),
 			    client->common.proxy_ttl - 1,
 			    client->common.end_client_tls_secured ?
@@ -60,6 +63,7 @@ static int proxy_send_login(struct pop3_client *client, struct ostream *output)
 			str_append(str, " FORWARD=");
 			base64_encode(str_data(fwd), str_len(fwd), str);
 		}
+		e_info(client->common.event, "Send: %s", str_c(str));
 		str_append(str, "\r\n");
 		/* remote supports XCLIENT, send it */
 		o_stream_nsend(output, str_data(str), str_len(str));
@@ -81,17 +85,21 @@ static int proxy_send_login(struct pop3_client *client, struct ostream *output)
 
 	i_assert(client->common.proxy_sasl_client == NULL);
 	i_zero(&sasl_set);
+	sasl_set.event_parent = client->common.event;
 	sasl_set.authid = client->common.proxy_master_user != NULL ?
 		client->common.proxy_master_user : client->common.proxy_user;
 	sasl_set.authzid = client->common.proxy_user;
 	sasl_set.password = client->common.proxy_password;
+	sasl_set.protocol = "pop";
+	sasl_set.host = login_proxy_get_host(client->common.login_proxy);
+	sasl_set.port = login_proxy_get_port(client->common.login_proxy);
 	client->common.proxy_sasl_client =
 		dsasl_client_new(client->common.proxy_mech, &sasl_set);
 	mech_name = dsasl_client_mech_get_name(client->common.proxy_mech);
 
 	str_printfa(str, "AUTH %s ", mech_name);
 	if (dsasl_client_output(client->common.proxy_sasl_client,
-				&sasl_output, &len, &error) < 0) {
+				&sasl_output, &len, &error) != DSASL_CLIENT_RESULT_OK) {
 		const char *reason = t_strdup_printf(
 			"SASL mechanism %s init failed: %s",
 			mech_name, error);
@@ -117,10 +125,6 @@ pop3_proxy_continue_sasl_auth(struct client *client, struct ostream *output,
 			      const char *line)
 {
 	string_t *str;
-	const unsigned char *data;
-	size_t data_len;
-	const char *error;
-	int ret;
 
 	str = t_str_new(128);
 	if (base64_decode(line, strlen(line), str) < 0) {
@@ -131,26 +135,9 @@ pop3_proxy_continue_sasl_auth(struct client *client, struct ostream *output,
 			LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, reason);
 		return -1;
 	}
-	ret = dsasl_client_input(client->proxy_sasl_client,
-				 str_data(str), str_len(str), &error);
-	if (ret == 0) {
-		ret = dsasl_client_output(client->proxy_sasl_client,
-					  &data, &data_len, &error);
-	}
-	if (ret < 0) {
-		const char *reason = t_strdup_printf(
-			"Invalid authentication data: %s", error);
-		login_proxy_failed(client->login_proxy,
-				   login_proxy_get_event(client->login_proxy),
-				   LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, reason);
+	if (login_proxy_sasl_step(client, str) < 0)
 		return -1;
-	}
-	i_assert(ret == 0);
-
-	str_truncate(str, 0);
-	base64_encode(data, data_len, str);
 	str_append(str, "\r\n");
-
 	o_stream_nsend(output, str_data(str), str_len(str));
 	return 0;
 }
@@ -266,9 +253,11 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 		if (!str_begins_with(line, "+OK")) {
 			const char *reason = t_strdup_printf(
 				"XCLIENT failed: %s", str_sanitize(line, 160));
+			/* XCLIENT failure is some misconfiguration - don't try
+			   to reconnect. */
 			login_proxy_failed(client->login_proxy,
 				login_proxy_get_event(client->login_proxy),
-				LOGIN_PROXY_FAILURE_TYPE_REMOTE, reason);
+				LOGIN_PROXY_FAILURE_TYPE_REMOTE_CONFIG, reason);
 			return -1;
 		}
 		pop3_client->proxy_state = client->proxy_sasl_client == NULL ?
@@ -285,9 +274,14 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 		pop3_client->proxy_state = POP3_PROXY_LOGIN2;
 		return 0;
 	case POP3_PROXY_LOGIN2:
-		if (str_begins(line, "+ ", &sasl_value) &&
+		if (line[0] == '+' && (line[1] == '\0' || line[1] == ' ') &&
 		    client->proxy_sasl_client != NULL) {
-			/* continue SASL authentication */
+			/* continue SASL authentication. RFC-compliant servers
+			   send "+ <base64>"; but some implementations  omit the
+			   space. */
+			sasl_value = line + 1;
+			if (*sasl_value == ' ')
+				sasl_value++;
 			if (pop3_proxy_continue_sasl_auth(client, output,
 							  sasl_value) < 0)
 				return -1;
@@ -322,7 +316,7 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 	   shouldn't be a real problem since of course everyone will
 	   be using only Dovecot as their backend :) */
 	enum login_proxy_failure_type failure_type =
-		LOGIN_PROXY_FAILURE_TYPE_AUTH;
+		LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED;
 	if (!str_begins_with(line, "-ERR ")) {
 		client_send_reply(client, POP3_CMD_REPLY_ERROR,
 				  AUTH_FAILED_MSG);
@@ -333,6 +327,8 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 	} else if (pop3_proxy_parse_referral(client, line + 5, &line)) {
 		failure_type = LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT;
 	} else {
+		if (str_begins_with(line, "-ERR [IN-USE]"))
+			failure_type = LOGIN_PROXY_FAILURE_TYPE_AUTH_LIMIT_REACHED_REPLIED;
 		client_send_raw(client, t_strconcat(line, "\r\n", NULL));
 		line += 5;
 	}
@@ -366,6 +362,7 @@ pop3_proxy_send_failure_reply(struct client *client,
 		break;
 	case LOGIN_PROXY_FAILURE_TYPE_INTERNAL_CONFIG:
 	case LOGIN_PROXY_FAILURE_TYPE_REMOTE_CONFIG:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_NOT_REPLIED:
 		client_send_reply(client, POP3_CMD_REPLY_ERROR,
 				  LOGIN_PROXY_FAILURE_MSG);
 		break;
@@ -373,7 +370,8 @@ pop3_proxy_send_failure_reply(struct client *client,
 		/* [SYS/TEMP] prefix is already in the reason string */
 		client_send_reply(client, POP3_CMD_REPLY_ERROR, reason);
 		break;
-	case LOGIN_PROXY_FAILURE_TYPE_AUTH:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_LIMIT_REACHED_REPLIED:
 		/* reply was already sent */
 		break;
 	}

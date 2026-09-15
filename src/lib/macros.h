@@ -3,6 +3,10 @@
 
 /* several useful macros, mostly from glib.h */
 
+#ifdef __USE_ISOC11
+#  define typeof __typeof__
+#endif
+
 #ifndef NULL
 #  define NULL ((void *)0)
 #endif
@@ -123,6 +127,11 @@
 #else
 #  define ATTR_DEPRECATED(str)
 #endif
+#ifdef HAVE_ATTR_NONSTRING
+#  define ATTR_NONSTRING __attribute__((nonstring))
+#else
+#  define ATTR_NONSTRING
+#endif
 
 /* Macros to provide type safety for callback functions' context parameters.
    This is used like:
@@ -209,17 +218,13 @@
 #endif
 
 /* Provide macros for error handling. */
-#ifdef DISABLE_ASSERTS
-#  define i_assert(expr)
-#else
-#  define i_assert(expr)			STMT_START{			\
+#define i_assert(expr)			STMT_START{			\
      if (unlikely(!(expr)))						\
        i_panic("file %s: line %d (%s): assertion failed: (%s)",		\
 		__FILE__,						\
 		__LINE__,						\
 		__func__,					\
 		#expr);			}STMT_END
-#endif
 
 /* Convenience macro to test the versions of dovecot. */
 #define DOVECOT_PREREQ(maj, min, micro) \
@@ -291,5 +296,8 @@
    sizeof check. */
 #  define ENUM_NEGATE(x) ((unsigned int)(~(x)))
 #endif
+
+#define regexec(...) "Do not use libc regex, use lib-regex instead"
+#define regcomp(...) "Do not use libc regex, use lib-regex instead"
 
 #endif

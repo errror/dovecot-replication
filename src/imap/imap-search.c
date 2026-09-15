@@ -1,8 +1,9 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "ostream.h"
 #include "str.h"
+#include "strnum.h"
 #include "seq-range-array.h"
 #include "time-util.h"
 #include "imap-resp-code.h"
@@ -21,15 +22,15 @@ static int imap_search_deinit(struct imap_search_context *ctx);
 static int
 imap_partial_range_parse(struct imap_search_context *ctx, const char *str)
 {
-	ctx->partial1 = 0;
-	ctx->partial2 = 0;
-	for (; *str >= '0' && *str <= '9'; str++)
-		ctx->partial1 = ctx->partial1 * 10 + *str-'0';
-	if (*str != ':' || ctx->partial1 == 0)
+	const char *p;
+
+	/* Parse with overflow detection: accumulating into uint32_t by hand
+	   would silently wrap for values like 99999999999. */
+	if (str_parse_uint32(str, &ctx->partial1, &p) < 0 ||
+	    *p != ':' || ctx->partial1 == 0)
 		return -1;
-	for (str++; *str >= '0' && *str <= '9'; str++)
-		ctx->partial2 = ctx->partial2 * 10 + *str-'0';
-	if (*str != '\0' || ctx->partial2 == 0)
+	if (str_parse_uint32(p + 1, &ctx->partial2, &p) < 0 ||
+	    *p != '\0' || ctx->partial2 == 0)
 		return -1;
 
 	if (ctx->partial1 > ctx->partial2) {
@@ -49,8 +50,8 @@ search_parse_fetch_att(struct imap_search_context *ctx,
 
 	ctx->fetch_pool = pool_alloconly_create("search update fetch", 512);
 	if (imap_fetch_att_list_parse(ctx->cmd->client, ctx->fetch_pool,
-				      update_args, &ctx->fetch_ctx,
-				      &client_error) < 0) {
+				      update_args, ctx->cmd->utf8,
+				      &ctx->fetch_ctx, &client_error) < 0) {
 		client_send_command_error(ctx->cmd, t_strconcat(
 			"SEARCH UPDATE fetch-att: ", client_error, NULL));
 		pool_unref(&ctx->fetch_pool);
@@ -178,7 +179,7 @@ static void imap_search_result_save(struct imap_search_context *ctx)
 		/* too many updates */
 		string_t *str = t_str_new(256);
 		str_append(str, "* NO [NOUPDATE ");
-		imap_append_quoted(str, ctx->cmd->tag);
+		imap_append_quoted(str, ctx->cmd->tag, 0);
 		str_append_c(str, ']');
 		client_send_line(client, str_c(str));
 		ctx->return_options &= ENUM_NEGATE(SEARCH_RETURN_UPDATE);
@@ -285,7 +286,7 @@ static void imap_search_send_result(struct imap_search_context *ctx)
 
 	str = str_new(default_pool, 1024);
 	str_append(str, "* ESEARCH (TAG ");
-	imap_append_string(str, ctx->cmd->tag);
+	imap_append_string(str, ctx->cmd->tag, 0);
 	str_append_c(str, ')');
 
 	if (ctx->cmd->uid)

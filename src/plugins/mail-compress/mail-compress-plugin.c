@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -164,7 +164,7 @@ static int mail_compress_istream_opened(struct mail *_mail, struct istream **str
 		return zmail->module_ctx.super.istream_opened(_mail, stream);
 	}
 
-	handler = compression_detect_handler(*stream);
+	compression_detect_handler(*stream, &handler);
 	if (handler != NULL) {
 		if (handler->create_istream == NULL) {
 			mail_set_critical(_mail,
@@ -238,7 +238,10 @@ static int mail_compress_mail_save_finish(struct mail_save_context *ctx)
 	if (ret < 0)
 		return -1;
 
-	if (compression_detect_handler(input) != NULL) {
+	const struct compression_handler *handler;
+
+	compression_detect_handler(input, &handler);
+	if (handler != NULL) {
 		mail_storage_set_error(box->storage, MAIL_ERROR_NOTPOSSIBLE,
 			"Saving mails compressed by client isn't supported");
 		return -1;
@@ -367,9 +370,6 @@ static void mail_compress_mail_user_created(struct mail_user *user)
 	int ret;
 
 	zuser = p_new(user->pool, struct mail_compress_user, 1);
-	zuser->module_ctx.super = *v;
-	user->vlast = &zuser->module_ctx.super;
-	v->deinit = mail_compress_mail_user_deinit;
 
 	if (settings_get(user->event, &mail_compress_setting_parser_info, 0,
 			 &set, &error) < 0) {
@@ -391,6 +391,9 @@ static void mail_compress_mail_user_created(struct mail_user *user)
 	}
 	settings_free(set);
 
+	zuser->module_ctx.super = *v;
+	user->vlast = &zuser->module_ctx.super;
+	v->deinit = mail_compress_mail_user_deinit;
 	MODULE_CONTEXT_SET(user, mail_compress_user_module, zuser);
 }
 

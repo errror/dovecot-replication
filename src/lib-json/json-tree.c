@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -245,7 +245,7 @@ json_tree_node_add_value(struct json_tree_node *parent, const char *name,
 
 	jtnode = json_tree_node_create(parent, name);
 	jtnode->node.type = type;
-	jtnode->node.value = *jvalue;
+	jtnode->node.value.content_type = jvalue->content_type;
 	switch (jvalue->content_type) {
 	case JSON_CONTENT_TYPE_NONE:
 		break;
@@ -266,18 +266,29 @@ json_tree_node_add_value(struct json_tree_node *parent, const char *name,
 		jtnode->node.value.content.data = jdata;
 		break;
 	case JSON_CONTENT_TYPE_STREAM:
+		/* The tree owns this stream, hands it out through
+		   json_tree_node_get_str_istream(), and may serialize it more
+		   than once; every such read starts at the value's first
+		   byte. Reject a non-seekable stream here, where the caller
+		   that supplied it is still on the stack, rather than three
+		   layers down in json_generate_value(). */
+		i_assert(jvalue->content.stream->seekable);
 		if (!array_is_created(&jtree->istreams))
 			i_array_init(&jtree->istreams, 4);
 		array_append(&jtree->istreams, &jvalue->content.stream, 1);
+		jtnode->node.value.content.stream = jvalue->content.stream;
+		jtnode->node.value.stream_is_tree_resource = TRUE;
 		i_stream_ref(jvalue->content.stream);
 		break;
 	case JSON_CONTENT_TYPE_INTEGER:
+		jtnode->node.value.content.intnum = jvalue->content.intnum;
 		break;
 	case JSON_CONTENT_TYPE_TREE:
 		i_assert(jvalue->content.tree != jtree);
 		if (!array_is_created(&jtree->subtrees))
 			i_array_init(&jtree->subtrees, 4);
 		array_append(&jtree->subtrees, &jvalue->content.tree, 1);
+		jtnode->node.value.content.tree = jvalue->content.tree;
 		json_tree_ref(jvalue->content.tree);
 		break;
 	}
@@ -307,7 +318,7 @@ json_tree_node_add_data(struct json_tree_node *parent, const char *name,
 	struct json_value jvalue;
 	struct json_data jdata;
 
-	i_zero(&data);
+	i_zero(&jdata);
 	jdata.data = data;
 	jdata.size = size;
 
@@ -546,6 +557,22 @@ json_tree_node_get_child(const struct json_tree_node *jtnode)
 	return jtnode->node.value.content.list->head;
 }
 
+struct json_tree_node *
+json_tree_node_get_nth_child(const struct json_tree_node *jtnode, unsigned int n)
+{
+	struct json_tree_node *node;
+
+	i_assert(jtnode->node.value.content_type == JSON_CONTENT_TYPE_LIST);
+	if (jtnode->node.value.content.list == NULL)
+		return NULL;
+	if (jtnode->node.value.content.list->count <= n)
+		return NULL;
+	node = jtnode->node.value.content.list->head;
+	for (unsigned int i = 0; i < n; i++)
+		node = node->next;
+	return node;
+}
+
 unsigned int
 json_tree_node_get_child_count(const struct json_tree_node *jtnode)
 {
@@ -587,7 +614,7 @@ json_tree_node_get_child_with(const struct json_tree_node *jtnode,
 		return NULL;
 
 	child = jtnode->node.value.content.list->head;
-	while (child != NULL) {
+	for (; child != NULL; child = child->next) {
 		struct json_tree_node *member;
 
 		if (!json_node_is_object(&child->node))
@@ -597,13 +624,110 @@ json_tree_node_get_child_with(const struct json_tree_node *jtnode,
 			continue;
 		if (!json_tree_node_is_string(member))
 			continue;
-		if (strcmp(json_tree_node_get_str(member), value) == 0)
-			break;
+		/* json_tree_node_is_string() only checks the node's JSON
+		   type, not its content_type: a string value at or above the
+		   json_istream_read_tree_lazy_strings() threshold is stored
+		   as JSON_CONTENT_TYPE_STREAM, which json_tree_node_get_str()
+		   panics on. Such a member can't be compared here without
+		   draining it, so skip only that case rather than crash.
+		   STRING and DATA content are both fully materialized and
+		   directly comparable via json_node_get_data(). */
+		if (json_tree_node_get(member)->value.content_type ==
+		    JSON_CONTENT_TYPE_STREAM)
+			continue;
+		size_t size;
+		const unsigned char *data =
+			json_node_get_data(json_tree_node_get(member),
+					   &size);
 
-		child = child->next;
+		if (size == strlen(value) &&
+		    memcmp(data, value, size) == 0)
+			break;
 	}
 
 	return child;
+}
+
+static void
+json_tree_node_str_istream_unref(struct json_tree *jtree)
+{
+	json_tree_unref(&jtree);
+}
+
+int
+json_tree_node_get_str_istream(const struct json_tree_node *jtnode,
+			       struct istream **stream_r)
+{
+	const struct json_value *jvalue;
+
+	i_assert(jtnode != NULL);
+	jvalue = &jtnode->node.value;
+
+	switch (jvalue->content_type) {
+	case JSON_CONTENT_TYPE_STRING:
+		*stream_r = i_stream_create_from_data(
+			jvalue->content.str,
+			strlen(jvalue->content.str));
+		/* content.str points into the tree's pool; keep the tree
+		   alive for as long as the returned stream is. */
+		json_tree_ref(jtnode->tree);
+		i_stream_add_destroy_callback(
+			*stream_r, json_tree_node_str_istream_unref,
+			jtnode->tree);
+		break;
+	case JSON_CONTENT_TYPE_DATA:
+		*stream_r = i_stream_create_from_data(
+			jvalue->content.data->data,
+			jvalue->content.data->size);
+		/* Same pool-lifetime reasoning as the STRING case above. */
+		json_tree_ref(jtnode->tree);
+		i_stream_add_destroy_callback(
+			*stream_r, json_tree_node_str_istream_unref,
+			jtnode->tree);
+		break;
+	case JSON_CONTENT_TYPE_STREAM: {
+		/* The node's stream may share its underlying seekable parent
+		   with sibling (or even the same) node's streams, so a plain
+		   wrapper around it would let one node's read silently
+		   invalidate another's already-returned data pointer. Drain
+		   it into a private buffer instead: the returned stream is
+		   then fully independent, like the STRING/DATA cases above. */
+		struct istream *src = jvalue->content.stream;
+		buffer_t *buf;
+		const unsigned char *data;
+		size_t size;
+		int ret;
+
+		if (!src->seekable)
+			return -1;
+		i_stream_seek(src, 0);
+		buf = buffer_create_dynamic(default_pool, 128);
+		while ((ret = i_stream_read_more(src, &data, &size)) > 0) {
+			buffer_append(buf, data, size);
+			i_stream_skip(src, size);
+		}
+		/* The bytes behind a tree's STREAM-content node were already
+		   read once by the parser to build this (fully parsed) tree,
+		   so they can't still be in flight - a would-block 0 return
+		   here would mean the source stream lost data it already
+		   delivered once. */
+		i_assert(ret != 0);
+		if (src->stream_errno != 0) {
+			buffer_free(&buf);
+			return -1;
+		}
+		*stream_r = i_stream_create_copy_from_data(buf->data,
+							   buf->used);
+		buffer_free(&buf);
+		break;
+	}
+	default:
+		/* Type mismatch (number/bool/null/object/array): consistent
+		   with every other json_tree_node_get_*() accessor, which
+		   return -1 rather than abort. */
+		return -1;
+	}
+	return 0;
 }
 
 /*
@@ -675,6 +799,13 @@ json_tree_walk_next(struct json_tree_walker *twalker, bool *is_end_r)
 		}
 		*is_end_r = TRUE;
 		return tnode;
+	}
+
+	if (tnode == twalker->root) {
+		/* Finished the node the walk started from; don't continue to
+		   its siblings or parent. */
+		twalker->node_level = 0;
+		return NULL;
 	}
 
 	tnode_next = json_tree_node_get_next(tnode);

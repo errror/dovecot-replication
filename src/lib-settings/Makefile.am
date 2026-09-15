@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libsettings.la
 
 AM_CPPFLAGS = \
@@ -14,7 +16,8 @@ libsettings_la_SOURCES = \
 headers = \
 	settings.h \
 	settings-history.h \
-	settings-parser.h
+	settings-parser.h \
+	settings-consts.h
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
@@ -31,28 +34,26 @@ EXTRA_DIST = \
 	settings-history-core.txt \
 	settings-history.py
 
+pkglibexecdir = $(libexecdir)/dovecot
+pkglibexec_SCRIPTS = \
+	settings-history.py
+
 test_programs = \
 	test-settings-parser \
 	test-settings
 
-noinst_PROGRAMS = $(test_programs)
-
 test_libs = \
 	libsettings.la \
 	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib-dns/libdns.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 
 test_settings_parser_SOURCES = test-settings-parser.c
-test_settings_parser_LDADD = $(test_libs) $(DLLIB)
+test_settings_parser_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_settings_parser_DEPENDENCIES = $(test_libs)
 
 test_settings_SOURCES = test-settings.c
-test_settings_LDADD = $(test_libs) $(DLLIB)
+test_settings_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_settings_DEPENDENCIES = $(test_libs)
-
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done

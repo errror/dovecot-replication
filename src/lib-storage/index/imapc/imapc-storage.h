@@ -14,6 +14,7 @@ struct imapc_untagged_reply;
 struct imapc_command_reply;
 struct imapc_mailbox;
 struct imapc_storage_client;
+struct ssl_settings;
 
 typedef void imapc_storage_callback_t(const struct imapc_untagged_reply *reply,
 				      struct imapc_storage_client *client);
@@ -56,6 +57,9 @@ struct imapc_storage_client {
 
 	struct imapc_client *client;
 	const struct imapc_settings *set;
+	/* Client SSL settings, or NULL if imapc_ssl=no. Used only for
+	   checking whether an existing storage can be reused. */
+	const struct ssl_settings *ssl_set;
 
 	ARRAY(struct imapc_storage_event_callback) untagged_callbacks;
 
@@ -67,6 +71,8 @@ struct imapc_storage_client {
 	/* Authentication reply was received (success or failure) */
 	bool auth_returned:1;
 	bool destroying:1;
+	/* Client was created with IMAPC_PARAMETER_CLIENT_DISABLED */
+	bool disabled:1;
 };
 
 struct imapc_storage_attribute_context {
@@ -274,5 +280,6 @@ void imapc_untagged_fetch_update_flags(struct imapc_mailbox *mbox,
 				       struct mail_index_view *view,
 				       uint32_t lseq);
 bool imapc_mailbox_fetch_state(struct imapc_mailbox *mbox, uint32_t first_uid);
+int imapc_server_unselect(struct imapc_storage_client *client);
 
 #endif

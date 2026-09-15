@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "common.h"
 #include "array.h"
@@ -32,21 +32,18 @@
 
 static void service_monitor_start_extra_avail(struct service *service);
 static void service_status_more(struct service_process *process,
-				const struct master_status *status);
+				unsigned int status_available_count);
 static void service_monitor_listen_start_force(struct service *service);
 
 static void service_process_idle_kill_timeout(struct service_process *process)
 {
-	struct master_status status;
-
 	e_error(process->service->event, "Process %s is ignoring idle SIGINT",
 		dec2str(process->pid));
 
 	timeout_remove(&process->to_idle_kill);
 
 	/* assume this process is busy */
-	i_zero(&status);
-	service_status_more(process, &status);
+	service_status_more(process, 0);
 	process->available_count = 0;
 }
 
@@ -104,7 +101,7 @@ static void service_kill_idle(struct service *service)
 }
 
 static void service_status_more(struct service_process *process,
-				const struct master_status *status)
+				unsigned int status_available_count)
 {
 	struct service *service = process->service;
 
@@ -123,9 +120,9 @@ static void service_status_more(struct service_process *process,
 			      service->process_idling);
 	}
 	process->total_count +=
-		process->available_count - status->available_count;
+		process->available_count - status_available_count;
 
-	if (status->available_count != 0)
+	if (status_available_count != 0)
 		return;
 
 	/* process used up all of its clients */
@@ -135,8 +132,17 @@ static void service_status_more(struct service_process *process,
 
 	if (service->type == SERVICE_TYPE_LOGIN &&
 	    service->process_avail == 0 &&
-	    service->process_count == service->process_limit)
+	    service_active_process_count(service) >= service->process_limit)
 		service_login_notify(service, TRUE);
+
+	if (service->set->reuse_port &&
+	    service->last_drop_warning +
+	    SERVICE_DROP_WARN_INTERVAL_SECS <= ioloop_time) {
+		service->last_drop_warning = ioloop_time;
+		e_warning(service->event,
+			  "client_limit (%u) reached, client connections are being dropped (pid=%s, reuse_port=yes)",
+			  service->client_limit, dec2str(process->pid));
+	}
 
 	/* we may need to start more */
 	service_monitor_start_extra_avail(service);
@@ -187,7 +193,8 @@ static void service_status_less(struct service_process *process)
 		/* process can accept more clients again */
 		if (service->process_avail++ == 0)
 			service_monitor_listen_stop(service);
-		i_assert(service->process_avail <= service->process_count);
+		i_assert(service->process_avail +
+			 service->retired_process_count <= service->process_count);
 	}
 	if (service->type == SERVICE_TYPE_LOGIN)
 		service_login_notify(service, FALSE);
@@ -226,10 +233,23 @@ service_status_input_one(struct service *service,
 	/* first status notification */
 	timeout_remove(&process->to_status);
 
-	if (process->available_count != status->available_count) {
+	if (status->available_count == UINT_MAX) {
+		/* restart_request_count reached. If this is a service with
+		   client_limit > 1, we mark it as retired and stop counting
+		   it towards process_limit. */
+		if (!process->retired && service->client_limit > 1) {
+			process->retired = TRUE;
+			service->retired_process_count++;
+			i_assert(service->retired_process_count <= service->process_count);
+		}
+		if (process->available_count != 0) {
+			process->available_count = 0;
+			service_status_more(process, 0);
+		}
+	} else if (process->available_count != status->available_count) {
 		if (process->available_count > status->available_count) {
 			/* process started servicing some more clients */
-			service_status_more(process, status);
+			service_status_more(process, status->available_count);
 		} else {
 			/* process finished servicing some clients */
 			service_status_less(process);
@@ -383,21 +403,42 @@ static void service_drop_connections(struct service_listener *l)
 static void service_accept(struct service_listener *l)
 {
 	struct service *service = l->service;
+	int fd = -1;
 
 	i_assert(service->process_avail == 0);
 
-	if (service->process_count == service->process_limit) {
+	if (service_active_process_count(service) >= service->process_limit) {
 		/* we've reached our limits, new clients will have to
 		   wait until there are more processes available */
 		service_drop_connections(l);
 		return;
 	}
 
-	/* create a child process and let it accept() this connection */
-	if (service_process_create(service) == NULL)
+	if (service->client_limit == 1 &&
+	    (l->type == SERVICE_LISTENER_INET ||
+	     (l->type == SERVICE_LISTENER_UNIX &&
+	      !l->set.fileset.pid_listener))) {
+		/* pre-accept() a client fd for services with client_limit=1,
+		   so we can rapidly create new processes as needed. */
+		fd = net_accept(l->fd, NULL, NULL);
+		if (fd == -1) {
+			if (!NET_ACCEPT_ENOCONN(errno))
+				e_error(service->event, "net_accept() failed: %m");
+			return;
+		}
+		fd_close_on_exec(fd, TRUE);
+	} else {
+		/* the created child process will accept() the connection */
+	}
+
+	if (service_process_create(service, fd, l) == NULL) {
+		/* failed to create the process */
 		service_monitor_throttle(service);
-	else
+	} else if (fd == -1) {
 		service_monitor_listen_stop(service);
+	}
+	if (fd != -1)
+		net_disconnect(fd);
 }
 
 static bool
@@ -407,14 +448,16 @@ service_monitor_start_count(struct service *service, unsigned int limit)
 
 	i_assert(service->set->process_min_avail >= service->process_avail);
 
+	unsigned int active_process_count =
+		service_active_process_count(service);
 	count = service->set->process_min_avail - service->process_avail;
-	if (service->process_count + count > service->process_limit)
-		count = service->process_limit - service->process_count;
+	if (active_process_count + count > service->process_limit)
+		count = service->process_limit - active_process_count;
 	if (count > limit)
 		count = limit;
 
 	for (i = 0; i < count; i++) {
-		if (service_process_create(service) == NULL) {
+		if (service_process_create(service, -1, NULL) == NULL) {
 			service_monitor_throttle(service);
 			break;
 		}
@@ -450,7 +493,7 @@ static void service_monitor_prefork_timeout(struct service *service)
 static void service_monitor_start_extra_avail(struct service *service)
 {
 	if (service->process_avail >= service->set->process_min_avail ||
-	    service->process_count >= service->process_limit ||
+	    service_active_process_count(service) >= service->process_limit ||
 	    service->list->destroying)
 		return;
 
@@ -480,7 +523,7 @@ static void service_monitor_listen_start_force(struct service *service)
 	timeout_remove(&service->to_drop_warning);
 
 	array_foreach_elem(&service->listeners, l) {
-		if (l->io == NULL && l->fd != -1)
+		if (l->io == NULL && l->fd != -1 && !service->set->reuse_port)
 			l->io = io_add(l->fd, IO_READ, service_accept, l);
 	}
 }
@@ -488,7 +531,7 @@ static void service_monitor_listen_start_force(struct service *service)
 void service_monitor_listen_start(struct service *service)
 {
 	if (service->process_avail > 0 || service->to_throttle != NULL ||
-	    (service->process_count == service->process_limit &&
+	    (service_active_process_count(service) >= service->process_limit &&
 	     service->listen_pending))
 		return;
 
@@ -597,7 +640,7 @@ void services_monitor_start(struct service_list *service_list)
 		service_monitor_start_extra_avail(service);
 
 	if (service_list->log->status_fd[0] != -1) {
-		if (service_process_create(service_list->log) != NULL)
+		if (service_process_create(service_list->log, -1, NULL) != NULL)
 			service_monitor_listen_stop(service_list->log);
 	}
 
@@ -605,7 +648,7 @@ void services_monitor_start(struct service_list *service_list)
 	array_foreach_elem(&service_list->services, service) {
 		if (service->type == SERVICE_TYPE_STARTUP &&
 		    service->status_fd[0] != -1) {
-			if (service_process_create(service) != NULL)
+			if (service_process_create(service, -1, NULL) != NULL)
 				service_monitor_listen_stop(service);
 		}
 	}
@@ -886,7 +929,7 @@ void services_monitor_reap_children(void)
 			} else if (service == service->list->log &&
 				   service->process_count == 0) {
 				/* log service must always be running */
-				if (service_process_create(service) == NULL)
+				if (service_process_create(service, -1, NULL) == NULL)
 					service_monitor_throttle(service);
 			} else {
 				service_monitor_listen_start(service);

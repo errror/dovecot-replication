@@ -8,7 +8,7 @@ enum var_expand_parameter_value_type {
 	VAR_EXPAND_PARAMETER_VALUE_TYPE_COUNT
 };
 
-union var_expand_parameter_value {
+struct var_expand_parameter_value {
 	const char *str;
 	intmax_t num;
 };
@@ -18,7 +18,7 @@ struct var_expand_parameter {
 	const char *key;
 	int idx;
 	enum var_expand_parameter_value_type value_type;
-	union var_expand_parameter_value value;
+	struct var_expand_parameter_value value;
 };
 
 struct var_expand_filter {
@@ -33,6 +33,9 @@ int var_expand_find_filter(const char *name, var_expand_filter_func_t **fn_r);
 
 int expansion_filter_if(const struct var_expand_statement *stmt, struct var_expand_state *state,
 			const char **error_r);
+int expansion_filter_switch(const struct var_expand_statement *stmt,
+			    struct var_expand_state *state,
+			    const char **error_r);
 int
 expansion_filter_encrypt(const struct var_expand_statement *stmt,
 			 struct var_expand_state *state, const char **error_r);

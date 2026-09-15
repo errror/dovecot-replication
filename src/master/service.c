@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "common.h"
 #include "ioloop.h"
@@ -18,7 +18,11 @@
 #include <unistd.h>
 #include <signal.h>
 
-#define SERVICE_DIE_TIMEOUT_MSECS (1000*6)
+/* How long to wait after config reload before killing processes that aren't
+   dying by themself. Keep this higher than
+   MASTER_SERVICE_DEFAULT_DIE_TIMEOUT_MSECS, and higher than any die timeout
+   set with master_service_set_die_timeout_msecs(). */
+#define SERVICE_DIE_TIMEOUT_MSECS (1000*35)
 #define SERVICE_LOGIN_NOTIFY_MIN_INTERVAL_SECS 2
 
 HASH_TABLE_TYPE(pid_process) service_pids;
@@ -156,9 +160,19 @@ service_create_inet_listeners(struct service *service,
 			return -1;
 
 		for (i = 0; i < ips_count; i++) {
-			l = service_create_one_inet_listener(service, set,
-							     address, &ips[i]);
-			array_push_back(&service->listeners, &l);
+			/* reuse_port=yes listeners create all of the processes'
+			   listeners at startup. */
+			unsigned int j, count;
+			if (!service->set->reuse_port)
+				count = 1;
+			else
+				count = service->process_limit;
+			for (j = 0; j < count; j++) {
+				l = service_create_one_inet_listener(service, set,
+								     address, &ips[i]);
+				l->reuse_port_process_index = j;
+				array_push_back(&service->listeners, &l);
+			}
 		}
 		service->have_inet_listeners = TRUE;
 	}
@@ -316,8 +330,10 @@ service_create_real(pool_t pool, struct event *event,
 
 		if (strstr(unix_listeners[i]->path, "%{pid}") == NULL)
 			array_push_back(&service->listeners, &l);
-		else
+		else {
+			l->set.fileset.pid_listener = TRUE;
 			array_push_back(&service->unix_pid_listeners, &l);
+		}
 	}
 	for (i = 0; i < fifo_count; i++) {
 		if (fifo_listeners[i]->mode == 0) {
@@ -384,6 +400,12 @@ service_lookup_type(struct service_list *service_list, enum service_type type)
 			return service;
 	}
 	return NULL;
+}
+
+unsigned int service_active_process_count(struct service *service)
+{
+	i_assert(service->retired_process_count <= service->process_count);
+	return service->process_count - service->retired_process_count;
 }
 
 static bool service_want(const struct master_settings *master_set,
@@ -569,6 +591,11 @@ void service_login_notify(struct service *service, bool all_processes_full)
 	if (service->last_login_full_notify == all_processes_full ||
 	    service->login_notify_fd == -1)
 		return;
+	if (service->set->reuse_port) {
+		/* With reuse_port=yes the processes don't care about sibling
+		   processes' state. */
+		return;
+	}
 
 	/* change the state always immediately. it's cheap. */
 	service->last_login_full_notify = all_processes_full;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -21,7 +21,7 @@
 extern struct mail_storage mdbox_storage;
 extern struct mailbox mdbox_mailbox;
 
-static struct event_category event_category_mdbox = {
+struct event_category event_category_mdbox = {
 	.name = "mdbox",
 	.parent = &event_category_storage,
 };
@@ -55,9 +55,6 @@ int mdbox_storage_create(struct mail_storage *_storage,
 		*error_r = "mdbox: mailbox_root_directory_name must not be empty";
 		return -1;
 	}
-
-	_storage->unique_root_dir =
-		p_strdup(_storage->pool, ns->list->mail_set->mail_path);
 
 	dir = mailbox_list_get_root_forced(ns->list, MAILBOX_LIST_PATH_TYPE_DIR);
 	storage->storage_dir = p_strconcat(_storage->pool, dir,
@@ -476,14 +473,13 @@ struct mail_storage mdbox_storage = {
 	.set_info = &mdbox_setting_parser_info,
 
 	.v = {
-		mdbox_storage_alloc,
-		mdbox_storage_create,
-		mdbox_storage_destroy,
-		NULL,
-		mdbox_storage_autodetect,
-		mdbox_mailbox_alloc,
-		mdbox_purge,
-		mail_storage_list_index_rebuild,
+		.alloc = mdbox_storage_alloc,
+		.create = mdbox_storage_create,
+		.destroy = mdbox_storage_destroy,
+		.autodetect = mdbox_storage_autodetect,
+		.mailbox_alloc = mdbox_mailbox_alloc,
+		.purge = mdbox_purge,
+		.list_index_rebuild = mail_storage_list_index_rebuild,
 	}
 };
 

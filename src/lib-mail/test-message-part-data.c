@@ -1,4 +1,4 @@
-/* Copyright (c) 2023-2025 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -14,12 +14,13 @@ static int message_parse_stream(pool_t pool, struct istream *input,
 	struct message_parser_ctx *parser;
 	struct message_block block;
 
+	struct message_part_data_limits limits = MESSAGE_PART_DATA_LIMITS_INIT;
 	i_zero(&block);
 	parser = message_parser_init(pool, input, set);
 	while ((ret = message_parser_parse_next_block(parser, &block)) > 0)
 		if (parse_data)
 			message_part_data_parse_from_header(pool, block.part,
-							    block.hdr);
+							    &limits, block.hdr);
 	message_parser_deinit(&parser, parts_r);
 	test_assert(input->stream_errno == 0);
 	return ret;
@@ -133,7 +134,7 @@ static void test_message_inline_without_filename(void)
 		"\n"
 		"xxxdata\n";
 
-	test_message_part_attachment(test_name, input, FALSE, NULL);
+	test_message_part_attachment(test_name, input, FALSE, "");
 }
 
 static void test_message_attachment_without_filename(void)
@@ -146,7 +147,7 @@ static void test_message_attachment_without_filename(void)
 		"\n"
 		"xxxdata\n";
 
-	test_message_part_attachment(test_name, input, TRUE, NULL);
+	test_message_part_attachment(test_name, input, TRUE, "");
 }
 
 static void test_message_attachment_with_cd_filename_star(void)

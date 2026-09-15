@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -95,13 +95,13 @@ static int mailbox_log_open(struct mailbox_log *log)
 	i_assert(log->fd == -1);
 
 	log->open_timestamp = ioloop_time;
-	log->fd = open(log->filepath, O_RDWR | O_APPEND);
+	log->fd = open(log->filepath, O_RDWR | O_APPEND | O_NOFOLLOW);
 	if (log->fd != -1)
 		return 0;
 
 	/* try to create it */
 	old_mode = umask(0666 ^ log->mode);
-	log->fd = open(log->filepath, O_RDWR | O_APPEND | O_CREAT, 0666);
+	log->fd = open(log->filepath, O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW, 0666);
 	umask(old_mode);
 
 	if (log->fd == -1) {
@@ -254,7 +254,11 @@ mailbox_log_iter_next(struct mailbox_log_iter *iter)
 			iter->failed = TRUE;
 			return NULL;
 		}
-		if (ret == 0) {
+		if ((size_t)ret < sizeof(iter->buf[0])) {
+			/* EOF. If ret > 0, the file ends with a partially
+			   written record. Just ignore it - it's either a
+			   crashed/truncated write, or a write that is still
+			   in progress. */
 			if (!mailbox_log_iter_open_next(iter))
 				return NULL;
 			iter->idx = iter->count = 0;

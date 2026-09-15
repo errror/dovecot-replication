@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -87,16 +87,53 @@ static void test_auth_cache_parse_key(void)
 		/* test that other providers are dropped */
 		{ "%{a}%{provider:user}", "%{a}" },
 	};
-	const char *cache_key;
+	const char *cache_key, *error;
 	unsigned int i;
 
 	test_begin("auth cache parse key");
 
 	for (i = 0; i < N_ELEMENTS(tests); i++) {
-		cache_key = auth_cache_parse_key(pool_datastack_create(),
-						 tests[i].in);
+		test_assert_idx(auth_cache_parse_key_and_fields(
+			pool_datastack_create(), tests[i].in, NULL, NULL,
+			&cache_key, &error) == 0, i);
 		test_assert_strcmp_idx(cache_key, tests[i].out, i);
 	}
+
+	test_end();
+}
+
+static void test_auth_cache_parse_key_errors(void)
+{
+	static const struct {
+		const char *in, *out;
+	} tests_bad[] = {
+		{ "%u", "auth-cache: %u: Cache key must contain at least one variable" },
+		{ "foobar", "auth-cache: foobar: Cache key must contain at least one variable" },
+		{ "%{test", "auth-cache: var_expand_program_create(%{test) " \
+			    "failed: syntax error, unexpected " },
+	};
+	const char *cache_key, *error;
+	unsigned int i;
+
+	test_begin("auth cache parse key errors");
+
+	for (i = 0; i < N_ELEMENTS(tests_bad); i++) {
+		test_assert_idx(auth_cache_parse_key_and_fields(
+			pool_datastack_create(), tests_bad[i].in, NULL, NULL,
+			&cache_key, &error) < 0, i);
+		const char *expected = tests_bad[i].out;
+		/* Bison uses different error on different versions */
+		if (strstr(error, "$end") != NULL) {
+			expected = t_strconcat(expected,
+					"$end, expecting CCBRACE or PIPE", NULL);
+		} else if (strstr(error, "end of file") != NULL) {
+			expected = t_strconcat(expected,
+					"end of file, expecting CCBRACE or PIPE",
+					NULL);
+		}
+		test_assert_strcmp_idx(error, expected, i);
+	}
+
 	test_end();
 }
 
@@ -106,9 +143,12 @@ int main(void)
 	auth_event = event_create(NULL);
 	static void (*const test_functions[])(void) = {
 		test_auth_cache_parse_key,
+		test_auth_cache_parse_key_errors,
 		NULL
 	};
+
 	int ret = test_run(test_functions);
+
 	event_unref(&auth_event);
 	return ret;
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #define AUTH_REQUEST_FIELDS_CONST
 
@@ -9,16 +9,21 @@
 #include "base64.h"
 #include "auth-request.h"
 
-void auth_request_fields_init(struct auth_request *request)
+void auth_request_fields_alloc(struct auth_request *request)
 {
 	request->fields.extra_fields = auth_fields_init(request->pool);
-	if (request->mech != NULL) {
-		request->fields.mech_name = request->mech->mech_name;
-		event_add_str(request->event, "mechanism",
-			      request->mech->mech_name);
-	}
 	/* Default to "insecure" until it's changed later */
 	event_add_str(request->event, "transport", "insecure");
+}
+
+void auth_request_fields_init(struct auth_request *request)
+{
+	if (request->sasl.req.mech != NULL) {
+		request->fields.mech_name =
+			sasl_server_mech_get_name(request->sasl.req.mech);
+		event_add_str(request->event, "mechanism",
+			      request->fields.mech_name);
+	}
 }
 
 static void
@@ -208,8 +213,11 @@ bool auth_request_import_info(struct auth_request *request,
 		fields->client_id = p_strdup(request->pool, value);
 		event_add_str(event, "client_id", value);
 	} else if (strcmp(key, "forward_fields") == 0) {
-		auth_fields_import_prefixed(fields->extra_fields,
-					    "forward_", value, 0);
+		if (auth_fields_import_prefixed(fields->extra_fields,
+						"forward_", value, 0) < 0) {
+			e_error(request->event,
+				"Invalid forward_fields: %s", value);
+		}
 		/* make sure the forward_ fields aren't deleted by
 		   auth_fields_rollback() if the first passdb lookup fails. */
 		auth_fields_snapshot(fields->extra_fields);
@@ -318,9 +326,9 @@ bool auth_request_import(struct auth_request *request,
 	} else if (strcmp(key, "mech") == 0) {
 		fields->mech_name = p_strdup(request->pool, value);
 		event_add_str(request->event, "mechanism", value);
-	} else if (str_begins(key, "passdb_", &key))
+	} else if (str_begins(key, "passdb_", &key) && key[0] != '\0')
 		auth_fields_add(fields->extra_fields, key, value, 0);
-	else if (str_begins(key, "userdb_", &key)) {
+	else if (str_begins(key, "userdb_", &key) && key[0] != '\0') {
 		if (fields->userdb_reply == NULL)
 			auth_request_init_userdb_reply(request);
 		auth_fields_add(fields->userdb_reply, key, value, 0);

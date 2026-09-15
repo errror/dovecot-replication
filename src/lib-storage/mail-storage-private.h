@@ -74,6 +74,14 @@ struct mail_storage_vfuncs {
 	   rebuild the index. */
 	int (*list_index_rebuild)(struct mail_storage *storage,
 				  enum mail_storage_list_index_rebuild_reason reason);
+	/* Returns TRUE if this already existing storage can be used also for
+	   the given mailbox list, i.e. their settings are compatible. This is
+	   called only for storages using the same storage class. If unset,
+	   storages with MAIL_STORAGE_CLASS_FLAG_UNIQUE_ROOT are reused only
+	   when their mail_path setting is the same, while other storages are
+	   always reused. */
+	bool (*storage_match)(struct mail_storage *storage,
+			      struct mailbox_list *list);
 };
 
 union mail_storage_module_context {
@@ -84,7 +92,9 @@ union mail_storage_module_context {
 enum mail_storage_class_flags {
 	/* mailboxes are files, not directories */
 	MAIL_STORAGE_CLASS_FLAG_MAILBOX_IS_FILE	= 0x01,
-	/* root_dir points to a unique directory */
+	/* Storage state is tied to a specific mail root, so different roots
+	   can't share the same storage and mails can't be renamed between
+	   two storages. */
 	MAIL_STORAGE_CLASS_FLAG_UNIQUE_ROOT	= 0x02,
 	/* mailbox_open_stream() is supported */
 	MAIL_STORAGE_CLASS_FLAG_OPEN_STREAMS	= 0x04,
@@ -110,6 +120,11 @@ enum mail_storage_class_flags {
 	MAIL_STORAGE_CLASS_FLAG_NO_LIST_DELETES	= 0x400,
 	/* Storage creates a secondary index */
 	MAIL_STORAGE_CLASS_FLAG_SECONDARY_INDEX	= 0x800,
+	/* Storage's mailboxes have no records of their own in the mailbox list
+	   index. The records with their names belong to another storage's
+	   mailboxes, so their cached status and metadata must neither be read
+	   nor updated. */
+	MAIL_STORAGE_CLASS_FLAG_NO_LIST_INDEX_CACHE = 0x1000,
 };
 
 struct mail_binary_cache {
@@ -137,6 +152,11 @@ struct mail_storage_error {
 
 struct mail_storage {
 	const char *name;
+	/* Name of the settings filter used for looking up this storage's
+	   settings. NULL is the same as using name. This is used by storages
+	   that are just a different view into another storage, and which
+	   therefore must use the exact same settings. */
+	const char *set_filter_name;
 	enum mail_storage_class_flags class_flags;
 	/* Fields that the storage backend can get by other means than parsing
 	   the message header/body. For example the imapc backend can lookup
@@ -160,9 +180,6 @@ struct mail_storage {
 	int obj_refcount;
 	/* Linked list of all mailboxes in the storage */
 	struct mailbox *mailboxes;
-	/* A "root dir" to enable storage sharing.  It is only ever used for
-	 * uniqueness checking (via strcmp) and never used as a path. */
-	const char *unique_root_dir;
 
 	/* Last error set in mail_storage_set_critical(). */
 	char *last_internal_error;
@@ -390,9 +407,23 @@ struct mailbox_index_first_saved {
 };
 
 struct mailbox {
+	/* Mailbox's "storage name". This uses the hierarchy separator from
+	   mailbox_list_get_hierarchy_sep(). It's mUTF-7 encoded, if
+	   mailbox_list_utf8=no. Special characters are encoded using
+	   mailbox_list_storage_escape_char. The namespace prefix is not
+	   included in this name. */
 	const char *name;
-	/* mailbox's virtual name (from mail_namespace_get_vname()) */
+	/* Mailbox's "virtual name". This uses the hierarchy separator from
+	   mail_namespace_get_vname(). It's always UTF-8 encoded. Special
+	   characters are encoded using mailbox_list_visible_escape_char.
+	   (Storage name's special characters are not encoded.) The namespace
+	   prefix is included in this name. This virtual name will be used
+	   as the visible name in e.g. doveadm output. For IMAP it is still
+	   encoded into mUTF-7, unless IMAP4rev2 / UTF-8 extensions are
+	   enabled. The vname is always stored as NFC normalized. */
 	const char *vname;
+	/* Same as vname, but before NFC normalization. */
+	const char *vname_raw;
 	struct mail_storage *storage;
 	struct mailbox_list *list;
 	struct event *event;
@@ -509,12 +540,23 @@ struct mailbox {
 	   corrupted mailbox name. Try to revert to the previously known good
 	   name. */
 	bool corrupted_mailbox_name:1;
-	/* mailbox_open() returned MAIL_ERROR_NOTFOUND because the mailbox
-	   doesn't have the LOOKUP ACL right. */
+	/* The ACL plugin determined that the session does not hold the
+	   LOOKUP right on this mailbox. Set by acl_mailbox_exists() whether
+	   or not it goes on to answer MAILBOX_EXISTENCE_NONE - READ or
+	   INSERT alone can still let the box exist for SUBSCRIBE and the
+	   METADATA commands. Not limited to mailbox_open() - any vfunc that
+	   ends up calling exists() (e.g. a bare mailbox_exists() probe, or
+	   delete/rename failing with MAIL_ERROR_NOTFOUND via
+	   acl_mailbox_fail_not_found()) can set this. */
 	bool acl_no_lookup_right:1;
 	/* mailbox_alloc() opened a different mailbox than asked (e.g. virtual
 	   plugin opened the backend mailbox). */
 	bool mailbox_not_original:1;
+	/* The mailbox name provided through mailbox_alloc() changed through NFC
+	   normalization */
+	bool mailbox_name_changed_by_nfc:1;
+	/* Already handling mailbox NFC normalization notification. */
+	bool notifying_nfc_name_change:1;
 };
 
 struct mail_vfuncs {
@@ -610,6 +652,8 @@ struct mail_private {
 	bool autoexpunged:1;
 	/* mail created by mailbox_search_*() */
 	bool search_mail:1;
+	/* mail_opened event has been sent for this mail/seq */
+	bool mail_opened_event_sent:1;
 };
 
 struct mailbox_list_context {
@@ -894,6 +938,14 @@ int mailbox_create_missing_dir(struct mailbox *box,
 bool mailbox_is_autocreated(struct mailbox *box);
 /* Returns TRUE if mailbox is autosubscribed. */
 bool mailbox_is_autosubscribed(struct mailbox *box);
+
+/* Force mailbox rename for Unicode NFC normalization. If the target already
+   exists, the new name is suffixed with a GUID. The final name is returned in
+   vname_new_r. Returns 1 if rename was performed, 0 if no rename was performed,
+   and -1 upon error. */
+int mailbox_rename_nfc_forced(struct mailbox_list *list, const char *vname_raw,
+			      const char *vname_nfc, const char **vname_new_r,
+			      const char **error_r);
 
 /* Returns -1 if error, 0 if failed with EEXIST, 1 if ok */
 int mailbox_create_fd(struct mailbox *box, const char *path, int flags,

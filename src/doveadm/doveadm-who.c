@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,7 +8,7 @@
 #include "hash.h"
 #include "str.h"
 #include "strescape.h"
-#include "master-service.h"
+#include "version.h"
 #include "doveadm.h"
 #include "doveadm-print.h"
 #include "doveadm-who.h"
@@ -49,10 +49,10 @@ static unsigned int who_user_hash(const struct who_user *user)
 	unsigned int hash = str_hash(user->service);
 
 	if (user->username[0] != '\0')
-		hash += str_hash(user->username);
+		hash ^= str_hash(user->username);
 	else {
 		who_user_ip(user, &ip);
-		hash += net_ip_hash(&ip);
+		hash ^= net_ip_hash(&ip);
 	}
 	return hash;
 }
@@ -452,8 +452,7 @@ who_print_line(struct who_context *ctx, struct doveadm_who_iter *iter,
 
 	for (alt_idx = 0; line->alt_usernames[alt_idx] != NULL; alt_idx++)
 		doveadm_print(line->alt_usernames[alt_idx]);
-	for (; alt_idx < iter->alt_username_fields_count; alt_idx++)
-		doveadm_print("");
+	doveadm_print_empty(iter->alt_username_fields_count - alt_idx);
 }
 
 static void cmd_who(struct doveadm_cmd_context *cctx)

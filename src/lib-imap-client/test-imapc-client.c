@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -10,6 +10,7 @@
 #include "unlink-directory.h"
 #include "sleep.h"
 #include "test-common.h"
+#include "test-dir.h"
 #include "test-subprocess.h"
 #include "imapc-client-private.h"
 #include "settings.h"
@@ -70,10 +71,6 @@ test_generate_settings(const char *port, const char *connection_timeout_interval
 
 	return settings;
 }
-
-static const struct imapc_parameters imapc_params = {
-	.temp_path_prefix = ".test-tmp/",
-};
 
 static enum imapc_command_state test_imapc_cmd_last_reply_pop(void)
 {
@@ -264,7 +261,7 @@ static int test_run_server(test_server_init_t *server_test)
 }
 
 static void
-test_run_client(test_client_init_t *client_test)
+test_run_client(test_client_init_t *client_test, const char *temp_path_prefix)
 {
 	struct ioloop *ioloop;
 
@@ -275,6 +272,9 @@ test_run_client(test_client_init_t *client_test)
 
 	i_sleep_msecs(100); /* wait a little for server setup */
 
+	struct imapc_parameters imapc_params = {
+		.temp_path_prefix = temp_path_prefix,
+	};
 	ioloop = io_loop_create();
 	imapc_client = imapc_client_init(&imapc_params, test_set.event);
 	client_test();
@@ -293,6 +293,7 @@ test_run_client_server(test_client_init_t *client_test,
 		       test_server_init_t *server_test,
 		       bool reduce_timeout)
 {
+	static unsigned int run_id = 0;
 	const char *error;
 
 	imapc_client_cmd_tag_counter = 0;
@@ -308,8 +309,10 @@ test_run_client_server(test_client_init_t *client_test,
 						       reduce_timeout ? "500ms" : "5s");
 	settings_simple_init(&test_set, settings);
 
-	if (mkdir(imapc_params.temp_path_prefix, 0700) < 0 && errno != EEXIST)
-		i_fatal("mkdir(%s) failed: %m", imapc_params.temp_path_prefix);
+	const char *temp_path_prefix = t_strdup_printf(
+		"%s/client-run-%u/", test_dir_get(), run_id++);
+	if (mkdir(temp_path_prefix, 0700) < 0 && errno != EEXIST)
+		i_fatal("mkdir(%s) failed: %m", temp_path_prefix);
 
 	if (server_test != NULL) {
 		/* Fork server */
@@ -318,12 +321,12 @@ test_run_client_server(test_client_init_t *client_test,
 	i_close_fd(&server.fd_listen);
 
 	/* Run client */
-	test_run_client(client_test);
+	test_run_client(client_test, temp_path_prefix);
 
 	i_unset_failure_prefix();
 	test_subprocess_kill_all(SERVER_KILL_TIMEOUT_SECS);
-	if (unlink_directory(imapc_params.temp_path_prefix,
-			     UNLINK_DIRECTORY_FLAG_RMDIR, &error) < 0)
+	if (unlink_directory(temp_path_prefix, UNLINK_DIRECTORY_FLAG_RMDIR,
+			     &error) < 0)
 		i_fatal("%s", error);
 
 	/* Cleanup the test settings in the main process.
@@ -524,6 +527,146 @@ static void test_imapc_reconnect_server(void)
 	test_assert(i_stream_read_next_line(server.input) == NULL);
 }
 
+/*
+ * imapc short tagged reply (IMAP4rev2)
+ */
+
+static void test_imapc_short_reply_client(void)
+{
+	imapc_client_set_login_callback(imapc_client, imapc_login_callback, NULL);
+	imapc_client_login(imapc_client);
+	imapc_client_run(imapc_client);
+	test_assert(imapc_login_last_reply == IMAPC_COMMAND_STATE_OK);
+}
+
+static void test_imapc_short_reply_server(void)
+{
+	test_server_wait_connection(&server, TRUE);
+	test_assert(test_imapc_server_expect(
+		"1 LOGIN \"testuser\" \"testpass\""));
+	/* short reply: no human-readable text (IMAP4rev2 section 6.1) */
+	o_stream_nsend_str(server.output, "1 OK\r\n");
+
+	test_assert(test_imapc_server_expect("2 LOGOUT"));
+	o_stream_nsend_str(server.output, "* BYE\r\n"
+					  "2 OK\r\n");
+
+	test_assert(i_stream_read_next_line(server.input) == NULL);
+}
+
+static void test_imapc_short_reply(void)
+{
+	test_begin("imapc short tagged reply (IMAP4rev2)");
+	test_run_client_server(test_imapc_short_reply_client,
+			       test_imapc_short_reply_server,
+			       FALSE);
+	test_end();
+}
+
+/*
+ * imapc short tagged NO reply (IMAP4rev2)
+ */
+
+static void test_imapc_short_reply_no_client(void)
+{
+	imapc_client_set_login_callback(imapc_client, imapc_login_callback, NULL);
+	imapc_client_login(imapc_client);
+	test_expect_error_string("Authentication failed");
+	imapc_client_run(imapc_client);
+	test_expect_no_more_errors();
+	test_assert(imapc_login_last_reply == IMAPC_COMMAND_STATE_AUTH_FAILED);
+}
+
+static void test_imapc_short_reply_no_server(void)
+{
+	test_server_wait_connection(&server, TRUE);
+	test_assert(test_imapc_server_expect(
+		"1 LOGIN \"testuser\" \"testpass\""));
+	/* short reply: no human-readable text (IMAP4rev2 section 6.1) */
+	o_stream_nsend_str(server.output, "1 NO\r\n");
+}
+
+static void test_imapc_short_reply_no(void)
+{
+	test_begin("imapc short tagged NO reply (IMAP4rev2)");
+	test_run_client_server(test_imapc_short_reply_no_client,
+			       test_imapc_short_reply_no_server,
+			       FALSE);
+	test_end();
+}
+
+/*
+ * imapc short tagged BAD reply (IMAP4rev2)
+ */
+
+static void test_imapc_short_reply_bad_client(void)
+{
+	imapc_client_set_login_callback(imapc_client, imapc_login_callback, NULL);
+	imapc_client_login(imapc_client);
+	/* BAD logs 2 messages, both containing "failed":
+	   "Command X failed with BAD" + "Authentication failed" */
+	test_expect_error_string_n_times("failed", 2);
+	imapc_client_run(imapc_client);
+	test_expect_no_more_errors();
+}
+
+static void test_imapc_short_reply_bad_server(void)
+{
+	test_server_wait_connection(&server, TRUE);
+	test_assert(test_imapc_server_expect(
+		"1 LOGIN \"testuser\" \"testpass\""));
+	/* short reply: no human-readable text (IMAP4rev2 section 6.1) */
+	o_stream_nsend_str(server.output, "1 BAD\r\n");
+}
+
+static void test_imapc_short_reply_bad(void)
+{
+	test_begin("imapc short tagged BAD reply (IMAP4rev2)");
+	test_run_client_server(test_imapc_short_reply_bad_client,
+			       test_imapc_short_reply_bad_server,
+			       FALSE);
+	test_end();
+}
+
+/*
+ * imapc banner with resp-text-code but no human-readable text (IMAP4rev2)
+ */
+
+static void test_imapc_short_banner_client(void)
+{
+	imapc_client_set_login_callback(imapc_client, imapc_login_callback, NULL);
+	imapc_client_login(imapc_client);
+	imapc_client_run(imapc_client);
+	test_assert(imapc_login_last_reply == IMAPC_COMMAND_STATE_OK);
+}
+
+static void test_imapc_short_banner_server(void)
+{
+	test_server_wait_connection(&server, FALSE);
+	/* short banner: resp-text-code present but no human-readable text */
+	o_stream_nsend_str(server.output,
+		"* OK [CAPABILITY IMAP4rev1]\r\n");
+
+	test_assert(test_imapc_server_expect(
+		"1 LOGIN \"testuser\" \"testpass\""));
+	o_stream_nsend_str(server.output, "1 OK\r\n");
+
+	test_assert(test_imapc_server_expect("2 LOGOUT"));
+	o_stream_nsend_str(server.output, "* BYE\r\n"
+					  "2 OK\r\n");
+
+	test_assert(i_stream_read_next_line(server.input) == NULL);
+}
+
+static void test_imapc_short_banner(void)
+{
+	test_begin("imapc banner with short resp-text (IMAP4rev2)");
+	test_run_client_server(test_imapc_short_banner_client,
+			       test_imapc_short_banner_server,
+			       FALSE);
+	test_end();
+}
+
 static void test_imapc_reconnect(void)
 {
 	test_begin("imapc reconnect");
@@ -688,7 +831,7 @@ static void test_imapc_reconnect_mailbox_client(void)
 	imapc_login_last_reply = IMAPC_COMMAND_STATE_INVALID;
 
 	/* select a mailbox */
-	box = imapc_client_mailbox_open(imapc_client, NULL);
+	box = imapc_client_mailbox_open(imapc_client, NULL, NULL);
 	imapc_client_mailbox_set_reopen_cb(box, imapc_reopen_callback, box);
 
 	cmd = imapc_client_mailbox_cmd(box, imapc_command_callback, NULL);
@@ -934,6 +1077,10 @@ int main(int argc ATTR_UNUSED, char *argv[])
 		test_imapc_banner_hangs,
 		test_imapc_login_hangs,
 		test_imapc_login_fails,
+		test_imapc_short_reply,
+		test_imapc_short_reply_no,
+		test_imapc_short_reply_bad,
+		test_imapc_short_banner,
 		test_imapc_reconnect,
 		test_imapc_reconnect_resend_commands,
 		test_imapc_reconnect_resend_commands_failed,
@@ -960,7 +1107,10 @@ int main(int argc ATTR_UNUSED, char *argv[])
 		}
 	}
 
-	test_subprocesses_init(debug);
+	test_init();
+	event_set_forced_debug(test_event, debug);
+	test_dir_init("test-imapc-client");
+	test_subprocesses_init();
 
 	/* listen on localhost */
 	i_zero(&bind_ip);
@@ -969,7 +1119,6 @@ int main(int argc ATTR_UNUSED, char *argv[])
 
 	ret = test_run(test_functions);
 
-	test_subprocesses_deinit();
 	main_deinit();
 	lib_deinit();
 

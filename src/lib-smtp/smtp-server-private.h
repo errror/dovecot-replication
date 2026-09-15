@@ -106,7 +106,6 @@ struct smtp_server_command {
 	bool input_locked:1;
 	bool input_captured:1;
 	bool pipeline_blocked:1;
-	bool reply_early:1;
 	bool destroying:1;
 };
 
@@ -248,8 +247,6 @@ smtp_server_command_new(struct smtp_server_connection *conn, const char *name);
 void smtp_server_command_execute(struct smtp_server_command *cmd,
 				 const char *params);
 
-void smtp_server_command_ref(struct smtp_server_command *cmd);
-bool smtp_server_command_unref(struct smtp_server_command **_cmd);
 void smtp_server_command_abort(struct smtp_server_command **_cmd);
 
 bool smtp_server_command_call_hooks(struct smtp_server_command **_cmd,
@@ -274,7 +271,7 @@ smtp_server_command_is_complete(struct smtp_server_command *cmd)
 {
 	struct smtp_server_connection *conn = cmd->context.conn;
 
-	return (conn->input_broken || (cmd->next != NULL) || cmd->reply_early ||
+	return (conn->input_broken || (cmd->next != NULL) ||
 		!smtp_server_connection_pending_command_data(conn));
 }
 
@@ -323,9 +320,6 @@ void smtp_server_connection_reply_lines(struct smtp_server_connection *conn,
 				        unsigned int status,
 					const char *enh_code,
 					const char *const *text_lines);
-void smtp_server_connection_reply_immediate(
-	struct smtp_server_connection *conn, unsigned int status,
-	const char *fmt, ...) ATTR_FORMAT(3, 4);
 
 void smtp_server_connection_reset_state(struct smtp_server_connection *conn);
 void smtp_server_connection_set_state(struct smtp_server_connection *conn,
@@ -348,6 +342,8 @@ void smtp_server_recipient_ref(struct smtp_server_recipient *rcpt);
 bool smtp_server_recipient_unref(struct smtp_server_recipient **_rcpt);
 void smtp_server_recipient_destroy(struct smtp_server_recipient **_rcpt);
 
+void smtp_server_recipient_replied(struct smtp_server_recipient *rcpt,
+				   const struct smtp_server_reply *reply);
 bool smtp_server_recipient_approved(struct smtp_server_recipient **_rcpt);
 void smtp_server_recipient_denied(struct smtp_server_recipient *rcpt,
 				  const struct smtp_server_reply *reply);

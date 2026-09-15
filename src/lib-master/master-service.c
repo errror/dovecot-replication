@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
@@ -47,7 +47,11 @@
 
 /* If die callback hasn't managed to stop the service for this many seconds,
    force it. */
-#define MASTER_SERVICE_DIE_TIMEOUT_MSECS (30*1000)
+#define MASTER_SERVICE_DEFAULT_DIE_TIMEOUT_MSECS (30*1000)
+
+/* How often master_service_ioloop_run_interruptible() polls whether the
+   process has been killed. */
+#define MASTER_SERVICE_KILL_CHECK_MSECS 200
 
 struct master_service *master_service;
 
@@ -99,9 +103,32 @@ log_killed_signal(struct master_service *service, const siginfo_t *si)
 	service->killed_signal_logged = TRUE;
 }
 
+static bool master_service_can_idle_die(struct master_service *service)
+{
+	if (service->master_status.available_count !=
+	    service->total_available_count)
+		return FALSE;
+
+	if (service->idle_die_callback != NULL &&
+	    !service->idle_die_callback())
+		return FALSE;
+	return TRUE;
+}
+
 static void sig_delayed_die(const siginfo_t *si, void *context)
 {
 	struct master_service *service = context;
+
+	if (si->si_signo == SIGTERM && service->callback != NULL &&
+	    service->last_kick_signal_user_matched == 0) {
+		/* The SIGTERM handler didn't see a KICK-USER-SIGNAL command.
+		   It may still be on its way in a master-admin connection that
+		   was already accepted by the ioloop, in which case the signal
+		   handler couldn't have accept()ed it. Wait a while for the
+		   command, so the user gets disconnected with the "kicked"
+		   reason instead of the generic "shutting down" reason. */
+		master_admin_clients_wait_commands();
+	}
 
 	/* SIGINT comes either from master process or from keyboard. we don't
 	   want to log it in either case.*/
@@ -113,15 +140,10 @@ static void sig_delayed_die(const siginfo_t *si, void *context)
 	} else if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) == 0) {
 		/* SIGINT came from master. die only if we're not handling
 		   any clients currently. */
-		if (service->master_status.available_count !=
-		    service->total_available_count)
-			return;
-
-		if (service->idle_die_callback != NULL &&
-		    !service->idle_die_callback()) {
+		if (!master_service_can_idle_die(service)) {
 			/* we don't want to die - send a notification to master
 			   so it doesn't think we're ignoring it completely. */
-			master_status_send(service, FALSE);
+			master_status_send(service, TRUE);
 			return;
 		}
 	}
@@ -145,7 +167,7 @@ static bool sig_term_buf_get_kick_user(char *buf, const char **user_r)
 		return FALSE;
 	buf += 30;
 	/* skip over minor version */
-	while (*buf >= '0' && *buf <= '0') buf++;
+	while (*buf >= '0' && *buf <= '9') buf++;
 	if (*buf != '\n')
 		return FALSE;
 	buf++;
@@ -446,6 +468,7 @@ master_service_init(const char *name, enum master_service_flags flags,
 	data_stack_frame_t datastack_frame_id = 0;
 	unsigned int count;
 	const char *service_configured_name, *value;
+	bool lib_initialized_externally = FALSE;
 
 	i_assert(name != NULL);
 
@@ -469,7 +492,10 @@ master_service_init(const char *name, enum master_service_flags flags,
 
 	/* NOTE: we start rooted, so keep the code minimal until
 	   restrict_access_by_env() is called */
-	lib_init();
+	if (lib_is_initialized())
+		lib_initialized_externally = TRUE;
+	else
+		lib_init();
 	/* Get the service name from environment. This usually differs from the
 	   service name parameter if the executable is used for multiple
 	   services. For example "auth" vs "auth-worker". It can also be a
@@ -494,7 +520,8 @@ master_service_init(const char *name, enum master_service_flags flags,
 		datastack_frame_id = t_push("master_service_init");
 
 	/* ignore these signals as early as possible */
-	lib_signals_init();
+	if (!lib_initialized_externally)
+		lib_signals_init();
 	lib_signals_ignore(SIGPIPE, TRUE);
 	lib_signals_ignore(SIGALRM, FALSE);
 
@@ -518,6 +545,7 @@ master_service_init(const char *name, enum master_service_flags flags,
 	service->name = i_strdup(name);
 	service->configured_name = i_strdup(service_configured_name);
 	service->settings_root = settings_root_init();
+	service->lib_initialized_externally = lib_initialized_externally;
 
 	master_service_category_name =
 		i_strdup_printf("service:%s", service->configured_name);
@@ -534,6 +562,7 @@ master_service_init(const char *name, enum master_service_flags flags,
 		i_strconcat(getopt_str, master_service_getopt_string(), NULL);
 	service->flags = flags;
 	service->ioloop = io_loop_create();
+	service->die_timeout_msecs = MASTER_SERVICE_DEFAULT_DIE_TIMEOUT_MSECS;
 	service->restart_request_count_left = UINT_MAX;
 	service->datastack_frame_id = datastack_frame_id;
 
@@ -557,6 +586,7 @@ master_service_init(const char *name, enum master_service_flags flags,
 	} else {
 		service->version_string = PACKAGE_VERSION;
 	}
+	service->reuse_port = getenv(MASTER_REUSE_PORT_ENV) != NULL;
 
 	/* Load the SSL module if we already know it is necessary. It can also
 	   get loaded later on-demand. */
@@ -637,6 +667,16 @@ master_service_init(const char *name, enum master_service_flags flags,
 
 	master_service_verify_version_string(service);
 
+	value = getenv(DOVECOT_ACCEPTED_CLIENT_LISTENER_FD_ENV);
+	if (value == NULL)
+		service->accepted_listener_fd = -1;
+	else if (str_to_int(value, &service->accepted_listener_fd) < 0 ||
+		 service->accepted_listener_fd < MASTER_LISTEN_FD_FIRST ||
+		 service->accepted_listener_fd - MASTER_LISTEN_FD_FIRST > (int)service->socket_count) {
+		i_fatal("Invalid DOVECOT_ACCEPTED_CLIENT_SETTINGS environment: "
+			"Invalid listener fd '%s'", value);
+	}
+
 	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) == 0) {
 		env_remove(MASTER_SERVICE_ENV);
 		env_remove(MASTER_SERVICE_SOCKET_COUNT_ENV);
@@ -664,6 +704,7 @@ int master_getopt(struct master_service *service)
 
 	i_assert(master_getopt_str_is_valid(service->getopt_str));
 
+	service->options_parsed = TRUE;
 	while ((c = getopt(service->argc, service->argv,
 			   service->getopt_str)) > 0) {
 		if (!master_service_parse_option(service, c, optarg))
@@ -681,6 +722,7 @@ master_getopt_long(struct master_service *service, const char **longopt_r)
 
 	i_assert(master_getopt_str_is_valid(service->getopt_str));
 
+	service->options_parsed = TRUE;
 	int c;
 	int longopt_idx = -1;
 	while ((c = getopt_long(service->argc, service->argv,
@@ -718,6 +760,8 @@ master_service_try_init_log(struct master_service *service,
 			    const char *prefix)
 {
 	const char *timestamp;
+
+	i_assert(service->options_parsed);
 
 	if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) != 0 &&
 	    (service->flags & MASTER_SERVICE_FLAG_DONT_LOG_TO_STDERR) == 0) {
@@ -825,6 +869,12 @@ void master_service_set_die_callback(struct master_service *service,
 	service->die_callback = callback;
 }
 
+void master_service_set_die_timeout_msecs(struct master_service *service,
+					  unsigned int msecs)
+{
+	service->die_timeout_msecs = msecs;
+}
+
 void master_service_set_idle_die_callback(struct master_service *service,
 					  bool (*callback)(void))
 {
@@ -904,7 +954,7 @@ static void master_service_error(struct master_service *service)
 			master_service_stop(service);
 		else {
 			service->to_die =
-				timeout_add(MASTER_SERVICE_DIE_TIMEOUT_MSECS,
+				timeout_add(service->die_timeout_msecs,
 					    master_service_stop,
 					    service);
 			service->die_callback();
@@ -1029,7 +1079,7 @@ static void master_service_import_environment_real(const char *import_environmen
 	array_push_back(&keys, &value);
 #endif
 	/* add new environments */
-	envs = t_strsplit_spaces(import_environment, " ");
+	envs = t_strsplit_tabescaped(import_environment);
 	expanded = t_str_new(64);
 	for (; *envs != NULL; envs++) {
 		value = strchr(*envs, '=');
@@ -1135,30 +1185,21 @@ unsigned int master_service_get_socket_count(struct master_service *service)
 	return service->socket_count;
 }
 
-const char *master_service_get_socket_name(struct master_service *service,
-					   int listen_fd)
+static void
+master_service_connection_init_finish(struct master_service_connection *conn,
+				      const struct master_service_listener *l)
 {
-	unsigned int i;
+	conn->ssl = l->ssl;
+	conn->name = (l->name != NULL ? l->name : "");
+	conn->type = (l->type != NULL ? l->type : "");
 
-	i_assert(listen_fd >= MASTER_LISTEN_FD_FIRST);
+	(void)net_getsockname(conn->fd, &conn->local_ip, &conn->local_port);
+	conn->real_remote_ip = conn->remote_ip;
+	conn->real_remote_port = conn->remote_port;
+	conn->real_local_ip = conn->local_ip;
+	conn->real_local_port = conn->local_port;
 
-	i = listen_fd - MASTER_LISTEN_FD_FIRST;
-	i_assert(i < service->socket_count);
-	return service->listeners[i].name != NULL ?
-		service->listeners[i].name : "";
-}
-
-const char *
-master_service_get_socket_type(struct master_service *service, int listen_fd)
-{
-	unsigned int i;
-
-	i_assert(listen_fd >= MASTER_LISTEN_FD_FIRST);
-
-	i = listen_fd - MASTER_LISTEN_FD_FIRST;
-	i_assert(i < service->socket_count);
-	return service->listeners[i].type != NULL ?
-		service->listeners[i].type : "";
+	net_set_nonblock(conn->fd, TRUE);
 }
 
 void master_service_set_avail_overflow_callback(struct master_service *service,
@@ -1198,12 +1239,83 @@ master_service_get_settings_root(struct master_service *service)
 	return service->settings_root;
 }
 
+static void master_service_start_accepted_fd(struct master_service *service)
+{
+	struct master_service_connection conn = {
+		.fd = MASTER_ACCEPTED_CLIENT_FD,
+		.listen_fd = service->accepted_listener_fd,
+	};
+	service->accepted_listener_fd = -1;
+
+	const struct master_service_listener *l =
+		&service->listeners[conn.listen_fd - MASTER_LISTEN_FD_FIRST];
+
+	(void)net_getpeername(conn.fd, &conn.remote_ip, &conn.remote_port);
+	master_service_connection_init_finish(&conn, l);
+
+	/* Note that master admin connections aren't pre-accepted */
+	master_service_client_connection_created(service);
+	if (l->haproxy)
+		master_service_haproxy_new(service, &conn);
+	else
+		master_service_client_connection_callback(service, &conn);
+}
+
 void master_service_run(struct master_service *service,
 			master_service_connection_callback_t *callback)
 {
+	bool run = TRUE;
+
 	service->callback = callback;
-	io_loop_run(service->ioloop);
+	if (service->accepted_listener_fd != -1) T_BEGIN {
+		/* Mark the ioloop as running, so we'll catch if
+		   master_service_stop() -> io_loop_stop() is called.
+		   If it is (e.g. due to restart_request_count=1) we don't
+		   want to continue to io_loop_run() anymore. */
+		io_loop_set_running(service->ioloop);
+		master_service_start_accepted_fd(service);
+		run = io_loop_is_running(service->ioloop);
+	} T_END;
+	if (run)
+		io_loop_run(service->ioloop);
 	service->callback = NULL;
+}
+
+struct master_service_interruptible_run {
+	struct master_service *service;
+	struct ioloop *ioloop;
+};
+
+static void
+master_service_ioloop_check_killed(struct master_service_interruptible_run *ctx)
+{
+	if (master_service_is_killed(ctx->service))
+		io_loop_stop(ctx->ioloop);
+}
+
+int master_service_ioloop_run_interruptible(struct master_service *service,
+					    struct ioloop *ioloop)
+{
+	if (service == NULL) {
+		/* running in a unit test */
+		io_loop_run(ioloop);
+		return 0;
+	}
+	struct master_service_interruptible_run ctx = {
+		.service = service,
+		.ioloop = ioloop,
+	};
+	struct timeout *to;
+
+	/* A kill signal stops only service->ioloop (and only while we're in
+	   master_service_run()). A nested ioloop such as this one isn't
+	   noticed, so poll master_service_is_killed() to interrupt a slow
+	   request instead of blocking until it finishes. */
+	to = timeout_add_short_to(ioloop, MASTER_SERVICE_KILL_CHECK_MSECS,
+				  master_service_ioloop_check_killed, &ctx);
+	io_loop_run(ioloop);
+	timeout_remove(&to);
+	return master_service_is_killed(service) ? -1 : 0;
 }
 
 void master_service_stop(struct master_service *service)
@@ -1403,8 +1515,9 @@ static bool master_service_want_listener(struct master_service *service)
 		/* more concurrent clients can still be added */
 		return TRUE;
 	}
-	if (service->restart_request_count_left == 1) {
-		/* after handling this client, the whole process will stop. */
+	if (service->restart_request_count_left == service->total_available_count) {
+		/* after handling the existing clients,
+		   the whole process will stop. */
 		return FALSE;
 	}
 	if (service->avail_overflow_callback != NULL) {
@@ -1432,7 +1545,7 @@ void master_service_client_connection_handled(struct master_service *service,
 	if (!master_service_want_listener(service)) {
 		i_assert(service->listeners != NULL);
 		master_service_io_listeners_remove(service);
-		if (service->restart_request_count_left == 1 &&
+		if (service->restart_request_count_left == service->total_available_count &&
 		   service->avail_overflow_callback == NULL) {
 			/* we're not going to accept any more connections after
 			   this. go ahead and close the connection early. don't
@@ -1467,13 +1580,12 @@ void master_service_client_connection_accept(struct master_service_connection *c
 
 void master_service_client_connection_destroyed(struct master_service *service)
 {
-	/* we can listen again */
-	master_service_io_listeners_add(service);
-
 	i_assert(service->total_available_count > 0);
 	i_assert(service->restart_request_count_left > 0);
 
 	if (service->restart_request_count_left == service->total_available_count) {
+		/* There may or may not be available clients, but we no longer
+		   increse them. */
 		service->total_available_count--;
 		service->restart_request_count_left--;
 	} else {
@@ -1483,6 +1595,14 @@ void master_service_client_connection_destroyed(struct master_service *service)
 		i_assert(service->master_status.available_count <
 			 service->total_available_count);
 		service->master_status.available_count++;
+	}
+
+	if (service->master_status.available_count > 0) {
+		/* we can listen again */
+		master_service_io_listeners_add(service);
+	} else {
+		/* restart_request_count reached. */
+		master_service_io_listeners_remove(service);
 	}
 
 	if (service->restart_request_count_left == 0) {
@@ -1613,6 +1733,7 @@ static void master_service_deinit_real(struct master_service *service)
 	master_service_category.name = NULL;
 	event_unregister_callback(master_service_event_callback);
 	master_service_unset_process_shutdown_filter(service);
+	i_close_fd(&service->accepted_listener_fd);
 }
 
 static void master_service_free(struct master_service **_service)
@@ -1647,16 +1768,20 @@ static void master_service_free(struct master_service **_service)
 void master_service_deinit(struct master_service **_service)
 {
 	struct master_service *service = *_service;
+	bool lib_initialized_externally = service->lib_initialized_externally;
 
 	master_service_deinit_real(service);
 
-	lib_signals_deinit();
-	/* run atexit callbacks before destroying ioloop */
-	lib_atexit_run();
+	if (!lib_initialized_externally) {
+		lib_signals_deinit();
+		/* run atexit callbacks before destroying ioloop */
+		lib_atexit_run();
+	}
 	io_loop_destroy(&service->ioloop);
 
 	master_service_free(_service);
-	lib_deinit();
+	if (!lib_initialized_externally)
+		lib_deinit();
 }
 
 void master_service_deinit_forked(struct master_service **_service)
@@ -1733,16 +1858,30 @@ static bool master_service_full(struct master_service *service)
 	struct timeval created;
 
 	/* This process can't handle any more connections. */
-	if (!service->call_avail_overflow ||
-	    service->avail_overflow_callback == NULL)
+	if (service->avail_overflow_callback == NULL)
 		return TRUE;
+	if (!service->call_avail_overflow && !service->reuse_port) {
+		/* This process is full, but sibling processes aren't. Another
+		   process will pick up this connection. Note that with
+		   reuse_port=yes the connection is specifically assigned to
+		   this process, so we are responsible for accepting or
+		   rejecting it. */
+		return TRUE;
+	}
 
-	/* Master has notified us that all processes are full, and
-	   we have the ability to kill old connections. */
+	/* Master has notified us that all processes are full (or with
+	   reuse_port=yes this process is full), and we have the ability to
+	   kill old connections. */
 	if (service->total_available_count > 1) {
 		/* This process can still create multiple concurrent
 		   clients if we just kill some of the existing ones.
 		   Do it immediately. */
+		if (service->restart_request_count_left == service->total_available_count) {
+			/* restart_request_count is reached - killing existing
+			   processes won't increase the number of available
+			   clients anymore. */
+			return TRUE;
+		}
 		return !service->avail_overflow_callback(TRUE, &created);
 	}
 
@@ -1765,8 +1904,7 @@ static bool master_service_full(struct master_service *service)
 }
 
 static void
-master_service_accept(struct master_service_listener *l, const char *conn_name,
-		      bool master_admin_conn)
+master_service_accept(struct master_service_listener *l, bool master_admin_conn)
 {
 	struct master_service *service = l->service;
 	struct master_service_connection conn;
@@ -1774,11 +1912,11 @@ master_service_accept(struct master_service_listener *l, const char *conn_name,
 	i_zero(&conn);
 	conn.listen_fd = l->fd;
 	conn.fd = net_accept(l->fd, &conn.remote_ip, &conn.remote_port);
-	if (conn.fd < 0) {
+	if (conn.fd == -1) {
 		struct stat st;
 		int orig_errno = errno;
 
-		if (conn.fd == -1)
+		if (NET_ACCEPT_ENOCONN(errno))
 			return;
 
 		if (errno == ENOTSOCK) {
@@ -1803,17 +1941,7 @@ master_service_accept(struct master_service_listener *l, const char *conn_name,
 		io_remove(&l->io);
 		l->fd = -1;
 	}
-	conn.ssl = l->ssl;
-	conn.name = conn_name;
-	conn.type = (l->type != NULL ? l->type : "");
-
-	(void)net_getsockname(conn.fd, &conn.local_ip, &conn.local_port);
-	conn.real_remote_ip = conn.remote_ip;
-	conn.real_remote_port = conn.remote_port;
-	conn.real_local_ip = conn.local_ip;
-	conn.real_local_port = conn.local_port;
-
-	net_set_nonblock(conn.fd, TRUE);
+	master_service_connection_init_finish(&conn, l);
 
 	if (master_admin_conn) {
 		master_admin_client_create(&conn);
@@ -1829,14 +1957,21 @@ master_service_accept(struct master_service_listener *l, const char *conn_name,
 static void master_service_listen(struct master_service_listener *l)
 {
 	struct master_service *service = l->service;
-	const char *conn_name;
 	bool master_admin_conn;
 
-	conn_name = master_service_get_socket_name(service, l->fd);
-	master_admin_conn = master_admin_client_can_accept(conn_name);
+	master_admin_conn = master_admin_client_can_accept(l->name);
 
 	if (service->master_status.available_count == 0 && !master_admin_conn) {
 		if (master_service_full(service)) {
+			if (service->reuse_port) {
+				/* With reuse_port the master can't drop
+				   the connections for us. We must do it
+				   ourselves. */
+				int fd = net_accept(l->fd, NULL, NULL);
+				if (fd != -1)
+					i_close_fd(&fd);
+				return;
+			}
 			/* Stop the listener until a client has disconnected or
 			   overflow callback has killed one. */
 			master_service_io_listeners_remove(service);
@@ -1855,7 +1990,7 @@ static void master_service_listen(struct master_service_listener *l)
 		   command. */
 		sigterm_blocked = block_sigterm(&oldmask) == 0;
 	}
-	master_service_accept(l, conn_name, master_admin_conn);
+	master_service_accept(l, master_admin_conn);
 	if (sigterm_blocked) {
 		if (sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0)
 			e_error(service->event,
@@ -1946,18 +2081,23 @@ static bool master_status_update_is_important(struct master_service *service)
 static void
 master_status_send(struct master_service *service, bool important_update)
 {
+	struct master_status status = service->master_status;
 	ssize_t ret;
+
+	if (status.available_count == 0 &&
+	    service->restart_request_count_left == service->total_available_count) {
+		/* restart_request_count limit reached */
+		status.available_count = UINT_MAX;
+	}
 
 	timeout_remove(&service->to_status);
 
-	ret = write(MASTER_STATUS_FD, &service->master_status,
-		    sizeof(service->master_status));
-	if (ret == (ssize_t)sizeof(service->master_status)) {
+	ret = write(MASTER_STATUS_FD, &status, sizeof(status));
+	if (ret == (ssize_t)sizeof(status)) {
 		/* success */
 		io_remove(&service->io_status_write);
 		service->last_sent_status_time = ioloop_time;
-		service->last_sent_status_avail_count =
-			service->master_status.available_count;
+		service->last_sent_status_avail_count = status.available_count;
 		service->initial_status_sent = TRUE;
 	} else if (ret >= 0) {
 		/* shouldn't happen? */
@@ -2030,91 +2170,6 @@ void master_status_update(struct master_service *service)
 	master_status_send(service, important_update);
 }
 
-bool version_string_verify(const char *line, const char *service_name,
-			   unsigned int major_version)
-{
-	unsigned int minor_version;
-
-	return version_string_verify_full(line, service_name,
-					  major_version, &minor_version);
-}
-
-bool version_string_verify_full(const char *line, const char *service_name,
-				unsigned int major_version,
-				unsigned int *minor_version_r)
-{
-	size_t service_name_len = strlen(service_name);
-	bool ret;
-
-	if (!str_begins(line, "VERSION\t", &line))
-		return FALSE;
-
-	if (strncmp(line, service_name, service_name_len) != 0 ||
-	    line[service_name_len] != '\t')
-		return FALSE;
-	line += service_name_len + 1;
-
-	T_BEGIN {
-		const char *p = strchr(line, '\t');
-
-		if (p == NULL)
-			ret = FALSE;
-		else {
-			ret = str_uint_equals(t_strdup_until(line, p),
-					      major_version);
-			if (str_to_uint(p+1, minor_version_r) < 0)
-				ret = FALSE;
-		}
-	} T_END;
-	return ret;
-}
-
-int version_cmp(const char *version1, const char *version2)
-{
-	unsigned int v1, v2;
-
-	do {
-		if (str_parse_uint(version1, &v1, &version1) < 0)
-			i_unreached();
-		if (str_parse_uint(version2, &v2, &version2) < 0)
-			i_unreached();
-		if (*version1 == '.')
-			version1++;
-		else
-			i_assert(*version1 == '\0');
-		if (*version2 == '.')
-			version2++;
-		else
-			i_assert(*version2 == '\0');
-
-		if (v1 < v2)
-			return -1;
-		if (v1 > v2)
-			return 1;
-	} while (*version1 != '\0' && *version2 != '\0');
-
-	if (*version1 != '\0')
-		return 1;
-	if (*version2 != '\0')
-		return -1;
-	return 0;
-}
-
-bool version_is_valid(const char *version)
-{
-	unsigned int i;
-
-	for (i = 0; version[i] != '\0'; i++) {
-		if (version[i] == '.') {
-			if (i == 0 || version[i-1] == '.' ||
-			    version[i+1] == '\0')
-				return FALSE;
-		} else if (version[i] < '0' || version[i] > '9')
-			return FALSE;
-	}
-	return i > 0;
-}
-
 void master_service_set_process_shutdown_filter(struct master_service *service,
 						struct event_filter *filter)
 {
@@ -2155,6 +2210,15 @@ void master_service_set_last_kick_signal_user(struct master_service *service,
 	i_free(service->last_kick_signal_user);
 	service->last_kick_signal_user = i_strdup(user);
 	service->last_kick_signal_user_accessed = 0;
+	if (service->killed_signal == SIGTERM &&
+	    service->current_user != NULL &&
+	    strcmp(user, service->current_user) == 0) {
+		/* The SIGTERM was already handled before this command was
+		   received, so the signal handler won't be doing the match
+		   anymore. */
+		service->last_kick_signal_user_accessed = 1;
+		service->last_kick_signal_user_matched = 1;
+	}
 
 	if (sigterm_blocked && sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0) {
 		e_error(service->event,

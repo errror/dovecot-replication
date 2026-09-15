@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,6 +8,8 @@
 #include "file-lock.h"
 #include "file-dotlock.h"
 #include "crc32.h"
+#include "randgen.h"
+#include "xxh64.h"
 #include "safe-mkstemp.h"
 #include "str.h"
 #include "mail-index-private.h"
@@ -24,6 +26,12 @@ struct mail_index_strmap {
 	struct file_lock *file_lock;
 	struct dotlock *dotlock;
 	struct dotlock_settings dotlock_settings;
+
+	/* If TRUE, new files are created in v2 format (xxh64-keyed hashes).
+	   If FALSE, new files are created in v1 format (crc32). Existing
+	   files of either version are always read; on rebuild they are
+	   recreated in this preferred format. */
+	bool enable_xxh64;
 };
 
 struct mail_index_strmap_view {
@@ -31,8 +39,16 @@ struct mail_index_strmap_view {
 	struct mail_index_view *view;
 
 	ARRAY_TYPE(mail_index_strmap_rec) recs;
-	ARRAY(uint32_t) recs_crc32;
+	ARRAY(uint32_t) recs_hash;
 	struct hash2_table *hash;
+
+	/* On-disk format version that view's hash values are computed
+	   against. v1 = crc32_str_nonzero, v2 = keyed xxh64. Set from the
+	   file header when opening an existing file; otherwise from
+	   strmap->enable_xxh64. */
+	uint8_t format_version;
+	/* Per-file random IV mixed into the xxh64 hash. Unused for v1. */
+	uint64_t hash_iv;
 
 	mail_index_strmap_key_cmp_t *key_compare;
 	mail_index_strmap_rec_cmp_t *rec_compare;
@@ -74,7 +90,7 @@ struct mail_index_strmap_view_sync {
 
 struct mail_index_strmap_hash_key {
 	const char *str;
-	uint32_t crc32;
+	uint32_t hash;
 };
 
 /* renumber the string indexes when highest string idx becomes larger than
@@ -92,7 +108,8 @@ static const struct dotlock_settings default_dotlock_settings = {
 };
 
 struct mail_index_strmap *
-mail_index_strmap_init(struct mail_index *index, const char *suffix)
+mail_index_strmap_init(struct mail_index *index, const char *suffix,
+		       bool enable_xxh64)
 {
 	struct mail_index_strmap *strmap;
 
@@ -102,6 +119,7 @@ mail_index_strmap_init(struct mail_index *index, const char *suffix)
 	strmap->index = index;
 	strmap->path = i_strconcat(index->filepath, suffix, NULL);
 	strmap->fd = -1;
+	strmap->enable_xxh64 = enable_xxh64;
 
 	strmap->dotlock_settings = default_dotlock_settings;
 	strmap->dotlock_settings.use_excl_lock =
@@ -113,7 +131,7 @@ mail_index_strmap_init(struct mail_index *index, const char *suffix)
 
 static bool
 mail_index_strmap_read_rec_next(struct mail_index_strmap_read_context *ctx,
-				uint32_t *crc32_r);
+				uint32_t *hash_r);
 
 static void
 mail_index_strmap_set_syscall_error(struct mail_index_strmap *strmap,
@@ -162,7 +180,7 @@ static unsigned int mail_index_strmap_hash_key(const void *_key)
 {
 	const struct mail_index_strmap_hash_key *key = _key;
 
-	return key->crc32;
+	return key->hash;
 }
 
 static bool
@@ -197,7 +215,10 @@ mail_index_strmap_view_open(struct mail_index_strmap *strmap,
 	view->next_str_idx = 1;
 
 	i_array_init(&view->recs, 64);
-	i_array_init(&view->recs_crc32, 64);
+	i_array_init(&view->recs_hash, 64);
+	view->format_version = strmap->enable_xxh64 ?
+		MAIL_INDEX_STRMAP_VERSION_V2 : MAIL_INDEX_STRMAP_VERSION_V1;
+	random_fill(&view->hash_iv, sizeof(view->hash_iv));
 	view->hash = hash2_create(0, sizeof(struct mail_index_strmap_rec),
 				  mail_index_strmap_hash_key,
 				  mail_index_strmap_hash_cmp, view);
@@ -212,7 +233,7 @@ void mail_index_strmap_view_close(struct mail_index_strmap_view **_view)
 
 	*_view = NULL;
 	array_free(&view->recs);
-	array_free(&view->recs_crc32);
+	array_free(&view->recs_hash);
 	hash2_destroy(&view->hash);
 	i_free(view);
 }
@@ -226,7 +247,7 @@ static void mail_index_strmap_view_reset(struct mail_index_strmap_view *view)
 {
 	view->remap_cb(NULL, 0, 0, view->cb_context);
 	array_clear(&view->recs);
-	array_clear(&view->recs_crc32);
+	array_clear(&view->recs_hash);
 	hash2_clear(view->hash);
 
 	view->last_added_uid = 0;
@@ -250,7 +271,7 @@ static int mail_index_strmap_open(struct mail_index_strmap_view *view)
 	const struct mail_index_header *idx_hdr;
 	struct mail_index_strmap_header hdr;
 	const unsigned char *data;
-	size_t size;
+	size_t size, hdr_size;
 	int ret;
 
 	i_assert(strmap->fd == -1);
@@ -263,7 +284,12 @@ static int mail_index_strmap_open(struct mail_index_strmap_view *view)
 		return -1;
 	}
 	strmap->input = i_stream_create_fd(strmap->fd, SIZE_MAX);
-	ret = i_stream_read_bytes(strmap->input, &data, &size, sizeof(hdr));
+
+	/* Read the smaller v1 header first; bytes 0..7 have identical
+	   layout in both formats so we can decide based on the version
+	   byte before reading the v2 tail. */
+	ret = i_stream_read_bytes(strmap->input, &data, &size,
+				  MAIL_INDEX_STRMAP_HEADER_V1_SIZE);
 	if (ret <= 0) {
 		if (ret < 0) {
 			mail_index_strmap_set_syscall_error(strmap, "read()");
@@ -274,23 +300,55 @@ static int mail_index_strmap_open(struct mail_index_strmap_view *view)
 		}
 		return ret;
 	}
-	memcpy(&hdr, data, sizeof(hdr));
+
+	i_zero(&hdr);
+	hdr_size = data[0] == MAIL_INDEX_STRMAP_VERSION_V2 ?
+		MAIL_INDEX_STRMAP_HEADER_V2_SIZE :
+		MAIL_INDEX_STRMAP_HEADER_V1_SIZE;
+	if (hdr_size > MAIL_INDEX_STRMAP_HEADER_V1_SIZE) {
+		ret = i_stream_read_bytes(strmap->input, &data, &size, hdr_size);
+		if (ret <= 0) {
+			if (ret < 0) {
+				mail_index_strmap_set_syscall_error(strmap, "read()");
+				mail_index_strmap_close(strmap);
+			} else {
+				mail_index_strmap_view_set_corrupted(view);
+			}
+			return ret;
+		}
+	}
+	memcpy(&hdr, data, hdr_size);
 
 	idx_hdr = mail_index_get_header(view->view);
-	if (hdr.version != MAIL_INDEX_STRMAP_VERSION ||
-	    hdr.uid_validity != idx_hdr->uid_validity) {
+	uint8_t compat_flags = 0;
+#ifndef WORDS_BIGENDIAN
+	if (hdr.version >= MAIL_INDEX_STRMAP_VERSION_V2)
+		compat_flags |= MAIL_INDEX_COMPAT_LITTLE_ENDIAN;
+#endif
+	if ((hdr.version != MAIL_INDEX_STRMAP_VERSION_V1 &&
+	     hdr.version != MAIL_INDEX_STRMAP_VERSION_V2) ||
+	    hdr.compat_flags != compat_flags ||
+	    hdr.uid_validity != idx_hdr->uid_validity ||
+	    (strmap->enable_xxh64 &&
+	     hdr.version < MAIL_INDEX_STRMAP_VERSION_V2)) {
 		/* need to rebuild. if we already had something in the strmap,
-		   we can keep it. */
+		   we can keep it. The enable_xxh64 case forces a v1 file to
+		   be discarded so the next write creates a v2 file - we never
+		   stay on v1 once the dovecot_storage_version threshold has
+		   been reached. */
 		i_unlink(strmap->path);
 		mail_index_strmap_close(strmap);
 		return 0;
 	}
+	view->format_version = hdr.version;
+	view->hash_iv = hdr.version >= MAIL_INDEX_STRMAP_VERSION_V2 ?
+		hdr.hash_iv : 0;
 
 	/* we'll read the entire file from the beginning */
 	view->last_added_uid = 0;
 	view->last_read_uid = 0;
 	view->total_ref_count = 0;
-	view->last_read_block_offset = sizeof(struct mail_index_strmap_header);
+	view->last_read_block_offset = hdr_size;
 	view->next_str_idx = 1;
 
 	mail_index_strmap_view_reset(view);
@@ -410,13 +468,13 @@ mail_index_strmap_uid_exists(struct mail_index_strmap_read_context *ctx,
 
 static int
 mail_index_strmap_read_rec_first(struct mail_index_strmap_read_context *ctx,
-				 uint32_t *crc32_r)
+				 uint32_t *hash_r)
 {
 	size_t size;
 	uint32_t n, i, count, str_idx;
 	int ret;
 
-	/* <uid> <n> <crc32>*count <str_idx>*count
+	/* <uid> <n> <hash>*count <str_idx>*count
 	   where
 	     n = 0 -> count=1 (only Message-ID:)
 	     n = 1 -> count=2 (Message-ID: + In-Reply-To:)
@@ -425,9 +483,12 @@ mail_index_strmap_read_rec_first(struct mail_index_strmap_read_context *ctx,
 	if (mail_index_strmap_read_packed(ctx, &n) <= 0)
 		return -1;
 	count = n < 2 ? n + 1 : n;
+	/* check that rec_size fits */
+	if (UINT_MAX / (sizeof(ctx->rec.str_idx) + sizeof(*hash_r)) < count)
+		return -1;
 	ctx->view->total_ref_count += count;
 
-	ctx->rec_size = count * (sizeof(ctx->rec.str_idx) + sizeof(*crc32_r));
+	ctx->rec_size = count * (sizeof(ctx->rec.str_idx) + sizeof(*hash_r));
 	ret = mail_index_strmap_uid_exists(ctx, ctx->rec.uid);
 	if (ret < 0)
 		return -1;
@@ -451,10 +512,10 @@ mail_index_strmap_read_rec_first(struct mail_index_strmap_read_context *ctx,
 	/* everything exists. save it. FIXME: these ref_index values
 	   are thread index specific, perhaps something more generic
 	   should be used some day */
-	ctx->end = ctx->data + count * sizeof(*crc32_r);
+	ctx->end = ctx->data + count * sizeof(*hash_r);
 
 	ctx->next_ref_index = 0;
-	if (!mail_index_strmap_read_rec_next(ctx, crc32_r))
+	if (!mail_index_strmap_read_rec_next(ctx, hash_r))
 		i_unreached();
 	ctx->next_ref_index = n == 1 ? 1 : 2;
 	return 1;
@@ -462,7 +523,7 @@ mail_index_strmap_read_rec_first(struct mail_index_strmap_read_context *ctx,
 
 static bool
 mail_index_strmap_read_rec_next(struct mail_index_strmap_read_context *ctx,
-				uint32_t *crc32_r)
+				uint32_t *hash_r)
 {
 	if (ctx->data == ctx->end) {
 		i_stream_skip(ctx->view->strmap->input, ctx->rec_size);
@@ -475,7 +536,7 @@ mail_index_strmap_read_rec_next(struct mail_index_strmap_read_context *ctx,
 
 	/* read the record contents */
 	memcpy(&ctx->rec.str_idx, ctx->str_idx_base, sizeof(ctx->rec.str_idx));
-	memcpy(crc32_r, ctx->data, sizeof(*crc32_r));
+	memcpy(hash_r, ctx->data, sizeof(*hash_r));
 
 	ctx->rec.ref_index = ctx->next_ref_index++;
 
@@ -483,7 +544,7 @@ mail_index_strmap_read_rec_next(struct mail_index_strmap_read_context *ctx,
 		ctx->highest_str_idx = ctx->rec.str_idx;
 
 	/* get to the next record */
-	ctx->data += sizeof(*crc32_r);
+	ctx->data += sizeof(*hash_r);
 	ctx->str_idx_base += sizeof(ctx->rec.str_idx);
 	return TRUE;
 }
@@ -544,12 +605,12 @@ strmap_read_block_init(struct mail_index_strmap_view *view,
 
 static int
 strmap_read_block_next(struct mail_index_strmap_read_context *ctx,
-		       uint32_t *crc32_r)
+		       uint32_t *hash_r)
 {
 	uint32_t uid_diff;
 	int ret;
 
-	if (mail_index_strmap_read_rec_next(ctx, crc32_r))
+	if (mail_index_strmap_read_rec_next(ctx, hash_r))
 		return 1;
 
 	/* get next UID */
@@ -562,7 +623,7 @@ strmap_read_block_next(struct mail_index_strmap_read_context *ctx,
 			return -1;
 
 		ctx->rec.uid += uid_diff;
-		ret = mail_index_strmap_read_rec_first(ctx, crc32_r);
+		ret = mail_index_strmap_read_rec_first(ctx, hash_r);
 	} while (ret == 0);
 	return ret;
 }
@@ -632,12 +693,12 @@ strmap_view_sync_handle_conflict(struct mail_index_strmap_read_context *ctx,
 
 static int
 strmap_view_sync_block_check_conflicts(struct mail_index_strmap_read_context *ctx,
-				       uint32_t crc32)
+				       uint32_t hash)
 {
 	struct mail_index_strmap_rec *hash_rec;
 	struct hash2_iter iter;
 
-	if (crc32 == 0) {
+	if (hash == 0) {
 		/* unique string - there are no conflicts */
 		return 0;
 	}
@@ -654,9 +715,9 @@ strmap_view_sync_block_check_conflicts(struct mail_index_strmap_read_context *ct
 	strmap index until X has been expunged. */
 	i_zero(&iter);
 	while ((hash_rec = hash2_iterate(ctx->view->hash,
-					 crc32, &iter)) != NULL &&
+					 hash, &iter)) != NULL &&
 	       hash_rec->str_idx != ctx->rec.str_idx) {
-		/* CRC32 matches, but string index doesn't */
+		/* hash matches, but string index doesn't */
 		if (!strmap_view_sync_handle_conflict(ctx, hash_rec, &iter)) {
 			ctx->lost_expunged_uid = hash_rec->uid;
 			return -1;
@@ -669,10 +730,10 @@ static int
 mail_index_strmap_view_sync_block(struct mail_index_strmap_read_context *ctx)
 {
 	struct mail_index_strmap_rec *hash_rec;
-	uint32_t crc32, prev_uid = 0;
+	uint32_t hash, prev_uid = 0;
 	int ret;
 
-	while ((ret = strmap_read_block_next(ctx, &crc32)) > 0) {
+	while ((ret = strmap_read_block_next(ctx, &hash)) > 0) {
 		if (ctx->rec.uid <= ctx->view->last_added_uid) {
 			if (ctx->rec.uid < ctx->view->last_added_uid ||
 			    prev_uid != ctx->rec.uid) {
@@ -682,7 +743,7 @@ mail_index_strmap_view_sync_block(struct mail_index_strmap_read_context *ctx)
 		}
 		prev_uid = ctx->rec.uid;
 
-		if (strmap_view_sync_block_check_conflicts(ctx, crc32) < 0) {
+		if (strmap_view_sync_block_check_conflicts(ctx, hash) < 0) {
 			ret = -1;
 			break;
 		}
@@ -690,10 +751,10 @@ mail_index_strmap_view_sync_block(struct mail_index_strmap_read_context *ctx)
 
 		/* add the record to records array */
 		array_push_back(&ctx->view->recs, &ctx->rec);
-		array_push_back(&ctx->view->recs_crc32, &crc32);
+		array_push_back(&ctx->view->recs_hash, &hash);
 
 		/* add a separate copy of the record to hash */
-		hash_rec = hash2_insert_hash(ctx->view->hash, crc32);
+		hash_rec = hash2_insert_hash(ctx->view->hash, hash);
 		memcpy(hash_rec, &ctx->rec, sizeof(*hash_rec));
 	}
 	return strmap_read_block_deinit(ctx, ret, TRUE);
@@ -747,6 +808,17 @@ static inline uint32_t crc32_str_nonzero(const char *str)
 	return value == 0 ? 1 : value;
 }
 
+static inline uint32_t
+strmap_hash_str(const struct mail_index_strmap_view *view, const char *str)
+{
+	if (view->format_version < MAIL_INDEX_STRMAP_VERSION_V2)
+		return crc32_str_nonzero(str);
+
+	uint32_t value = xxh64_to_32(xxh64_data(str, strlen(str), view->hash_iv));
+	/* 0 is reserved as a sentinel meaning "unique / no hash stored" */
+	return value == 0 ? 1 : value;
+}
+
 void mail_index_strmap_view_sync_add(struct mail_index_strmap_view_sync *sync,
 				     uint32_t uid, uint32_t ref_index,
 				     const char *key)
@@ -761,7 +833,7 @@ void mail_index_strmap_view_sync_add(struct mail_index_strmap_view_sync *sync,
 		  ref_index > view->last_ref_index));
 
 	hash_key.str = key;
-	hash_key.crc32 = crc32_str_nonzero(key);
+	hash_key.hash = strmap_hash_str(view, key);
 
 	old_rec = hash2_lookup(view->hash, &hash_key);
 	if (old_rec != NULL) {
@@ -778,7 +850,7 @@ void mail_index_strmap_view_sync_add(struct mail_index_strmap_view_sync *sync,
 	rec->ref_index = ref_index;
 	rec->str_idx = str_idx;
 	array_push_back(&view->recs, rec);
-	array_push_back(&view->recs_crc32, &hash_key.crc32);
+	array_push_back(&view->recs_hash, &hash_key.hash);
 
 	view->last_added_uid = uid;
 	view->last_ref_index = ref_index;
@@ -799,7 +871,7 @@ void mail_index_strmap_view_sync_add_unique(struct mail_index_strmap_view_sync *
 	rec.ref_index = ref_index;
 	rec.str_idx = view->next_str_idx++;
 	array_push_back(&view->recs, &rec);
-	array_append_zero(&view->recs_crc32);
+	array_append_zero(&view->recs_hash);
 
 	view->last_added_uid = uid;
 	view->last_ref_index = ref_index;
@@ -817,7 +889,7 @@ static void mail_index_strmap_view_renumber(struct mail_index_strmap_view *view)
 {
 	struct mail_index_strmap_read_context ctx;
 	struct mail_index_strmap_rec *recs, *hash_rec;
-	uint32_t prev_uid, str_idx, *recs_crc32, *renumber_map;
+	uint32_t prev_uid, str_idx, *recs_hash, *renumber_map;
 	unsigned int i, dest, count, count2;
 	int ret;
 
@@ -830,7 +902,7 @@ static void mail_index_strmap_view_renumber(struct mail_index_strmap_view *view)
 	renumber_map = i_new(uint32_t, view->next_str_idx);
 	str_idx = 0; prev_uid = 0;
 	recs = array_get_modifiable(&view->recs, &count);
-	recs_crc32 = array_get_modifiable(&view->recs_crc32, &count2);
+	recs_hash = array_get_modifiable(&view->recs_hash, &count2);
 	i_assert(count == count2);
 
 	for (i = dest = 0; i < count; ) {
@@ -853,13 +925,13 @@ static void mail_index_strmap_view_renumber(struct mail_index_strmap_view *view)
 			renumber_map[recs[i].str_idx] = ++str_idx;
 		if (i != dest) {
 			recs[dest] = recs[i];
-			recs_crc32[dest] = recs_crc32[i];
+			recs_hash[dest] = recs_hash[i];
 		}
 		i++; dest++;
 	}
 	i_assert(renumber_map[0] == 0);
 	array_delete(&view->recs, dest, i-dest);
-	array_delete(&view->recs_crc32, dest, i-dest);
+	array_delete(&view->recs_hash, dest, i-dest);
 	mail_index_strmap_zero_terminate(view);
 
 	/* notify caller of the renumbering */
@@ -872,7 +944,7 @@ static void mail_index_strmap_view_renumber(struct mail_index_strmap_view *view)
 	hash2_clear(view->hash);
 	for (i = 0; i < count; i++) {
 		recs[i].str_idx = renumber_map[recs[i].str_idx];
-		hash_rec = hash2_insert_hash(view->hash, recs_crc32[i]);
+		hash_rec = hash2_insert_hash(view->hash, recs_hash[i]);
 		memcpy(hash_rec, &recs[i], sizeof(*hash_rec));
 	}
 
@@ -886,7 +958,7 @@ static void mail_index_strmap_write_block(struct mail_index_strmap_view *view,
 					  unsigned int i, uint32_t base_uid)
 {
 	const struct mail_index_strmap_rec *recs;
-	const uint32_t *crc32;
+	const uint32_t *hashes;
 	unsigned int j, n, count, count2, uid_rec_count;
 	uint32_t block_size;
 	uint8_t *p, packed[MAIL_INDEX_PACK_MAX_SIZE*2];
@@ -899,7 +971,7 @@ static void mail_index_strmap_write_block(struct mail_index_strmap_view *view,
 
 	/* write records */
 	recs = array_get(&view->recs, &count);
-	crc32 = array_get(&view->recs_crc32, &count2);
+	hashes = array_get(&view->recs_hash, &count2);
 	i_assert(count == count2);
 	while (i < count) {
 		/* @UNSAFE: <uid diff> */
@@ -916,7 +988,7 @@ static void mail_index_strmap_write_block(struct mail_index_strmap_view *view,
 		}
 		view->total_ref_count += uid_rec_count;
 
-		/* <n> <crc32>*count <str_idx>*count -
+		/* <n> <hash>*count <str_idx>*count -
 		   FIXME: thread index specific code */
 		i_assert(recs[i].ref_index == 0);
 		if (uid_rec_count == 1) {
@@ -935,7 +1007,7 @@ static void mail_index_strmap_write_block(struct mail_index_strmap_view *view,
 		mail_index_pack_num(&p, n);
 		o_stream_nsend(output, packed, p-packed);
 		for (j = 0; j < uid_rec_count; j++)
-			o_stream_nsend(output, &crc32[i+j], sizeof(crc32[i+j]));
+			o_stream_nsend(output, &hashes[i+j], sizeof(hashes[i+j]));
 		for (j = 0; j < uid_rec_count; j++) {
 			i_assert(j < 2 || recs[i+j].ref_index == j+1);
 			o_stream_nsend(output, &recs[i+j].str_idx,
@@ -968,14 +1040,29 @@ mail_index_strmap_recreate_write(struct mail_index_strmap_view *view,
 {
 	const struct mail_index_header *idx_hdr;
 	struct mail_index_strmap_header hdr;
+	size_t hdr_size;
 
 	idx_hdr = mail_index_get_header(view->view);
 
+	/* view->format_version was set either at view_open() time (from the
+	   strmap-wide enable_xxh64 preference for fresh files) or in
+	   mail_index_strmap_open() from the existing file's header. Reuse
+	   it as-is so renumber recreates preserve the file's format. */
+
 	/* write header */
 	i_zero(&hdr);
-	hdr.version = MAIL_INDEX_STRMAP_VERSION;
+	hdr.version = view->format_version;
 	hdr.uid_validity = idx_hdr->uid_validity;
-	o_stream_nsend(output, &hdr, sizeof(hdr));
+	if (view->format_version >= MAIL_INDEX_STRMAP_VERSION_V2) {
+#ifndef WORDS_BIGENDIAN
+		hdr.compat_flags |= MAIL_INDEX_COMPAT_LITTLE_ENDIAN;
+#endif
+		hdr.hash_iv = view->hash_iv;
+		hdr_size = MAIL_INDEX_STRMAP_HEADER_V2_SIZE;
+	} else {
+		hdr_size = MAIL_INDEX_STRMAP_HEADER_V1_SIZE;
+	}
+	o_stream_nsend(output, &hdr, hdr_size);
 
 	view->total_ref_count = 0;
 	mail_index_strmap_write_block(view, output, 0, 1);
@@ -1092,7 +1179,7 @@ mail_index_strmap_write_append(struct mail_index_strmap_view *view)
 	const struct mail_index_strmap_rec *old_recs;
 	unsigned int i, old_count;
 	struct ostream *output;
-	uint32_t crc32, next_uid;
+	uint32_t hash, next_uid;
 	bool full_block;
 	int ret;
 
@@ -1131,7 +1218,7 @@ mail_index_strmap_write_append(struct mail_index_strmap_view *view)
 	full_block = TRUE; ret = 0;
 	while (i < old_count &&
 	       (ret = strmap_read_block_init(view, &ctx)) > 0) {
-		while ((ret = strmap_read_block_next(&ctx, &crc32)) > 0) {
+		while ((ret = strmap_read_block_next(&ctx, &hash)) > 0) {
 			if (ctx.rec.uid != old_recs[i].uid ||
 			    ctx.rec.str_idx != old_recs[i].str_idx) {
 				/* mismatch */

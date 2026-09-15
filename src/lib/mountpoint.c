@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "mountpoint.h"
@@ -27,6 +27,7 @@
 #  include <stdio.h>
 #  include <sys/mnttab.h> /* Solaris */
 #  include <sys/mntent.h>
+#  include <sys/mkdev.h>
 #  define MOUNTPOINT_SOLARIS
 #else
 #  define MOUNTPOINT_UNKNOWN

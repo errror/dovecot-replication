@@ -1,4 +1,4 @@
-/* Copyright (c) 2024 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -9,6 +9,8 @@
 #include "var-expand-parser-private.h"
 #include "var-expand-parser.h"
 #include "expansion.h"
+
+#define MAX_PROGRAM_SIZE 8192
 
 extern void var_expand_parser_lex_init_extra(void*, void*);
 
@@ -22,6 +24,13 @@ int var_expand_program_create(const char *str,
 	int ret;
 	struct var_expand_parser_state state;
 	i_zero(&state);
+
+	if (strlen(str) > MAX_PROGRAM_SIZE) {
+		*error_r = t_strdup_printf("Program size exceeds maximum of %d bytes",
+					   MAX_PROGRAM_SIZE);
+		return -1;
+	}
+
 	pool_t pool =
 		pool_alloconly_create(MEMPOOL_GROWING"var expand program", 1024);
 	state.p = state.plist = p_new(pool, struct var_expand_program, 1);
@@ -31,7 +40,7 @@ int var_expand_program_create(const char *str,
 	T_BEGIN {
 		state.str = NULL;
 		state.pool =
-			pool_alloconly_create(MEMPOOL_GROWING"var expand parser", 32768);
+			pool_allocfree_create("var expand parser");
 		p_array_init(&state.variables, pool, 1);
 		state.input = str;
 		state.left = strlen(str);
@@ -79,15 +88,11 @@ void var_expand_program_dump(const struct var_expand_program *prog, string_t *de
 	}
 }
 
-int var_expand_program_execute(string_t *dest, const struct var_expand_program *program,
-			       const struct var_expand_params *params, const char **error_r)
- {
-	int ret = 0;
-	struct var_expand_state state;
-	i_zero(&state);
-
-	if (params == NULL)
-		params = &empty_params;
+static void prepare_state(const struct var_expand_params *params,
+			  struct var_expand_state *state_r)
+{
+	i_zero(state_r);
+	i_assert(params != NULL);
 
 	i_assert((params->table == NULL && params->tables_arr == NULL) ||
 		 (params->table != NULL && params->tables_arr == NULL) ||
@@ -98,62 +103,121 @@ int var_expand_program_execute(string_t *dest, const struct var_expand_program *
 		 (params->providers == NULL && params->providers_arr != NULL));
 
 	size_t num_tables = 0;
-	if (params->tables_arr != NULL)
+	if (params->tables_arr != NULL) {
 		while (params->tables_arr[num_tables] != NULL)
 			num_tables++;
+	}
 	size_t num_providers = 0;
-	if (params->providers_arr != NULL)
+	if (params->providers_arr != NULL) {
 		while (params->providers_arr[num_providers] != NULL)
 		     num_providers++;
+	}
 	size_t num_contexts = I_MAX(num_tables, num_providers);
 
 	/* ensure contexts are properly terminated. */
 	i_assert(params->contexts == NULL ||
 		 params->contexts[num_contexts] == var_expand_contexts_end);
 
-	state.params = params;
-	state.result = str_new(default_pool, 32);
-	state.transfer = str_new(default_pool, 32);
+	state_r->params = params;
+	state_r->result = str_new(default_pool, 32);
+	state_r->transfer = str_new(default_pool, 32);
+}
+
+static int
+var_expand_program_execute_one_real(const struct var_expand_program *program,
+				    const struct var_expand_params *params,
+				    struct var_expand_state *state,
+				    const char **error_r)
+{
+	int ret = 0;
+	const struct var_expand_statement *stmt = program->first;
+	if (stmt == NULL) {
+		/* skip empty programs */
+		return 0;
+	}
+	T_BEGIN {
+		while (stmt != NULL) {
+			bool first = stmt == program->first;
+			if (!var_expand_execute_stmt(state, stmt,
+						     first, error_r)) {
+				ret = -1;
+				break;
+			}
+			stmt = stmt->next;
+		}
+	} T_END_PASS_STR_IF(ret < 0, error_r);
+	if (ret < 0)
+		return ret;
+	if (state->transfer_binary)
+		var_expand_state_set_transfer(state,
+				binary_to_hex(state->transfer->data, state->transfer->used));
+	if (state->transfer_set) {
+		if (!program->only_literal && params->escape_func != NULL &&
+		    !state->transfer_safe) {
+			const char *escaped;
+			if (params->escape_func(str_c(state->transfer), &escaped,
+						params->escape_context, error_r) < 0)
+				return -1;
+			str_append(state->result, escaped);
+		} else
+			str_append_str(state->result, state->transfer);
+	} else {
+		*error_r = t_strdup(state->delayed_error);
+		ret = -1;
+	}
+	var_expand_state_unset_transfer(state);
+	return ret;
+}
+
+int var_expand_program_execute_one(string_t *dest, const struct var_expand_program *program,
+				   const struct var_expand_params *params, const char **error_r)
+{
+	int ret = 0;
+	struct var_expand_state state;
+	if (params == NULL)
+		params = &empty_params;
+	prepare_state(params, &state);
+
+	*error_r = NULL;
+
+	ret = var_expand_program_execute_one_real(program, params, &state, error_r);
+
+	if (state.delayed_error != NULL) {
+		*error_r = t_strdup(state.delayed_error);
+		ret = -1;
+	}
+	str_free(&state.transfer);
+	i_free(state.delayed_error);
+	/* only write to dest on success */
+	if (ret == 0)
+		str_append_str(dest, state.result);
+	str_free(&state.result);
+	i_assert(ret == 0 || *error_r != NULL);
+
+	return ret;
+}
+
+int var_expand_program_execute(string_t *dest, const struct var_expand_program *program,
+			       const struct var_expand_params *params, const char **error_r)
+ {
+	int ret = 0;
+	struct var_expand_state state;
+	if (params == NULL)
+		params = &empty_params;
+	prepare_state(params, &state);
 
 	*error_r = NULL;
 
 	while (program != NULL) {
-		const struct var_expand_statement *stmt = program->first;
-		if (stmt == NULL) {
-			/* skip empty programs */
-			program = program->next;
-			continue;
-		}
-		T_BEGIN {
-			while (stmt != NULL) {
-				bool first = stmt == program->first;
-				if (!var_expand_execute_stmt(&state, stmt,
-							     first, error_r)) {
-					ret = -1;
-					break;
-				}
-				stmt = stmt->next;
-			}
-		} T_END_PASS_STR_IF(ret < 0, error_r);
-		if (ret < 0)
+		ret = var_expand_program_execute_one_real(program, params, &state, error_r);
+		if (ret == -1)
 			break;
-		if (state.transfer_binary)
-			var_expand_state_set_transfer(&state, binary_to_hex(state.transfer->data, state.transfer->used));
-		if (state.transfer_set) {
-			if (!program->only_literal && params->escape_func != NULL) {
-				str_append(state.result,
-					   params->escape_func(str_c(state.transfer),
-							       params->escape_context));
-			} else
-				str_append_str(state.result, state.transfer);
-		} else {
-			*error_r = t_strdup(state.delayed_error);
-			ret = -1;
-			break;
-		}
-		var_expand_state_unset_transfer(&state);
 		program = program->next;
 	};
+	if (state.delayed_error != NULL) {
+		*error_r = t_strdup(state.delayed_error);
+		ret = -1;
+	}
 	str_free(&state.transfer);
 	i_free(state.delayed_error);
 	/* only write to dest on success */
@@ -169,6 +233,28 @@ const char *const *
 var_expand_program_variables(const struct var_expand_program *program)
 {
 	return program->variables;
+}
+
+bool var_expand_program_has_variable(const struct var_expand_program *program,
+				     const char *variable, bool first_program_only)
+{
+	if (!first_program_only)
+		return str_array_find(var_expand_program_variables(program), variable);
+
+	const struct var_expand_statement *stmt = program->first;
+	if (stmt->params == NULL && strcmp(stmt->function, variable) == 0)
+		return TRUE;
+	while (stmt != NULL) {
+		const struct var_expand_parameter *par = stmt->params;
+		while (par != NULL) {
+			if (par->value_type == VAR_EXPAND_PARAMETER_VALUE_TYPE_VARIABLE &&
+			    strcmp(par->value.str, variable) == 0)
+				return TRUE;
+			par = par->next;
+		}
+		stmt = stmt->next;
+	}
+	return FALSE;
 }
 
 void var_expand_program_free(struct var_expand_program **_program)
@@ -301,12 +387,131 @@ const char *var_expand_program_export(const struct var_expand_program *program)
 	return str_c(dest);
 }
 
+static void
+var_expand_program_to_string_calculate(const struct var_expand_statement *stmt,
+				       string_t *dest)
+{
+	if (str_len(dest) > 0)
+		str_append_c(dest, ' ');
+	switch (stmt->params->value.num) {
+	case VAR_EXPAND_STATEMENT_OPER_PLUS:
+		str_append_c(dest, '+');
+		break;
+	case VAR_EXPAND_STATEMENT_OPER_MINUS:
+		str_append_c(dest, '-');
+		break;
+	case VAR_EXPAND_STATEMENT_OPER_STAR:
+		str_append_c(dest, '*');
+		break;
+	case VAR_EXPAND_STATEMENT_OPER_SLASH:
+		str_append_c(dest, '/');
+		break;
+	case VAR_EXPAND_STATEMENT_OPER_MODULO:
+		str_append_c(dest, '%');
+		break;
+	case VAR_EXPAND_STATEMENT_OPER_COUNT:
+	default:
+		i_unreached();
+	}
+	str_append_c(dest, ' ');
+	str_printfa(dest, "%jd", stmt->params->next->value.num);
+}
+
+void
+var_expand_program_to_string_append_one(string_t *dest,
+					const struct var_expand_program *program)
+{
+	if (program->only_literal) {
+		i_assert(program->first->params->value_type ==
+			 VAR_EXPAND_PARAMETER_VALUE_TYPE_STRING);
+		str_append(dest, program->first->params->value.str);
+		return;
+	}
+	str_append(dest, "%{");
+	const struct var_expand_statement *stmt = program->first;
+	while (stmt != NULL) {
+		bool braces = FALSE;
+		if (strcmp(stmt->function, "calculate") == 0) {
+			var_expand_program_to_string_calculate(stmt, dest);
+			goto next;
+		}
+		str_append(dest, stmt->function);
+		const struct var_expand_parameter *param = stmt->params;
+		if (param != NULL) {
+			str_append_c(dest, '(');
+			braces = TRUE;
+		}
+		while (param != NULL) {
+			if (param->key != NULL) {
+				str_append(dest, param->key);
+				str_append_c(dest, '=');
+			}
+			switch (param->value_type) {
+			case VAR_EXPAND_PARAMETER_VALUE_TYPE_STRING:
+				str_append_c(dest, '\'');
+				str_append_escaped(dest, param->value.str,
+						   strlen(param->value.str));
+				str_append_c(dest, '\'');
+				break;
+			case VAR_EXPAND_PARAMETER_VALUE_TYPE_INT:
+				str_printfa(dest, "%jd", param->value.num);
+				break;
+			case VAR_EXPAND_PARAMETER_VALUE_TYPE_VARIABLE:
+				str_append(dest, param->value.str);
+				break;
+			default:
+				i_unreached();
+			}
+			param = param->next;
+			if (param != NULL)
+				str_append(dest, ", ");
+		}
+		if (braces)
+			str_append_c(dest, ')');
+next:		stmt = stmt->next;
+		if (stmt != NULL && strcmp(stmt->function, "calculate") != 0)
+			str_append(dest, " | ");
+	}
+	str_append_c(dest, '}');
+}
+
+void var_expand_program_to_string_append(string_t *dest,
+					 const struct var_expand_program *program)
+{
+	i_assert(program != NULL);
+	i_assert(dest != NULL);
+
+	while (program != NULL) {
+		var_expand_program_to_string_append_one(dest, program);
+		program = program->next;
+	}
+}
+
+const char *var_expand_program_to_string_one(const struct var_expand_program *program)
+{
+	string_t *dest = t_str_new(64);
+	var_expand_program_to_string_append_one(dest, program);
+	return str_c(dest);
+}
+
+const char *var_expand_program_to_string(const struct var_expand_program *program)
+{
+	string_t *dest = t_str_new(64);
+	var_expand_program_to_string_append(dest, program);
+	return str_c(dest);
+}
+
 /* Import code */
 
-static int extract_name(char *data, size_t size,
+static int extract_name(pool_t pool, const char *data, size_t size,
 			const char **value_r, const char **error_r)
 {
-	char *ptr = memchr(data, '\1', size);
+	if (size == 0) {
+		*error_r = "Missing end of name";
+		return -1;
+	}
+
+	const char *ptr = memchr(data, '\1', size);
 	if (ptr == NULL) {
 		*error_r = "Missing end of name";
 		return -1;
@@ -316,23 +521,27 @@ static int extract_name(char *data, size_t size,
 		*value_r = NULL;
 		return 1;
 	}
-	*value_r = data;
-	*ptr = '\0';
+	*value_r = p_strdup_until(pool, data, ptr);
 	return len + 1;
-
 }
 
-static int extract_value(char *data, size_t size,
+static int extract_value(pool_t pool, const char *data, size_t size,
 			 const char **value_r, const char **error_r)
 {
-	char *ptr = memchr(data, '\r', size);
+	if (size == 0) {
+		*error_r = "Missing end of string";
+		return -1;
+	}
+
+	const char *ptr = memchr(data, '\r', size);
 	if (ptr == NULL) {
 		*error_r = "Missing end of string";
 		return -1;
 	}
 	size_t len = ptr - data;
-	*ptr = '\0';
-	*value_r = str_tabunescape(data);
+	string_t *unescaped = str_new(pool, len);
+	str_append_tabunescaped(unescaped, data, len);
+	*value_r = str_c(unescaped);
 	/* make sure we end up in right place. */
 	return len + 1;
 }
@@ -340,6 +549,11 @@ static int extract_value(char *data, size_t size,
 static int extract_number(const char *data, size_t size, intmax_t *value_r,
 			  const char **error_r)
 {
+	if (size == 0) {
+		*error_r = "Too short number";
+		return -1;
+	}
+
 	const unsigned char *ptr = (const unsigned char*)data;
 	bool negative;
 	size_t len = 1;
@@ -351,6 +565,11 @@ static int extract_number(const char *data, size_t size, intmax_t *value_r,
 		return 1;
 	}
 
+	if (size < 2) {
+		*error_r = "Too short number";
+		return -1;
+	}
+
 	const char sign = *ptr - 0x80;
 	if (sign == '+') {
 		negative = FALSE;
@@ -360,13 +579,15 @@ static int extract_number(const char *data, size_t size, intmax_t *value_r,
 		*error_r = "Unknown number";
 		return -1;
 	}
+	size--;
 	ptr++;
 
 	intmax_t value = 0;
 	intmax_t shift = 0;
+	size_t max_size = I_MIN(size, 9);
 
 	/* a number can be at most 9 bytes */
-	for (size_t i = 0; i < I_MIN(size, 9); i++) {
+	for (size_t i = 0; i < max_size; i++) {
 		len++;
 		value |= ((*(ptr) & 0x7fLL) << shift);
 		/* if high byte is set, the number continues */
@@ -374,9 +595,10 @@ static int extract_number(const char *data, size_t size, intmax_t *value_r,
 			break;
 		shift += 7;
 		ptr++;
+		size--;
 	}
 
-	if ((*ptr & 0x80) != 0) {
+	if (size > 0 && (*ptr & 0x80) != 0) {
 		*error_r = "Unfinished number";
 		return -1;
 	}
@@ -397,7 +619,7 @@ static int extract_number(const char *data, size_t size, intmax_t *value_r,
 	data = data + (count); \
 	size = size - (size_t)(count);
 
-static int var_expand_program_import_stmt(char *data, size_t size,
+static int var_expand_program_import_stmt(const char *data, size_t size,
 					  struct var_expand_program *program,
 					  const char **error_r)
 {
@@ -406,7 +628,7 @@ static int var_expand_program_import_stmt(char *data, size_t size,
 	size_t orig_size = size;
 
 	/* normal program, starts with filter name */
-	int ret = extract_name(data, size, &name, error_r);
+	int ret = extract_name(program->pool, data, size, &name, error_r);
 	if (ret < 0)
 		return -1;
 	if (name == NULL) {
@@ -438,12 +660,17 @@ static int var_expand_program_import_stmt(char *data, size_t size,
 			param->idx = ++idx;
 			ADVANCE_INPUT(1);
 		} else {
-			ret = extract_name(data, size,
+			ret = extract_name(program->pool, data, size,
 					   &name, error_r);
 			if (ret < 0)
 				return -1;
 			ADVANCE_INPUT(ret);
 			param->key = name;
+		}
+
+		if (size < 1) {
+			*error_r = "Premature end of data";
+			return -1;
 		}
 
 		/* check the parameter type */
@@ -466,9 +693,14 @@ static int var_expand_program_import_stmt(char *data, size_t size,
 		}
 		ADVANCE_INPUT(1);
 
+		if (size == 0) {
+			*error_r = "Premature end of data";
+			return -1;
+		}
+
 		if (param->value_type == VAR_EXPAND_PARAMETER_VALUE_TYPE_STRING ||
 		    param->value_type == VAR_EXPAND_PARAMETER_VALUE_TYPE_VARIABLE) {
-			ret = extract_value(data, size,
+			ret = extract_value(program->pool, data, size,
 					    &value, error_r);
 			if (ret < 0)
 				return -1;
@@ -492,9 +724,9 @@ static int var_expand_program_import_stmt(char *data, size_t size,
 			prev->next = param;
 		prev = param;
 
-		if (*data == '\t') {
+		if (size > 0 && *data == '\t') {
 			break;
-		} else if (*data == '\1') {
+		} else if (size > 0 && *data == '\1') {
 			ADVANCE_INPUT(1);
 		} else {
 			*error_r = "Missing parameter end";
@@ -502,7 +734,7 @@ static int var_expand_program_import_stmt(char *data, size_t size,
 		}
 	}
 
-	if (*data != '\t')
+	if (size < 1 || *data != '\t')
 		*error_r = "Missing parameter statement end";
 
 	ADVANCE_INPUT(1);
@@ -510,11 +742,11 @@ static int var_expand_program_import_stmt(char *data, size_t size,
 	return orig_size - size;
 }
 
-static int var_expand_program_import_one(char **_data, size_t *_size,
+static int var_expand_program_import_one(const char **_data, size_t *_size,
 					 struct var_expand_program *program,
 					 const char **error_r)
 {
-	char *data = *_data;
+	const char *data = *_data;
 	size_t size = *_size;
 	const char *value;
 	int ret;
@@ -522,7 +754,7 @@ static int var_expand_program_import_one(char **_data, size_t *_size,
 	/* Only literal */
 	if (*data == '\1') {
 		ADVANCE_INPUT(1);
-		ret = extract_value(data, size, &value, error_r);
+		ret = extract_value(program->pool, data, size, &value, error_r);
 		if (ret < 0)
 			return -1;
 		ADVANCE_INPUT(ret);
@@ -542,30 +774,33 @@ static int var_expand_program_import_one(char **_data, size_t *_size,
 	/* A full program */
 	} else if (*data == '\2') {
 		ADVANCE_INPUT(1);
-		while (*data != '\t' && size > 0) {
+		while (size > 0 && *data != '\t') {
 			int ret = var_expand_program_import_stmt(data, size, program, error_r);
 			if (ret < 0)
 				return -1;
 			ADVANCE_INPUT(ret);
-			if (*data == '\t') {
+			if (size > 0 && *data == '\t') {
 				ADVANCE_INPUT(1);
 				break;
-			} else if (*data != '\1') {
+			} else if (size == 0 || *data != '\1') {
 				*error_r = "Missing statement end";
 				return -1;
 			}
 			ADVANCE_INPUT(1);
 		}
 		/* And finally there should be variables */
-		if (*data != '\t') {
+		if (size > 0 && *data != '\t') {
 			const char *ptr = memchr(data, '\t', size);
 			if (ptr == NULL) {
 				*error_r = "Missing variables end";
 				return -1;
 			}
 			size_t len = ptr - data;
+			/* ensure data is properly terminated, since
+			   p_strsplit() expects a NUL terminated string. */
+			const char *variables = t_strdup_until(data, ptr);
 			program->variables = (const char *const *)
-				p_strsplit(program->pool, data, "\1");
+				p_strsplit(program->pool, variables, "\1");
 			ADVANCE_INPUT(len + 1);
 		} else {
 			ADVANCE_INPUT(1);
@@ -596,14 +831,13 @@ int var_expand_program_import_sized(const char *data, size_t size,
 	struct var_expand_program *prev = NULL;
 	struct var_expand_program *first = NULL;
 	int ret;
-	char *copy_data = p_strndup(pool, data, size);
 
 	while (size > 0) {
 		struct var_expand_program *program =
 			p_new(pool, struct var_expand_program, 1);
 		program->pool = pool;
 		T_BEGIN {
-			ret = var_expand_program_import_one(&copy_data, &size,
+			ret = var_expand_program_import_one(&data, &size,
 							    program, error_r);
 		} T_END;
 		if (ret < 0)

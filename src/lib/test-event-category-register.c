@@ -1,4 +1,4 @@
-/* Copyright (c) 2019 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "ioloop.h"
@@ -144,6 +144,9 @@ static void test_event_category_1ptr_nonnull(void)
 	register_cat(&cat_with_parent, NULL);
 	check_cat_registered(CAT_NAME_0, TRUE);
 	check_cat_registered(CAT_NAME_1, TRUE);
+	/* the representative's parent is the parent's representative */
+	test_assert(event_category_find_registered(CAT_NAME_1)->parent ==
+		    event_category_find_registered(CAT_NAME_0));
 
 	unregister_cat(&cat_with_parent, UNREG_LAST);
 	unregister_cat(&cat_with_parent, UNREG_NOP);
@@ -244,6 +247,47 @@ static void test_event_category_2ptr_nonnull_similar(void)
 #undef CAT_NAME_1
 }
 
+static void test_event_category_unregister(void)
+{
+#define CAT_NAME_0	CAT_NAME_PREFIX "-unregister"
+	struct event_category *cat, *cat2, *representative;
+
+	test_begin("event category unregister");
+
+	check_cat_registered(CAT_NAME_0, FALSE);
+
+	/* dynamically allocated categories can be freed after unregistering */
+	cat = i_new(struct event_category, 1);
+	cat->name = CAT_NAME_0;
+	register_cat(cat, cat);
+
+	representative = event_category_find_registered(CAT_NAME_0);
+	test_assert(representative != NULL);
+
+	event_category_unregister(cat);
+	test_assert(cat->internal == NULL);
+	i_free(cat);
+
+	/* the category itself stays registered */
+	test_assert(event_category_find_registered(CAT_NAME_0) ==
+		    representative);
+
+	/* registering the name again reuses the same representative */
+	cat2 = i_new(struct event_category, 1);
+	cat2->name = CAT_NAME_0;
+	register_cat(cat2, NULL);
+	test_assert(representative != NULL &&
+		    cat2->internal == representative->internal);
+
+	event_category_unregister(cat2);
+	/* unregistering an unregistered category is a no-op */
+	event_category_unregister(cat2);
+	i_free(cat2);
+
+	test_end();
+#undef CAT_NAME_0
+}
+
 void test_event_category_register(void)
 {
 	event_category_register_callback(check_category);
@@ -262,6 +306,10 @@ void test_event_category_register(void)
 	test_event_category_2ptr_null();
 	test_event_category_2ptr_nonnull_same();
 	test_event_category_2ptr_nonnull_similar();
+
+	/* unregistering a category struct leaves the category itself
+	   registered */
+	test_event_category_unregister();
 
 	event_category_unregister_callback(check_category);
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -158,10 +158,10 @@ struct imapc_connection {
 	bool idle_plus_waiting:1;
 	bool imap4rev2_enabled:1;
 	bool select_waiting_reply:1;
-	/* TRUE if IMAP server is in SELECTED state. select_box may be NULL
+	/* The name of the folder if in SELECTED state. select_box may be NULL
 	   though, if we already closed the mailbox from client point of
 	   view. */
-	bool selected_on_server:1;
+	char *selected_on_server;
 };
 
 static void imapc_connection_capability_cb(const struct imapc_command_reply *reply,
@@ -262,6 +262,7 @@ static void imapc_connection_unref(struct imapc_connection **_conn)
 	array_free(&conn->aborted_cmd_tags);
 	imapc_client_unref(&conn->client);
 	event_unref(&conn->event);
+	i_free(conn->selected_on_server);
 	i_free(conn->ips);
 	i_free(conn);
 }
@@ -422,7 +423,7 @@ static void imapc_connection_set_state(struct imapc_connection *conn,
 		conn->select_waiting_reply = FALSE;
 		conn->qresync_selecting_box = NULL;
 		conn->selected_box = NULL;
-		conn->selected_on_server = FALSE;
+		i_free_and_null(conn->selected_on_server);
 		/* fall through */
 	case IMAPC_CONNECTION_STATE_DONE:
 		/* if we came from imapc_client_get_capabilities(), stop so
@@ -783,7 +784,6 @@ imapc_connection_parse_capability(struct imapc_connection *conn,
 				  const char *value)
 {
 	const char *const *tmp;
-	unsigned int i;
 
 	e_debug(conn->event, "Server capabilities: %s", value);
 
@@ -792,34 +792,20 @@ imapc_connection_parse_capability(struct imapc_connection *conn,
 		p_strsplit_free(default_pool, conn->capabilities_list);
 	conn->capabilities_list = p_strsplit(default_pool, value, " ");
 
-	for (tmp = t_strsplit(value, " "); *tmp != NULL; tmp++) {
-		for (i = 0; imapc_capability_names[i].name != NULL; i++) {
-			const struct imapc_capability_name *cap =
-				&imapc_capability_names[i];
-
-			if (strcasecmp(*tmp, cap->name) == 0) {
-				conn->capabilities |= cap->capability;
-				break;
-			}
-		}
-	}
+	for (tmp = t_strsplit(value, " "); *tmp != NULL; tmp++)
+		conn->capabilities |= imapc_capability_lookup(*tmp);
 
 	if ((conn->capabilities & IMAPC_CAPABILITY_IMAP4REV1) == 0) {
 		imapc_connection_input_error(conn,
 			"CAPABILITY list is missing IMAP4REV1");
 		return -1;
 	}
-	if ((conn->client->set->parsed_features & IMAPC_FEATURE_NO_QRESYNC) != 0)
-		conn->capabilities &= ENUM_NEGATE(IMAPC_CAPABILITY_QRESYNC);
-	if ((conn->client->set->parsed_features & IMAPC_FEATURE_NO_IMAP4REV2) != 0)
-		conn->capabilities &= ENUM_NEGATE(IMAPC_CAPABILITY_IMAP4REV2);
-	else {
+	conn->capabilities &= ENUM_NEGATE(conn->client->set->parsed_disabled_capabilities);
 #ifndef EXPERIMENTAL_IMAP4REV2
-		e_debug(conn->event,
-			"Disable IMAP4REV2 capability, as it is not supported with this build");
-		conn->capabilities &= ENUM_NEGATE(IMAPC_CAPABILITY_IMAP4REV2);
+	e_debug(conn->event,
+		"Disable IMAP4REV2 capability, as it is not supported with this build");
+	conn->capabilities &= ENUM_NEGATE(IMAPC_CAPABILITY_IMAP4REV2);
 #endif
-	}
 
 	return 0;
 }
@@ -838,7 +824,7 @@ imapc_connection_handle_resp_text_code(struct imapc_connection *conn,
 			conn->selected_box = conn->qresync_selecting_box;
 			conn->qresync_selecting_box = NULL;
 		} else {
-			conn->selected_on_server = FALSE;
+			i_free_and_null(conn->selected_on_server);
 		}
 	}
 	return 0;
@@ -881,14 +867,8 @@ imapc_connection_handle_imap_resp_text(struct imapc_connection *conn,
 		return 0;
 
 	text = imap_args_to_str(args);
-	if (*text != '[') {
-		if (*text == '\0') {
-			imapc_connection_input_error(conn,
-				"Missing text in resp-text");
-			return -1;
-		}
+	if (*text != '[')
 		return 0;
-	}
 	return imapc_connection_handle_resp_text(conn, text, key_r, value_r);
 }
 
@@ -987,10 +967,11 @@ imapc_connection_authenticate_cb(const struct imapc_command_reply *reply,
 		imapc_auth_failed(conn, reply,
 				  t_strdup_printf("Server sent non-base64 input for AUTHENTICATE: %s",
 						  reply->text_full));
-	} else if (dsasl_client_input(conn->sasl_client, buf->data, buf->used, &error) < 0) {
+	} else if (dsasl_client_input(conn->sasl_client, buf->data, buf->used,
+				      &error) != DSASL_CLIENT_RESULT_OK) {
 		imapc_auth_failed(conn, reply, error);
 	} else if (dsasl_client_output(conn->sasl_client, &sasl_output,
-				       &sasl_output_len, &error) < 0) {
+				       &sasl_output_len, &error) != DSASL_CLIENT_RESULT_OK) {
 		imapc_auth_failed(conn, reply, error);
 	} else if (sasl_output_len == 0) {
 		o_stream_nsend_str(conn->output, "\r\n");
@@ -1109,6 +1090,7 @@ static void imapc_connection_authenticate(struct imapc_connection *conn)
 	}
 
 	i_zero(&sasl_set);
+	sasl_set.event_parent = conn->event;
 	if (*set->imapc_master_user == '\0')
 		sasl_set.authid = set->imapc_user;
 	else {
@@ -1116,6 +1098,9 @@ static void imapc_connection_authenticate(struct imapc_connection *conn)
 		sasl_set.authzid = set->imapc_user;
 	}
 	sasl_set.password = conn->client->password;
+	sasl_set.protocol = "imap";
+	sasl_set.host = conn->client->set->imapc_host;
+	sasl_set.port = conn->client->set->imapc_port;
 
 	if (sasl_mech == NULL)
 		sasl_mech = &dsasl_client_mech_plain;
@@ -1138,7 +1123,8 @@ static void imapc_connection_authenticate(struct imapc_connection *conn)
 		const char *error;
 
 		if (dsasl_client_output(conn->sasl_client, &sasl_output,
-					&sasl_output_len, &error) < 0) {
+					&sasl_output_len,
+					&error) != DSASL_CLIENT_RESULT_OK) {
 			e_error(conn->event,
 				"Failed to create initial SASL reply: %s",
 				error);
@@ -1577,8 +1563,11 @@ static int imapc_connection_input_tagged(struct imapc_connection *conn)
 	    (cmd->flags & IMAPC_COMMAND_FLAG_SELECT) != 0 &&
 	    conn->selected_box != NULL) {
 		/* EXAMINE/SELECT failed: mailbox is no longer selected */
-		imapc_connection_unselect(conn->selected_box, TRUE);
-	}
+		imapc_connection_mailbox_closed(conn->selected_box, TRUE);
+	} else if (reply.state == IMAPC_COMMAND_STATE_OK &&
+                   (cmd->flags & IMAPC_COMMAND_FLAG_UNSELECT) != 0) {
+               	i_free_and_null(conn->selected_on_server);
+        }
 
 	if (conn->reconnect_command_count > 0 &&
 	    (cmd->flags & IMAPC_COMMAND_FLAG_RECONNECTED) != 0) {
@@ -1709,23 +1698,27 @@ static void imapc_connection_input(struct imapc_connection *conn)
 	imapc_connection_unref(&conn);
 }
 
-static int imapc_connection_ssl_handshaked(const char **error_r, void *context)
+static enum ssl_iostream_state
+imapc_connection_ssl_handshaked(const char **error_r, void *context)
 {
 	struct imapc_connection *conn = context;
 	const char *error;
+	enum ssl_iostream_cert_validity validity =
+		ssl_iostream_check_cert_validity(conn->ssl_iostream,
+			conn->client->set->imapc_host, &error);
 
-	if (ssl_iostream_check_cert_validity(conn->ssl_iostream,
-					     conn->client->set->imapc_host, &error) == 0) {
+	if (validity == SSL_IOSTREAM_CERT_VALIDITY_OK)
 		e_debug(conn->event, "SSL handshake successful");
-		return 0;
-	} else if (ssl_iostream_get_allow_invalid_cert(conn->ssl_iostream)) {
+	else if (ssl_iostream_get_allow_invalid_cert(conn->ssl_iostream)) {
 		e_debug(conn->event, "SSL handshake successful, "
 			"ignoring invalid certificate: %s", error);
-		return 0;
 	} else {
 		*error_r = error;
-		return -1;
+		return validity == SSL_IOSTREAM_CERT_VALIDITY_NAME_MISMATCH ?
+			SSL_IOSTREAM_STATE_NAME_MISMATCH :
+			SSL_IOSTREAM_STATE_INVALID_CERT;
 	}
+	return SSL_IOSTREAM_STATE_OK;
 }
 
 static int imapc_connection_ssl_init(struct imapc_connection *conn)
@@ -1772,7 +1765,8 @@ static int imapc_connection_ssl_init(struct imapc_connection *conn)
 	}
 
 	if (*conn->client->imapc_rawlog_dir != '\0') {
-		iostream_rawlog_create(conn->client->imapc_rawlog_dir,
+		iostream_rawlog_create(conn->event, "imapc_rawlog_dir",
+				       conn->client->imapc_rawlog_dir,
 				       &conn->input, &conn->output);
 	}
 
@@ -1907,7 +1901,8 @@ static void imapc_connection_connect_next_ip(struct imapc_connection *conn)
 
 	if (*conn->client->imapc_rawlog_dir != '\0' &&
 	    conn->client->ssl_mode != IMAPC_CLIENT_SSL_MODE_IMMEDIATE) {
-		iostream_rawlog_create(conn->client->imapc_rawlog_dir,
+		iostream_rawlog_create(conn->event, "imapc_rawlog_dir",
+				       conn->client->imapc_rawlog_dir,
 				       &conn->input, &conn->output);
 	}
 
@@ -1915,7 +1910,8 @@ static void imapc_connection_connect_next_ip(struct imapc_connection *conn)
 	o_stream_set_flush_callback(conn->output, imapc_connection_connected,
 				    conn);
 	conn->parser = imap_parser_create(conn->input, NULL,
-					  conn->client->set->imapc_max_line_length);
+					  conn->client->set->imapc_max_line_length,
+					  NULL);
 	conn->to = timeout_add(conn->client->set->imapc_connection_timeout_interval_msecs,
 			       imapc_connection_timeout, conn);
 	conn->to_output = timeout_add(conn->client->set->imapc_max_idle_time_secs*1000,
@@ -1990,7 +1986,7 @@ void imapc_connection_connect(struct imapc_connection *conn)
 		conn->ips = i_new(struct ip_addr, conn->ips_count);
 		conn->ips[0] = ip;
 	} else {
-		(void)dns_lookup(conn->client->set->imapc_host, NULL,
+		dns_lookup(conn->client->set->imapc_host, NULL,
 				 conn->event, imapc_connection_dns_callback,
 				 conn, &conn->dns_lookup);
 		return;
@@ -2208,7 +2204,7 @@ static void imapc_connection_set_selecting(struct imapc_client_mailbox *box)
 
 	i_assert(conn->qresync_selecting_box == NULL);
 
-	if (conn->selected_on_server &&
+	if (conn->selected_on_server != NULL &&
 	    (conn->capabilities & IMAPC_CAPABILITY_QRESYNC) != 0) {
 		/* server will send a [CLOSED] once selected mailbox is
 		   closed */
@@ -2216,8 +2212,9 @@ static void imapc_connection_set_selecting(struct imapc_client_mailbox *box)
 	} else {
 		/* we'll have to assume that all the future untagged messages
 		   are for the mailbox we're selecting */
+		i_free_and_null(conn->selected_on_server);
+		conn->selected_on_server = i_strdup(box->name);
 		conn->selected_box = box;
-		conn->selected_on_server = TRUE;
 	}
 	conn->select_waiting_reply = TRUE;
 }
@@ -2527,7 +2524,7 @@ void imapc_command_sendvf(struct imapc_command *cmd,
 			const char *arg = va_arg(args, const char *);
 
 			if (!need_literal(arg))
-				imap_append_quoted(cmd->data, arg);
+				imap_append_quoted(cmd->data, arg, 0);
 			else if ((cmd->conn->capabilities &
 				  IMAPC_CAPABILITY_LITERALPLUS) != 0) {
 				str_printfa(cmd->data, "{%zu+}\r\n%s",
@@ -2571,8 +2568,8 @@ bool imapc_cmd_has_imap4rev2(struct imapc_command *cmd)
 	return cmd->conn->imap4rev2_enabled;
 }
 
-void imapc_connection_unselect(struct imapc_client_mailbox *box,
-			       bool via_tagged_reply)
+void imapc_connection_mailbox_closed(struct imapc_client_mailbox *box,
+				     bool via_tagged_reply)
 {
 	struct imapc_connection *conn = box->conn;
 
@@ -2595,7 +2592,7 @@ void imapc_connection_unselect(struct imapc_client_mailbox *box,
 		conn->qresync_selecting_box = NULL;
 		conn->selected_box = NULL;
 		if (via_tagged_reply)
-			conn->selected_on_server = FALSE;
+			i_free_and_null(conn->selected_on_server);
 		else {
 			/* We didn't actually send UNSELECT command, so don't
 			   touch selected_on_server state. */
@@ -2673,4 +2670,10 @@ imapc_client_find_command_by_tag(struct imapc_client *client, const char *tag_st
 struct timeval imapc_command_get_start_time(struct imapc_command *cmd)
 {
 	return cmd->start_time;
+}
+
+const char *
+imapc_connection_get_selected_mailbox_name(struct imapc_connection *conn)
+{
+	return conn->selected_on_server;
 }

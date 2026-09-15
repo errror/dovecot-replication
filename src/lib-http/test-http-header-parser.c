@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "str-sanitize.h"
@@ -271,6 +271,30 @@ static const struct http_header_parse_test invalid_header_parse_tests[] = {
 			"Date: Sat, 06 Oct 2012 17:18:22 GMT\r\n"
 			"Server: Apache/2.2.3\177 (CentOS)\r\n"
 			"\r\n",
+		.flags = HTTP_HEADER_PARSE_FLAG_STRICT
+	},{
+		/* obsolete line folding (obs-fold) must be rejected in strict
+		   mode, the way the HTTP server parses requests */
+		.header =
+			"Host: www.example.com\r\n"
+			"X-Frop: folded\r\n"
+			"\tvalue\r\n"
+			"\r\n",
+		.flags = HTTP_HEADER_PARSE_FLAG_STRICT
+	},{
+		/* bare LF terminating a header field must be rejected in
+		   strict mode */
+		.header =
+			"Host: www.example.com\r\n"
+			"X-Frop: value\n"
+			"\r\n",
+		.flags = HTTP_HEADER_PARSE_FLAG_STRICT
+	},{
+		/* bare LF terminating the header block must be rejected in
+		   strict mode */
+		.header =
+			"Host: www.example.com\r\n"
+			"\n",
 		.flags = HTTP_HEADER_PARSE_FLAG_STRICT
 	},{
 		.header =

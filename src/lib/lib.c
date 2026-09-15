@@ -1,10 +1,11 @@
-/* Copyright (c) 2001-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "dovecot-version.h"
 #include "array.h"
 #include "event-filter.h"
 #include "env-util.h"
+#include "hash.h"
 #include "hostpid.h"
 #include "ipwd.h"
 #include "process-title.h"
@@ -31,6 +32,7 @@ struct atexit_callback {
 };
 
 static ARRAY(struct atexit_callback) atexit_callbacks = ARRAY_INIT;
+static bool lib_registered_atexit = FALSE;
 static bool lib_clean_exit;
 
 /* The original faccessat() syscall didn't handle the flags parameter.  glibc
@@ -168,6 +170,9 @@ void lib_exit(int status)
 
 static void lib_atexit_handler(void)
 {
+	if (!lib_initialized)
+		return;
+
 	/* We're already in exit code path. Avoid using any functions that
 	   might cause strange breakage. Especially anything that could call
 	   exit() again could cause infinite looping in some OSes. */
@@ -184,6 +189,7 @@ void lib_init(void)
 {
 	i_assert(!lib_initialized);
 	random_init();
+	hash_init();
 	data_stack_init();
 	hostpid_init();
 	lib_open_non_stdio_dev_null();
@@ -195,7 +201,10 @@ void lib_init(void)
 	   of using lib_exit(). master_service_init_finish() will change this
 	   again to be FALSE. */
 	lib_set_clean_exit(TRUE);
-	atexit(lib_atexit_handler);
+	if (!lib_registered_atexit) {
+		atexit(lib_atexit_handler);
+		lib_registered_atexit = TRUE;
+	}
 
 	lib_initialized = TRUE;
 }

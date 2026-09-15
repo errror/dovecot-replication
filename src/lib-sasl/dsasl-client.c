@@ -1,9 +1,13 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "safe-memset.h"
 #include "dsasl-client-private.h"
+
+struct event_category event_category_sasl_client = {
+	.name = "sasl-client"
+};
 
 static int init_refcount = 0;
 static ARRAY(const struct dsasl_client_mech *) dsasl_mechanisms = ARRAY_INIT;
@@ -72,6 +76,15 @@ struct dsasl_client *dsasl_client_new(const struct dsasl_client_mech *mech,
 	client->set.authzid = p_strdup(pool, set->authzid);
 	client->password = p_strdup(pool, set->password);
 	client->set.password = client->password;
+	client->set.protocol = p_strdup(pool, set->protocol);
+	client->set.host = p_strdup(pool, set->host);
+	client->set.port = set->port;
+
+	client->event = event_create(set->event_parent);
+	event_add_category(client->event, &event_category_sasl_client);
+	event_set_append_log_prefix(client->event,
+		t_strdup_printf("sasl(%s): ", t_str_lcase(mech->name)));
+
 	return client;
 }
 
@@ -87,6 +100,7 @@ void dsasl_client_free(struct dsasl_client **_client)
 		client->mech->free(client);
 	if (client->password != NULL)
 		safe_memset(client->password, 0, strlen(client->password));
+	event_unref(&client->event);
 	pool_unref(&client->pool);
 }
 
@@ -100,21 +114,29 @@ void dsasl_client_enable_channel_binding(
 	client->cbinding_context = context;
 }
 
-int dsasl_client_input(struct dsasl_client *client,
-		       const unsigned char *input, size_t input_len,
-		       const char **error_r)
+enum dsasl_client_result
+dsasl_client_input(struct dsasl_client *client,
+		   const unsigned char *input, size_t input_len,
+		   const char **error_r)
 {
 	if ((client->mech->flags & DSASL_MECH_SEC_ALLOW_NULS) == 0 &&
 	    memchr(input, '\0', input_len) != NULL) {
 		*error_r = "Unexpected NUL in input data";
-		return -1;
+		return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
+	}
+	if (input_len > (size_t)SASL_MAX_MESSAGE_SIZE) {
+		*error_r = t_strdup_printf(
+			"Excessive challenge size (> %d)",
+			SASL_MAX_MESSAGE_SIZE);
+		return DSASL_CLIENT_RESULT_ERR_PROTOCOL;
 	}
 	return client->mech->input(client, input, input_len, error_r);
 }
 
-int dsasl_client_output(struct dsasl_client *client,
-			const unsigned char **output_r, size_t *output_len_r,
-			const char **error_r)
+enum dsasl_client_result
+dsasl_client_output(struct dsasl_client *client,
+		    const unsigned char **output_r, size_t *output_len_r,
+		    const char **error_r)
 {
 	return client->mech->output(client, output_r, output_len_r, error_r);
 }
@@ -156,6 +178,8 @@ void dsasl_clients_init(void)
 	dsasl_client_mech_register(&dsasl_client_mech_external);
 	dsasl_client_mech_register(&dsasl_client_mech_plain);
 	dsasl_client_mech_register(&dsasl_client_mech_login);
+	dsasl_client_mech_register(&dsasl_client_mech_digest_md5);
+	dsasl_client_mech_register(&dsasl_client_mech_cram_md5);
 	dsasl_client_mech_register(&dsasl_client_mech_oauthbearer);
 	dsasl_client_mech_register(&dsasl_client_mech_xoauth2);
 	dsasl_client_mech_register(&dsasl_client_mech_scram_sha_1);

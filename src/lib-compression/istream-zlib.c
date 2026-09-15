@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "crc32.h"
@@ -32,7 +32,7 @@ struct zlib_istream {
 	bool header_read:1;
 	bool trailer_read:1;
 	bool zs_closed:1;
-	bool starting_concated_output:1;
+	bool starting_concatenated_output:1;
 };
 
 static void i_stream_zlib_init(struct zlib_istream *zstream);
@@ -40,7 +40,8 @@ static void i_stream_zlib_init(struct zlib_istream *zstream);
 static void i_stream_zlib_close(struct iostream_private *stream,
 				bool close_parent)
 {
-	struct zlib_istream *zstream = (struct zlib_istream *)stream;
+	struct zlib_istream *zstream =
+		container_of(stream, struct zlib_istream, istream.iostream);
 
 	if (!zstream->zs_closed) {
 		(void)inflateEnd(&zstream->zs);
@@ -58,15 +59,17 @@ static void zlib_read_error(struct zlib_istream *zstream, const char *error)
 			    i_stream_get_absolute_offset(&zstream->istream.istream));
 }
 
-static int i_stream_zlib_read_header(struct istream_private *stream)
+static int
+i_stream_zlib_read_header_more(struct zlib_istream *zstream,
+			       const unsigned char **data_r, size_t *size_r)
 {
-	struct zlib_istream *zstream = (struct zlib_istream *)stream;
-	const unsigned char *data;
+	struct istream_private *stream = &zstream->istream;
 	size_t size;
-	unsigned int pos, fextra_size;
 	int ret;
 
-	ret = i_stream_read_bytes(stream->parent, &data, &size,
+	*size_r = 0;
+
+	ret = i_stream_read_bytes(stream->parent, data_r, &size,
 				  zstream->prev_size + 1);
 	if (size == zstream->prev_size) {
 		stream->istream.stream_errno = stream->parent->stream_errno;
@@ -82,6 +85,17 @@ static int i_stream_zlib_read_header(struct istream_private *stream)
 		return ret;
 	}
 	zstream->prev_size = size;
+
+	*size_r = size;
+	return 1;
+}
+
+static int
+i_stream_zlib_parse_header(struct zlib_istream *zstream,
+			   const unsigned char *data, size_t size)
+{
+	struct istream_private *stream = &zstream->istream;
+	unsigned int pos, fextra_size;
 
 	if (size < GZ_HEADER_MIN_SIZE)
 		return 0;
@@ -121,7 +135,52 @@ static int i_stream_zlib_read_header(struct istream_private *stream)
 		pos += 2;
 	}
 	i_stream_skip(stream->parent, pos);
+	return 1;
+}
+
+static int i_stream_zlib_read_header(struct zlib_istream *zstream)
+{
+	const unsigned char *data;
+	size_t size;
+	int ret;
+
+	for (;;) {
+		ret = i_stream_zlib_read_header_more(zstream, &data, &size);
+		if (ret <= 0)
+			return ret;
+		ret = i_stream_zlib_parse_header(zstream, data, size);
+		if (ret < 0)
+			return ret;
+		if (ret > 0)
+			break;
+	}
+
 	zstream->prev_size = 0;
+	return 1;
+}
+
+static int
+i_stream_zlib_read_trailer_more(struct zlib_istream *zstream,
+				const unsigned char **data_r, size_t *size_r)
+{
+	struct istream_private *stream = &zstream->istream;
+	size_t size;
+	int ret;
+
+	ret = i_stream_read_bytes(stream->parent, data_r, &size,
+				  GZ_TRAILER_SIZE);
+	if (size == zstream->prev_size) {
+		i_assert(ret <= 0);
+		stream->istream.stream_errno = stream->parent->stream_errno;
+		if (ret == -1 && stream->istream.stream_errno == 0) {
+			zlib_read_error(zstream, "missing gz trailer");
+			stream->istream.stream_errno = EINVAL;
+		}
+		return ret;
+	}
+	zstream->prev_size = size;
+
+	*size_r = size;
 	return 1;
 }
 
@@ -132,20 +191,11 @@ static int i_stream_zlib_read_trailer(struct zlib_istream *zstream)
 	size_t size;
 	int ret;
 
-	ret = i_stream_read_bytes(stream->parent, &data, &size,
-				  GZ_TRAILER_SIZE);
-	if (size == zstream->prev_size) {
-		stream->istream.stream_errno = stream->parent->stream_errno;
-		if (ret == -1 && stream->istream.stream_errno == 0) {
-			zlib_read_error(zstream, "missing gz trailer");
-			stream->istream.stream_errno = EINVAL;
-		}
-		return ret;
-	}
-	zstream->prev_size = size;
-
-	if (size < GZ_TRAILER_SIZE)
-		return 0;
+	do {
+		ret = i_stream_zlib_read_trailer_more(zstream, &data, &size);
+		if (ret <= 0)
+			return ret;
+	} while (size < GZ_TRAILER_SIZE);
 
 	if (le32_to_cpu_unaligned(data) != zstream->crc32) {
 		zlib_read_error(zstream, "gz trailer has wrong CRC value");
@@ -160,159 +210,168 @@ static int i_stream_zlib_read_trailer(struct zlib_istream *zstream)
 
 static ssize_t i_stream_zlib_read(struct istream_private *stream)
 {
-	struct zlib_istream *zstream = (struct zlib_istream *)stream;
+	struct zlib_istream *zstream =
+		container_of(stream, struct zlib_istream, istream);
 	const unsigned char *data;
 	uoff_t high_offset;
 	size_t size, out_size;
 	int ret;
 
-	high_offset = stream->istream.v_offset + (stream->pos - stream->skip);
-	if (zstream->eof_offset == high_offset) {
-		/* zlib library returned EOF. */
-		if (!zstream->gz) {
-			/* deflate - ignore if there's still more data */
-			stream->istream.eof = TRUE;
-			return -1;
+	/* Loop instead of recursing when an inflate step yields no output:
+	   a crafted stream can produce an unbounded number of zero-output
+	   steps, and tail-call recursion (not guaranteed) would exhaust the
+	   stack. */
+	for (;;) {
+		high_offset = stream->istream.v_offset + (stream->pos - stream->skip);
+		if (zstream->eof_offset == high_offset) {
+			/* zlib library returned EOF. */
+			if (!zstream->gz) {
+				/* deflate - ignore if there's still more data */
+				stream->istream.eof = TRUE;
+				return -1;
+			}
+			/* gz format - read the trailer */
+			if (!zstream->trailer_read) {
+				do {
+					ret = i_stream_zlib_read_trailer(zstream);
+				} while (ret == 0 && stream->istream.blocking);
+				if (ret <= 0)
+					return ret;
+			}
+			/* See if there's another concatenated gz stream. */
+			if (i_stream_read_eof(stream->parent)) {
+				/* EOF or error */
+				stream->istream.stream_errno =
+					stream->parent->stream_errno;
+				stream->istream.eof = TRUE;
+				return -1;
+			}
+			/* Multiple gz streams concatenated together */
+			zstream->starting_concatenated_output = TRUE;
 		}
-		/* gz format - read the trailer */
-		if (!zstream->trailer_read) {
+		if (zstream->starting_concatenated_output) {
+			/* make sure there actually is something in parent stream.
+			   we don't want to reset the stream unless we actually see
+			   some concatenated output. */
+			ret = i_stream_read_more(stream->parent, &data, &size);
+			if (ret <= 0) {
+				if (ret == 0)
+					return 0;
+				if (stream->parent->stream_errno != 0) {
+					stream->istream.stream_errno =
+						stream->parent->stream_errno;
+				}
+				stream->istream.eof = TRUE;
+				return -1;
+			}
+
+			/* gzip file with concatenated content */
+			stream->cached_stream_size = UOFF_T_MAX;
+			zstream->eof_offset = UOFF_T_MAX;
+			zstream->header_read = FALSE;
+			zstream->trailer_read = FALSE;
+			zstream->crc32 = 0;
+			zstream->starting_concatenated_output = FALSE;
+
+			(void)inflateEnd(&zstream->zs);
+			i_stream_zlib_init(zstream);
+		}
+
+		if (!zstream->header_read) {
 			do {
-				ret = i_stream_zlib_read_trailer(zstream);
+				ret = i_stream_zlib_read_header(zstream);
 			} while (ret == 0 && stream->istream.blocking);
 			if (ret <= 0)
 				return ret;
+			zstream->header_read = TRUE;
 		}
-		/* See if there's another concatenated gz stream. */
-		if (i_stream_read_eof(stream->parent)) {
-			/* EOF or error */
-			stream->istream.stream_errno =
-				stream->parent->stream_errno;
-			stream->istream.eof = TRUE;
-			return -1;
+
+		if (!zstream->marked) {
+			if (!i_stream_try_alloc(stream, CHUNK_SIZE, &out_size))
+				return -2; /* buffer full */
+		} else {
+			/* try to avoid compressing, so we can quickly seek backwards */
+			if (!i_stream_try_alloc_avoid_compress(stream, CHUNK_SIZE, &out_size))
+				return -2; /* buffer full */
 		}
-		/* Multiple gz streams concatenated together */
-		zstream->starting_concated_output = TRUE;
-	}
-	if (zstream->starting_concated_output) {
-		/* make sure there actually is something in parent stream.
-		   we don't want to reset the stream unless we actually see
-		   some concatenated output. */
-		ret = i_stream_read_more(stream->parent, &data, &size);
-		if (ret <= 0) {
-			if (ret == 0)
-				return 0;
+
+		if (i_stream_read_more(stream->parent, &data, &size) < 0) {
 			if (stream->parent->stream_errno != 0) {
 				stream->istream.stream_errno =
 					stream->parent->stream_errno;
+			} else {
+				i_assert(stream->parent->eof);
+				zlib_read_error(zstream, "unexpected EOF");
+				stream->istream.stream_errno = EPIPE;
 			}
-			stream->istream.eof = TRUE;
 			return -1;
 		}
-
-		/* gzip file with concatenated content */
-		stream->cached_stream_size = UOFF_T_MAX;
-		zstream->eof_offset = UOFF_T_MAX;
-		zstream->header_read = FALSE;
-		zstream->trailer_read = FALSE;
-		zstream->crc32 = 0;
-		zstream->starting_concated_output = FALSE;
-
-		(void)inflateEnd(&zstream->zs);
-		i_stream_zlib_init(zstream);
-	}
-
-	if (!zstream->header_read) {
-		do {
-			ret = i_stream_zlib_read_header(stream);
-		} while (ret == 0 && stream->istream.blocking);
-		if (ret <= 0)
-			return ret;
-		zstream->header_read = TRUE;
-	}
-
-	if (!zstream->marked) {
-		if (!i_stream_try_alloc(stream, CHUNK_SIZE, &out_size))
-			return -2; /* buffer full */
-	} else {
-		/* try to avoid compressing, so we can quickly seek backwards */
-		if (!i_stream_try_alloc_avoid_compress(stream, CHUNK_SIZE, &out_size))
-			return -2; /* buffer full */
-	}
-
-	if (i_stream_read_more(stream->parent, &data, &size) < 0) {
-		if (stream->parent->stream_errno != 0) {
-			stream->istream.stream_errno =
-				stream->parent->stream_errno;
-		} else {
-			i_assert(stream->parent->eof);
-			zlib_read_error(zstream, "unexpected EOF");
-			stream->istream.stream_errno = EPIPE;
+		if (size == 0) {
+			/* no more input */
+			i_assert(!stream->istream.blocking);
+			return 0;
 		}
-		return -1;
-	}
-	if (size == 0) {
-		/* no more input */
-		i_assert(!stream->istream.blocking);
-		return 0;
-	}
 
-	zstream->zs.next_in = (void *)data;
-	zstream->zs.avail_in = size;
+		zstream->zs.next_in = (void *)data;
+		zstream->zs.avail_in = size;
 
-	zstream->zs.next_out = stream->w_buffer + stream->pos;
-	zstream->zs.avail_out = out_size;
-	ret = inflate(&zstream->zs, Z_SYNC_FLUSH);
+		zstream->zs.next_out = stream->w_buffer + stream->pos;
+		zstream->zs.avail_out = out_size;
+		ret = inflate(&zstream->zs, Z_SYNC_FLUSH);
 
-	out_size -= zstream->zs.avail_out;
-	zstream->crc32 = crc32_data_more(zstream->crc32,
-					 stream->w_buffer + stream->pos,
-					 out_size);
-	stream->pos += out_size;
+		out_size -= zstream->zs.avail_out;
+		/* CRC32 is only needed for GZ trailer. */
+		if (zstream->gz)
+			zstream->crc32 = crc32_data_more(zstream->crc32,
+							 stream->w_buffer + stream->pos,
+							 out_size);
+		stream->pos += out_size;
 
-	size_t bytes_consumed = size - zstream->zs.avail_in;
-	i_stream_skip(stream->parent, bytes_consumed);
-	if (i_stream_get_data_size(stream->parent) > 0 &&
-	    (bytes_consumed > 0 || out_size > 0)) {
-		/* Parent stream was only partially consumed. Set the stream's
-		   IO as pending to avoid hangs. */
-		i_stream_set_input_pending(&stream->istream, TRUE);
-	}
-
-	switch (ret) {
-	case Z_OK:
-		break;
-	case Z_NEED_DICT:
-		zlib_read_error(zstream, "can't read file without dict");
-		stream->istream.stream_errno = EIO;
-		return -1;
-	case Z_DATA_ERROR:
-		zlib_read_error(zstream, "corrupted data");
-		stream->istream.stream_errno = EINVAL;
-		return -1;
-	case Z_MEM_ERROR:
-		i_fatal_status(FATAL_OUTOFMEM, "zlib.read(%s): Out of memory",
-			       i_stream_get_name(&stream->istream));
-	case Z_STREAM_END:
-		zstream->eof_offset = stream->istream.v_offset +
-			(stream->pos - stream->skip);
-		stream->cached_stream_size = zstream->eof_offset;
-		zstream->zs.avail_in = 0;
-
-		if (!zstream->trailer_read) {
-			/* try to read and verify the trailer, we might not
-			   be called again. */
-			if (i_stream_zlib_read_trailer(zstream) < 0)
-				return -1;
+		size_t bytes_consumed = size - zstream->zs.avail_in;
+		i_stream_skip(stream->parent, bytes_consumed);
+		if (i_stream_get_data_size(stream->parent) > 0 &&
+		    (bytes_consumed > 0 || out_size > 0)) {
+			/* Parent stream was only partially consumed. Set the stream's
+			   IO as pending to avoid hangs. */
+			i_stream_set_input_pending(&stream->istream, TRUE);
 		}
-		break;
-	default:
-		i_fatal("inflate() failed with %d", ret);
+
+		switch (ret) {
+		case Z_OK:
+			break;
+		case Z_NEED_DICT:
+			zlib_read_error(zstream, "can't read file without dict");
+			stream->istream.stream_errno = EIO;
+			return -1;
+		case Z_DATA_ERROR:
+			zlib_read_error(zstream, "corrupted data");
+			stream->istream.stream_errno = EINVAL;
+			return -1;
+		case Z_MEM_ERROR:
+			i_fatal_status(FATAL_OUTOFMEM, "zlib.read(%s): Out of memory",
+				       i_stream_get_name(&stream->istream));
+		case Z_STREAM_END:
+			zstream->eof_offset = stream->istream.v_offset +
+				(stream->pos - stream->skip);
+			stream->cached_stream_size = zstream->eof_offset;
+			zstream->zs.avail_in = 0;
+
+			if (!zstream->trailer_read) {
+				/* try to read and verify the trailer, we might not
+				   be called again. */
+				if (i_stream_zlib_read_trailer(zstream) < 0)
+					return -1;
+			}
+			break;
+		default:
+			i_fatal("inflate() failed with %d", ret);
+		}
+		if (out_size == 0) {
+			/* no output yet; read more input without recursing */
+			continue;
+		}
+		return out_size;
 	}
-	if (out_size == 0) {
-		/* read more input */
-		return i_stream_zlib_read(stream);
-	}
-	return out_size;
 }
 
 static void i_stream_zlib_init(struct zlib_istream *zstream)
@@ -360,7 +419,8 @@ static void i_stream_zlib_reset(struct zlib_istream *zstream)
 static void
 i_stream_zlib_seek(struct istream_private *stream, uoff_t v_offset, bool mark)
 {
-	struct zlib_istream *zstream = (struct zlib_istream *) stream;
+	struct zlib_istream *zstream =
+		container_of(stream, struct zlib_istream, istream);
 
 	if (i_stream_nonseekable_try_seek(stream, v_offset))
 		return;
@@ -376,7 +436,8 @@ i_stream_zlib_seek(struct istream_private *stream, uoff_t v_offset, bool mark)
 
 static void i_stream_zlib_sync(struct istream_private *stream)
 {
-	struct zlib_istream *zstream = (struct zlib_istream *) stream;
+	struct zlib_istream *zstream =
+		container_of(stream, struct zlib_istream, istream);
 	const struct stat *st;
 
 	if (i_stream_stat(stream->parent, FALSE, &st) == 0) {
@@ -413,7 +474,8 @@ i_stream_create_zlib(struct istream *input, bool gz)
 	zstream->istream.istream.seekable = input->seekable;
 
 	return i_stream_create(&zstream->istream, input,
-			       i_stream_get_fd(input), 0);
+			       i_stream_get_fd(input),
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }
 
 struct istream *i_stream_create_gz(struct istream *input)

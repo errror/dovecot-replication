@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -9,7 +9,7 @@
 #include "imap-base-subject.h"
 #include "index-storage.h"
 #include "index-sort-private.h"
-
+#include "settings-consts.h"
 
 struct mail_sort_node_date {
 	uint32_t seq;
@@ -188,8 +188,9 @@ void index_sort_list_add(struct mail_search_sort_program *program,
 	} T_END;
 	mail->access_type = orig_access_type;
 
-	if (!prev_slow && (mail->mail_stream_accessed ||
-			   mail->mail_metadata_accessed)) {
+	if (!prev_slow &&
+	    program->slow_mails_left != SET_UINT_UNLIMITED &&
+	    (mail->mail_stream_accessed || mail->mail_metadata_accessed)) {
 		i_assert(program->slow_mails_left > 0);
 		program->slow_mails_left--;
 	}
@@ -392,8 +393,6 @@ index_sort_program_init(struct mailbox_transaction_context *t,
 
 	program->slow_mails_left =
 		program->t->box->storage->set->mail_sort_max_read_count;
-	if (program->slow_mails_left == 0)
-		program->slow_mails_left = UINT_MAX;
 
 	for (i = 0; i < MAX_SORT_PROGRAM_SIZE; i++) {
 		program->sort_program[i] = sort_program[i];
@@ -550,7 +549,8 @@ index_sort_set_seq(struct mail_search_sort_program *program,
 		   struct mail *mail, uint32_t seq)
 {
 	if ((mail->mail_stream_accessed || mail->mail_metadata_accessed) &&
-	    program->slow_mails_left > 0)
+	    program->slow_mails_left > 0 &&
+	    program->slow_mails_left != SET_UINT_UNLIMITED)
 		program->slow_mails_left--;
 	mail_set_seq(mail, seq);
 	if (program->slow_mails_left == 0) {

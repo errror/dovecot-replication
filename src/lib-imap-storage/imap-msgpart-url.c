@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -246,6 +246,7 @@ int imap_msgpart_url_verify(struct imap_msgpart_url *mpurl,
 }
 
 int imap_msgpart_url_get_bodypartstructure(struct imap_msgpart_url *mpurl,
+					   enum imap_quote_flags qflags,
 					   const char **bpstruct_r,
 					   const char **client_error_r)
 {
@@ -257,7 +258,8 @@ int imap_msgpart_url_get_bodypartstructure(struct imap_msgpart_url *mpurl,
 	if (ret <= 0)
 		return ret;
 
-	ret = imap_msgpart_bodypartstructure(mail, mpurl->part, bpstruct_r);
+	ret = imap_msgpart_bodypartstructure(mail, mpurl->part, qflags,
+					     bpstruct_r);
 	if (ret < 0)
 		*client_error_r = mailbox_get_last_error(mpurl->box, NULL);
 	else if (ret == 0)

@@ -8,6 +8,22 @@
 
 struct message_header_line;
 
+#define MESSAGE_PART_DATA_MAX_TOTAL_ADDRESSES 100000
+#define MESSAGE_PART_DATA_MAX_TOTAL_LANGUAGE_TAGS 100000
+/* Combined limit for Content-Type + Content-Disposition parameters */
+#define MESSAGE_PART_DATA_MAX_TOTAL_MIME_PARAMS 200000
+
+struct message_part_data_limits {
+	unsigned int remaining_addresses;
+	unsigned int remaining_language_tags;
+	unsigned int remaining_mime_params;
+};
+
+#define MESSAGE_PART_DATA_LIMITS_INIT \
+	{ MESSAGE_PART_DATA_MAX_TOTAL_ADDRESSES, \
+	  MESSAGE_PART_DATA_MAX_TOTAL_LANGUAGE_TAGS, \
+	  MESSAGE_PART_DATA_MAX_TOTAL_MIME_PARAMS }
+
 struct message_part_param {
 	const char *name;
 	const char *value;
@@ -79,7 +95,7 @@ bool message_part_has_content_types(const struct message_part *part,
 
 /* Check if part is attachment according to given settings */
 bool message_part_is_attachment(
-	struct message_part *part,
+	const struct message_part *part,
 	const struct message_part_attachment_settings *settings);
 /*
  * Header parsing
@@ -88,11 +104,13 @@ bool message_part_is_attachment(
 /* Update envelope data based from given header field */
 void message_part_envelope_parse_from_header(pool_t pool,
 	struct message_part_envelope **_data,
+	struct message_part_data_limits *limits,
 	struct message_header_line *hdr);
 
 /* Parse a single header. Note that this modifies part->context. */
 void message_part_data_parse_from_header(pool_t pool,
 	struct message_part *part,
+	struct message_part_data_limits *limits,
 	struct message_header_line *hdr);
 
 #endif

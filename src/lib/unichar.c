@@ -1,14 +1,12 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
+#include "str.h"
 #include "bsearch-insert-pos.h"
+#include "unicode-data.h"
+#include "unicode-transform.h"
 #include "unichar.h"
-
-#include "unicodemap.c"
-
-#define HANGUL_FIRST 0xac00
-#define HANGUL_LAST 0xd7a3
 
 const unsigned char utf8_replacement_char[UTF8_REPLACEMENT_CHAR_LEN] =
 	{ 0xef, 0xbf, 0xbd }; /* 0xfffd */
@@ -231,99 +229,14 @@ unsigned int uni_utf8_partial_strlen_n(const void *_input, size_t size,
 	return len;
 }
 
-static bool uint16_find(const uint16_t *data, unsigned int count,
-			uint16_t value, unsigned int *idx_r)
-{
-	BINARY_NUMBER_SEARCH(data, count, value, idx_r);
-}
-
-static bool uint32_find(const uint32_t *data, unsigned int count,
-			uint32_t value, unsigned int *idx_r)
-{
-	BINARY_NUMBER_SEARCH(data, count, value, idx_r);
-}
-
 unichar_t uni_ucs4_to_titlecase(unichar_t chr)
 {
-	unsigned int idx;
+	const struct unicode_code_point_data *cp_data =
+		unicode_code_point_get_data(chr);
 
-	if (chr <= 0xff)
-		return titlecase8_map[chr];
-	else if (chr <= 0xffff) {
-		if (!uint16_find(titlecase16_keys, N_ELEMENTS(titlecase16_keys),
-				 chr, &idx))
-			return chr;
-		else
-			return titlecase16_values[idx];
-	} else {
-		if (!uint32_find(titlecase32_keys, N_ELEMENTS(titlecase32_keys),
-				 chr, &idx))
-			return chr;
-		else
-			return titlecase32_values[idx];
-	}
-}
-
-static bool uni_ucs4_decompose_uni(unichar_t *chr)
-{
-	unsigned int idx;
-
-	if (*chr <= 0xff) {
-		if (uni8_decomp_map[*chr] == *chr)
-			return FALSE;
-		*chr = uni8_decomp_map[*chr];
-	} else if (*chr <= 0xffff) {
-		if (*chr < uni16_decomp_keys[0])
-			return FALSE;
-
-		if (!uint16_find(uni16_decomp_keys,
-				 N_ELEMENTS(uni16_decomp_keys), *chr, &idx))
-			return FALSE;
-		*chr = uni16_decomp_values[idx];
-	} else {
-		if (!uint32_find(uni32_decomp_keys,
-				 N_ELEMENTS(uni32_decomp_keys), *chr, &idx))
-			return FALSE;
-		*chr = uni32_decomp_values[idx];
-	}
-	return TRUE;
-}
-
-static void uni_ucs4_decompose_hangul_utf8(unichar_t chr, buffer_t *output)
-{
-#define SBase HANGUL_FIRST
-#define LBase 0x1100
-#define VBase 0x1161
-#define TBase 0x11A7
-#define VCount 21
-#define TCount 28
-#define NCount (VCount * TCount)
-	unsigned int SIndex = chr - SBase;
-        unichar_t L = LBase + SIndex / NCount;
-        unichar_t V = VBase + (SIndex % NCount) / TCount;
-        unichar_t T = TBase + SIndex % TCount;
-
-	uni_ucs4_to_utf8_c(L, output);
-	uni_ucs4_to_utf8_c(V, output);
-	if (T != TBase) uni_ucs4_to_utf8_c(T, output);
-}
-
-static bool uni_ucs4_decompose_multi_utf8(unichar_t chr, buffer_t *output)
-{
-	const uint32_t *value;
-	unsigned int idx;
-
-	if (chr < multidecomp_keys[0] || chr > 0xffff)
-		return FALSE;
-
-	if (!uint32_find(multidecomp_keys, N_ELEMENTS(multidecomp_keys),
-			 chr, &idx))
-		return FALSE;
-
-	value = &multidecomp_values[multidecomp_offsets[idx]];
-	for (; *value != 0; value++)
-		uni_ucs4_to_utf8_c(*value, output);
-	return TRUE;
+	if (cp_data->simple_titlecase_mapping != 0x0000)
+		return cp_data->simple_titlecase_mapping;
+	return chr;
 }
 
 static void output_add_replacement_char(buffer_t *output)
@@ -338,12 +251,245 @@ static void output_add_replacement_char(buffer_t *output)
 	buffer_append(output, utf8_replacement_char, UTF8_REPLACEMENT_CHAR_LEN);
 }
 
+int uni_utf8_run_transform(const void *_input, size_t size,
+			   struct unicode_transform *trans, buffer_t *output,
+			   const char **error_r)
+{
+	struct unicode_transform *trans_last =
+		unicode_transform_get_last(trans);
+	struct unicode_buffer_sink sink;
+	const unsigned char *input = _input;
+	unichar_t chr;
+	ssize_t sret;
+	bool got_chr = FALSE, bad_cp = FALSE;
+	int ret = 0;
+
+	unicode_buffer_sink_init(&sink, output);
+	unicode_transform_chain(trans_last, &sink.transform);
+
+	while (size > 0 || got_chr) {
+		if (!got_chr) {
+			int bytes = uni_utf8_get_char_n(input, size, &chr);
+			if (bytes <= 0) {
+				/* Invalid input. try the next byte. */
+				ret = -1;
+				input++; size--;
+				if (!bad_cp) {
+				       chr = UNICODE_REPLACEMENT_CHAR;
+				       bad_cp = TRUE;
+				}
+			} else {
+				input += bytes;
+				size -= bytes;
+				bad_cp = FALSE;
+			}
+		}
+
+		sret = unicode_transform_input(trans, &chr, 1, error_r);
+		if (sret < 0)
+			return -1;
+		if (sret > 0)
+			got_chr = FALSE;
+	}
+
+	int fret = unicode_transform_flush(trans, error_r);
+	if (fret < 0)
+		i_panic("unicode_transform_flush(): %s", *error_r);
+	i_assert(fret == 1);
+	return ret;
+}
+
+static inline int
+uni_utf8_write_nf_common(const void *_input, size_t size,
+			 enum unicode_nf_type nf_type, buffer_t *output)
+{
+	static struct unicode_nf_context ctx;
+	const char *error;
+
+	unicode_nf_init(&ctx, nf_type);
+
+	return uni_utf8_run_transform(_input, size, &ctx.transform, output,
+				      &error);
+}
+
+int uni_utf8_write_nfd(const void *input, size_t size, buffer_t *output)
+{
+	return uni_utf8_write_nf_common(input, size, UNICODE_NFD, output);
+}
+
+int uni_utf8_write_nfkd(const void *input, size_t size, buffer_t *output)
+{
+	return uni_utf8_write_nf_common(input, size, UNICODE_NFKD, output);
+}
+
+int uni_utf8_write_nfc(const void *input, size_t size, buffer_t *output)
+{
+	return uni_utf8_write_nf_common(input, size, UNICODE_NFC, output);
+}
+
+int uni_utf8_write_nfkc(const void *input, size_t size, buffer_t *output)
+{
+	return uni_utf8_write_nf_common(input, size, UNICODE_NFKC, output);
+}
+
+int uni_utf8_to_nfd(const void *input, size_t size, const char **output_r)
+{
+	buffer_t *output = t_buffer_create(size);
+
+	if (uni_utf8_write_nf_common(input, size, UNICODE_NFD, output) < 0)
+		return -1;
+	*output_r = str_c(output);
+	return 0;
+}
+
+int uni_utf8_to_nfkd(const void *input, size_t size, const char **output_r)
+{
+	buffer_t *output = t_buffer_create(size);
+
+	if (uni_utf8_write_nf_common(input, size, UNICODE_NFKD, output) < 0)
+		return -1;
+	*output_r = str_c(output);
+	return 0;
+}
+
+int uni_utf8_to_nfc(const void *input, size_t size, const char **output_r)
+{
+	buffer_t *output = t_buffer_create(size);
+
+	if (uni_utf8_write_nf_common(input, size, UNICODE_NFC, output) < 0)
+		return -1;
+	*output_r = str_c(output);
+	return 0;
+}
+
+int uni_utf8_to_nfkc(const void *input, size_t size, const char **output_r)
+{
+	buffer_t *output = t_buffer_create(size);
+
+	if (uni_utf8_write_nf_common(input, size, UNICODE_NFKC, output) < 0)
+		return -1;
+	*output_r = str_c(output);
+	return 0;
+}
+
+static int
+uni_utf8_is_nf(const void *_input, size_t size, enum unicode_nf_type type)
+{
+	static struct unicode_nf_checker unc;
+	const unsigned char *input = _input;
+	unichar_t chr;
+	int ret;
+
+	unicode_nf_checker_init(&unc, type);
+
+	while (size > 0) {
+		const struct unicode_code_point_data *cp_data = NULL;
+		int bytes = uni_utf8_get_char_n(input, size, &chr);
+		if (bytes <= 0)
+			return -1;
+		input += bytes;
+		size -= bytes;
+
+		ret = unicode_nf_checker_input(&unc, chr, &cp_data);
+		if (ret <= 0)
+			return ret;
+	}
+
+	return unicode_nf_checker_finish(&unc);
+}
+
+int uni_utf8_is_nfd(const void *input, size_t size)
+{
+	return uni_utf8_is_nf(input, size, UNICODE_NFD);
+}
+
+int uni_utf8_is_nfkd(const void *input, size_t size)
+{
+	return uni_utf8_is_nf(input, size, UNICODE_NFKD);
+}
+
+int uni_utf8_is_nfc(const void *input, size_t size)
+{
+	return uni_utf8_is_nf(input, size, UNICODE_NFC);
+}
+
+int uni_utf8_is_nfkc(const void *input, size_t size)
+{
+	return uni_utf8_is_nf(input, size, UNICODE_NFKC);
+}
+
+int uni_utf8_write_uppercase(const void *_input, size_t size, buffer_t *output)
+{
+	static struct unicode_casemap map;
+	const char *error;
+
+	unicode_casemap_init_uppercase(&map);
+
+	return uni_utf8_run_transform(_input, size, &map.transform, output,
+				      &error);
+}
+
+int uni_utf8_write_lowercase(const void *_input, size_t size, buffer_t *output)
+{
+	static struct unicode_casemap map;
+	const char *error;
+
+	unicode_casemap_init_lowercase(&map);
+
+	return uni_utf8_run_transform(_input, size, &map.transform, output,
+				      &error);
+}
+
+int uni_utf8_write_casefold(const void *_input, size_t size, buffer_t *output)
+{
+	static struct unicode_casemap map;
+	const char *error;
+
+	unicode_casemap_init_casefold(&map);
+
+	return uni_utf8_run_transform(_input, size, &map.transform, output,
+				      &error);
+}
+
+int uni_utf8_to_uppercase(const void *input, size_t size, const char **output_r)
+{
+	buffer_t *output = t_buffer_create(size);
+	int ret;
+
+	ret = uni_utf8_write_uppercase(input, size, output);
+	*output_r = str_c(output);
+	return ret;
+}
+
+int uni_utf8_to_lowercase(const void *input, size_t size, const char **output_r)
+{
+	buffer_t *output = t_buffer_create(size);
+	int ret;
+
+	ret = uni_utf8_write_lowercase(input, size, output);
+	*output_r = str_c(output);
+	return ret;
+}
+
+int uni_utf8_to_casefold(const void *input, size_t size, const char **output_r)
+{
+	buffer_t *output = t_buffer_create(size);
+	int ret;
+
+	ret = uni_utf8_write_casefold(input, size, output);
+	*output_r = str_c(output);
+	return ret;
+}
+
 int uni_utf8_to_decomposed_titlecase(const void *_input, size_t size,
 				     buffer_t *output)
 {
+	struct unicode_rfc5051_context ctx;
 	const unsigned char *input = _input;
 	unichar_t chr;
 	int ret = 0;
+
+	unicode_rfc5051_init(&ctx);
 
 	while (size > 0) {
 		int bytes = uni_utf8_get_char_n(input, size, &chr);
@@ -357,12 +503,11 @@ int uni_utf8_to_decomposed_titlecase(const void *_input, size_t size,
 		input += bytes;
 		size -= bytes;
 
-		chr = uni_ucs4_to_titlecase(chr);
-		if (chr >= HANGUL_FIRST && chr <= HANGUL_LAST)
-			uni_ucs4_decompose_hangul_utf8(chr, output);
-		else if (uni_ucs4_decompose_uni(&chr) ||
-			 !uni_ucs4_decompose_multi_utf8(chr, output))
-			uni_ucs4_to_utf8_c(chr, output);
+		const unichar_t *norm;
+		size_t norm_len;
+
+		norm_len = unicode_rfc5051_normalize(&ctx, chr, &norm);
+		uni_ucs4_to_utf8(norm, norm_len, output);
 	}
 	return ret;
 }
@@ -456,4 +601,60 @@ size_t uni_utf8_data_truncate(const unsigned char *data, size_t old_size,
 	if (max_new_size > 0 && (data[max_new_size-1] & 0xc0) == 0xc0)
 		max_new_size--;
 	return max_new_size;
+}
+
+/*
+ * Grapheme clusters
+ */
+
+void uni_gc_scanner_init(struct uni_gc_scanner *gcsc,
+			 const void *input, size_t size)
+{
+	i_zero(gcsc);
+	unicode_gc_break_init(&gcsc->gcbrk);
+	gcsc->p = input;
+	gcsc->pend = gcsc->p + size;
+}
+
+bool uni_gc_scan_shift(struct uni_gc_scanner *gcsc)
+{
+	bool first = (gcsc->poffset == NULL);
+
+	/* Reset offset to last grapheme boundary (after the last grapheme
+	   cluster we indicated). */
+	gcsc->poffset = gcsc->p;
+	/* Shift pointer past last code point; starts the next grapheme cluster
+	   we shall compose in this call. */
+	gcsc->p += gcsc->cp_size;
+	gcsc->cp_size = 0;
+	while (gcsc->p < gcsc->pend) {
+		/* Decode next UTF-8 code point */
+		gcsc->cp_size = uni_utf8_get_char_n(
+			gcsc->p, gcsc->pend - gcsc->p, &gcsc->cp);
+		/* We expect valid and complete UTF-8 input */
+		i_assert(gcsc->cp_size > 0);
+
+		/* Determine whether there exists a grapheme cluster boundary
+		   before this code point. */
+		const struct unicode_code_point_data *cp_data = NULL;
+		if (unicode_gc_break_cp(&gcsc->gcbrk, gcsc->cp, &cp_data)) {
+			/* Yes, but ignore the very first grapheme boundary that
+			   occurs at the start of input. */
+			if (!first) {
+				/* Grapheme cluster detected, but it does *NOT*
+				   include the last code point we decoded just
+				   now. */
+				i_assert(gcsc->p > gcsc->poffset);
+				return TRUE;
+			}
+			first = FALSE;
+		}
+
+		/* Shift pointer past last code point; include this in the next
+		   grapheme cluster we shall compose in this call. */
+		gcsc->p += gcsc->cp_size;
+		gcsc->cp_size = 0;
+	}
+	/* Return whether there is any last remaining grapheme cluster. */
+	return (gcsc->p > gcsc->poffset);
 }

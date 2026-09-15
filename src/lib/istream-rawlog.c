@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ostream.h"
@@ -117,5 +117,6 @@ i_stream_create_rawlog_from_stream(struct istream *input,
 	rstream->istream.istream.blocking = input->blocking;
 	rstream->istream.istream.seekable = input->seekable;
 	return i_stream_create(&rstream->istream, input,
-			       i_stream_get_fd(input), 0);
+			       i_stream_get_fd(input),
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }

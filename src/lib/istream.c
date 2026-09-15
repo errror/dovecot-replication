@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -281,10 +281,23 @@ i_stream_noop_snapshot(struct istream_private *stream ATTR_UNUSED,
 	return prev_snapshot;
 }
 
+static struct istream_private *
+i_stream_get_io_parent(struct istream_private *_stream)
+{
+	if (_stream->parent != NULL)
+		return _stream->parent->real_stream;
+	if (_stream->io_parent != NULL)
+		return _stream->io_parent->real_stream;
+	return NULL;
+}
+
 static bool i_stream_is_io_pending_until_read(struct istream_private *_stream)
 {
-	while (_stream->parent != NULL && !_stream->io_pending_until_read)
-		_stream = _stream->parent->real_stream;
+	struct istream_private *parent;
+
+	while (!_stream->io_pending_until_read &&
+	       (parent = i_stream_get_io_parent(_stream)) != NULL)
+		_stream = parent;
 	return _stream->io_pending_until_read;
 }
 
@@ -341,6 +354,66 @@ ssize_t i_stream_read(struct istream *stream)
 	return ret;
 }
 
+/* The istreams whose read() is currently running, innermost first. Used for
+   verifying that istreams declare the istreams they read. */
+struct istream_reader {
+	const struct istream_reader *prev;
+	struct istream *stream;
+	/* The ioloop that was running when read() was called. A nested
+	   io_loop_run() (e.g. dict_wait()) runs unrelated istreams, which
+	   this istream isn't reading. */
+	struct ioloop *ioloop;
+};
+static const struct istream_reader *istream_cur_reader = NULL;
+
+static void i_stream_verify_reader(struct istream *stream)
+{
+	struct istream_private *reader;
+
+	if (istream_cur_reader == NULL || istream_cur_reader->stream == stream)
+		return;
+	if (istream_cur_reader->ioloop != current_ioloop) {
+		/* Running in a nested ioloop, so this istream is unrelated to
+		   the istream whose read() is running. */
+		return;
+	}
+	if (stream->blocking) {
+		/* Blocking istreams are read until they're finished, so their
+		   ioloop IO doesn't matter. read() implementations may create
+		   and drain such istreams internally (e.g. a temp file). */
+		return;
+	}
+	if (istream_cur_reader->stream->blocking) {
+		/* A blocking istream is also read until it's finished, so it
+		   never depends on an ioloop IO to wake it up, and it doesn't
+		   matter which istreams it reads. */
+		return;
+	}
+
+	reader = istream_cur_reader->stream->real_stream;
+	if (stream == reader->parent)
+		return;
+	if (reader->io_parent != NULL &&
+	    i_stream_get_root_io(stream) ==
+	    i_stream_get_root_io(reader->io_parent)) {
+		/* The declared istream, or another istream reading from the
+		   same one (e.g. istream-decompress reads both its input and
+		   the decompressing istream created on top of it). */
+		return;
+	}
+	if (reader->hidden_inputs == ISTREAM_HIDDEN_INPUTS_UNCHECKED ||
+	    reader->hidden_inputs == ISTREAM_HIDDEN_INPUTS_PANIC) {
+		/* Reads istreams it doesn't declare, so there's nothing to
+		   compare against. */
+		return;
+	}
+
+	i_panic("istream %s reads undeclared istream %s "
+		"(missing istream_private.io_parent?)",
+		i_stream_get_name(&reader->istream),
+		i_stream_get_name(stream));
+}
+
 ssize_t i_stream_read_memarea(struct istream *stream)
 {
 	struct istream_private *_stream = stream->real_stream;
@@ -353,6 +426,7 @@ ssize_t i_stream_read_memarea(struct istream *stream)
 		return -1;
 	}
 
+	i_stream_verify_reader(stream);
 	stream->eof = FALSE;
 
 	if (_stream->parent != NULL)
@@ -365,10 +439,19 @@ ssize_t i_stream_read_memarea(struct istream *stream)
 		_stream->pos = _stream->high_pos;
 		_stream->high_pos = 0;
 	} else {
+		struct istream_reader reader = {
+			.prev = istream_cur_reader,
+			.stream = stream,
+			.ioloop = current_ioloop,
+		};
+
 		_stream->high_pos = 0;
 		_stream->io_pending_until_read = FALSE;
+		istream_cur_reader = &reader;
 		ret = _stream->read(_stream);
+		istream_cur_reader = reader.prev;
 	}
+	i_assert(_stream->skip <= _stream->pos);
 	i_assert(old_size <= _stream->pos - _stream->skip);
 	switch (ret) {
 	case -2:
@@ -1015,11 +1098,40 @@ bool i_stream_add_data(struct istream *_stream, const unsigned char *data,
 
 struct istream *i_stream_get_root_io(struct istream *stream)
 {
-	while (stream->real_stream->parent != NULL) {
+	struct istream_private *parent;
+
+	while ((parent = i_stream_get_io_parent(stream->real_stream)) != NULL) {
 		i_assert(stream->real_stream->io == NULL);
-		stream = stream->real_stream->parent;
+		stream = &parent->istream;
 	}
 	return stream;
+}
+
+static void i_stream_verify_pending_reachable(struct istream *owner)
+{
+	const struct istream_reader *reader;
+
+	/* The IO may still be added to owner later on. But if an istream that
+	   is currently reading it already owns one, and it can't share it with
+	   owner, this pending is lost. */
+	for (reader = istream_cur_reader; reader != NULL; reader = reader->prev) {
+		struct istream *root;
+
+		if (reader->ioloop != current_ioloop) {
+			/* Nested ioloop - the outer istreams aren't reading
+			   this one. */
+			break;
+		}
+		if (reader->stream->real_stream->hidden_inputs !=
+		    ISTREAM_HIDDEN_INPUTS_PANIC)
+			continue;
+		root = i_stream_get_root_io(reader->stream);
+		if (root == owner || root->real_stream->io == NULL)
+			continue;
+		i_panic("i_stream_set_input_pending(%s) is lost: "
+			"istream %s reads it and owns the ioloop IO",
+			i_stream_get_name(owner), i_stream_get_name(root));
+	}
 }
 
 void i_stream_set_input_pending(struct istream *stream, bool pending)
@@ -1032,8 +1144,10 @@ void i_stream_set_input_pending(struct istream *stream, bool pending)
 	stream = i_stream_get_root_io(stream);
 	if (stream->real_stream->io != NULL)
 		io_set_pending(stream->real_stream->io);
-	else
+	else {
+		i_stream_verify_pending_reachable(stream);
 		stream->real_stream->io_pending = TRUE;
+	}
 }
 
 void i_stream_switch_ioloop_to(struct istream *stream, struct ioloop *ioloop)
@@ -1045,6 +1159,12 @@ void i_stream_switch_ioloop_to(struct istream *stream, struct ioloop *ioloop)
 			stream->real_stream->switch_ioloop_to(
 				stream->real_stream, ioloop);
 		}
+		if (stream->real_stream->io_parent != NULL) {
+			/* Switch also the hidden input istream, which isn't
+			   reached by walking the istream-parents. */
+			i_stream_switch_ioloop_to(
+				stream->real_stream->io_parent, ioloop);
+		}
 		stream = stream->real_stream->parent;
 	} while (stream != NULL);
 }
@@ -1054,12 +1174,18 @@ void i_stream_switch_ioloop(struct istream *stream)
 	i_stream_switch_ioloop_to(stream, current_ioloop);
 }
 
+bool i_stream_io_ever_added(struct istream *stream)
+{
+	return i_stream_get_root_io(stream)->real_stream->io_ever_added;
+}
+
 void i_stream_set_io(struct istream *stream, struct io *io)
 {
 	stream = i_stream_get_root_io(stream);
 
 	i_assert(stream->real_stream->io == NULL);
 	stream->real_stream->io = io;
+	stream->real_stream->io_ever_added = TRUE;
 	if (stream->real_stream->io_pending) {
 		io_set_pending(io);
 		stream->real_stream->io_pending = FALSE;
@@ -1259,9 +1385,16 @@ void i_stream_init_parent(struct istream_private *_stream,
 
 struct istream *
 i_stream_create(struct istream_private *_stream, struct istream *parent, int fd,
+		enum istream_hidden_inputs hidden_inputs,
 		enum istream_create_flag flags)
 {
 	bool noop_snapshot = (flags & ISTREAM_CREATE_FLAG_NOOP_SNAPSHOT) != 0;
+
+	/* io_parent is what ISTREAM_HIDDEN_INPUTS_DECLARED declares, so one
+	   without the other is a mistake in either direction. */
+	i_assert((_stream->io_parent != NULL) ==
+		 (hidden_inputs == ISTREAM_HIDDEN_INPUTS_DECLARED));
+	_stream->hidden_inputs = hidden_inputs;
 
 	_stream->fd = fd;
 	if (parent != NULL)
@@ -1328,7 +1461,8 @@ struct istream *i_stream_create_error(int stream_errno)
 	   reasonable max_buffer_size anyway since some filter istreams don't
 	   behave properly otherwise. */
 	stream->max_buffer_size = IO_BLOCK_SIZE;
-	i_stream_create(stream, NULL, -1, 0);
+	i_stream_create(stream, NULL, -1,
+			ISTREAM_HIDDEN_INPUTS_NONE, 0);
 	i_stream_set_name(&stream->istream, "(error)");
 	return &stream->istream;
 }

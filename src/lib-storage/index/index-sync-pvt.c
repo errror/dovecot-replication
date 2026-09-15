@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "mailbox-list-private.h"
@@ -87,8 +87,7 @@ index_mailbox_sync_view_refresh(struct index_mailbox_sync_pvt_context *ctx)
 		mailbox_set_index_error(ctx->box);
 		return -1;
 	}
-	if (ctx->view_shared != NULL)
-		mail_index_view_close(&ctx->view_shared);
+	mail_index_view_close(&ctx->view_shared);
 	ctx->view_shared = mail_index_view_open(ctx->box->index);
 	return 0;
 }
@@ -196,8 +195,13 @@ index_mailbox_sync_pvt_index(struct index_mailbox_sync_pvt_context *ctx,
 
 	count_shared = mail_index_view_get_messages_count(ctx->view_shared);
 	if (!reset) {
+		/* The private index's next_uid can be higher than the shared
+		   index's, e.g. if the private index was copied from another
+		   server after the mails were copied. Don't look up an
+		   invalid UID range in that case. */
 		if (!mail_index_lookup_seq_range(ctx->view_shared,
-						 hdr_pvt->next_uid,
+						 I_MIN(hdr_pvt->next_uid,
+						       hdr_shared->next_uid),
 						 hdr_shared->next_uid,
 						 &seq_shared, &seq2)) {
 			/* no new messages */
@@ -339,7 +343,6 @@ void index_mailbox_sync_pvt_deinit(struct index_mailbox_sync_pvt_context **_ctx)
 
 	if (ctx->sync_ctx != NULL)
 		mail_index_sync_rollback(&ctx->sync_ctx);
-	if (ctx->view_shared != NULL)
-		mail_index_view_close(&ctx->view_shared);
+	mail_index_view_close(&ctx->view_shared);
 	i_free(ctx);
 }

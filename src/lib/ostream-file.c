@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /* @UNSAFE: whole file */
 
@@ -360,7 +360,16 @@ static int buffer_flush(struct file_ostream *fstream)
 		update_buffer(fstream, ret);
 	}
 
-	return IS_STREAM_EMPTY(fstream) ? 1 : 0;
+	if (!IS_STREAM_EMPTY(fstream))
+		return 0;
+
+	if (fstream->buffer_size > fstream->optimal_block_size) {
+		fstream->buffer = i_realloc(fstream->buffer,
+					    fstream->buffer_size,
+					    fstream->optimal_block_size);
+		fstream->buffer_size = fstream->optimal_block_size;
+	}
+	return 1;
 }
 
 static void o_stream_tcp_flush_via_nodelay(struct file_ostream *fstream)
@@ -580,6 +589,12 @@ static size_t o_stream_add(struct file_ostream *fstream,
 	unused = get_unused_space(fstream);
 	if (unused < size)
 		o_stream_grow_buffer(fstream, size-unused);
+	if (fstream->buffer_size == 0) {
+		/* max_buffer_size=0 with nothing buffered so far:
+		   o_stream_grow_buffer() allocated no buffer at all.
+		   Nothing can be added. */
+		return 0;
+	}
 
 	sent = 0;
 	for (i = 0; i < 2 && sent < size && !fstream->full; i++) {
@@ -1175,7 +1190,7 @@ struct ostream *o_stream_create_file(const char *path, uoff_t offset, mode_t mod
 				     enum ostream_create_file_flags flags)
 {
 	int fd;
-	int open_flags = O_WRONLY|O_CREAT;
+	int open_flags = O_WRONLY | O_CREAT | O_NOFOLLOW;
 	if (HAS_ANY_BITS(flags, OSTREAM_CREATE_FILE_FLAG_APPEND))
 		open_flags |= O_APPEND;
 	else

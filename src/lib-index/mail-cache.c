@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -144,8 +144,9 @@ static int mail_cache_try_open(struct mail_cache *cache)
 	cache->fd = nfs_safe_open(cache->filepath,
 				  cache->index->readonly ? O_RDONLY : O_RDWR);
 	if (cache->fd == -1) {
+		int err = errno;
 		mail_cache_file_close(cache);
-		if (errno == ENOENT) {
+		if (err == ENOENT) {
 			mail_cache_purge_later_reset(cache);
 			return 0;
 		}
@@ -245,7 +246,11 @@ static void mail_cache_update_need_purge(struct mail_cache *cache)
 		records_count = hdr->record_count;
 	}
 
-	cont_percentage = hdr->continued_record_count * 100 / records_count;
+	/* Check if purge_continued_percentage is reached. Note that 100% means
+	   there's a continuation record for every message. But there can be
+	   more than one continuation, so the percentage can grow over 100% */
+	cont_percentage = hdr->continued_record_count >= (UINT_MAX / 100) ?
+		UINT_MAX : (hdr->continued_record_count * 100 / records_count);
 	if (cont_percentage >= set->purge_continued_percentage) {
 		/* too many continued rows, purge */
 		want_purge_reason = t_strdup_printf(
@@ -253,8 +258,13 @@ static void mail_cache_update_need_purge(struct mail_cache *cache)
 			hdr->continued_record_count, records_count);
 	}
 
-	delete_percentage = hdr->deleted_record_count * 100 /
-		(records_count + hdr->deleted_record_count);
+	/* Check if purge_delete_percentage is reached. deleted_record_count is
+	   the number of messages already expunged, so the total number of
+	   records in cache file is deleted_record_count + records_count.
+	   These calculations ignore continuation records. */
+	delete_percentage = hdr->deleted_record_count >= (UINT_MAX / 100) ?
+		UINT_MAX : (hdr->deleted_record_count * 100 /
+			    (records_count + hdr->deleted_record_count));
 	if (delete_percentage >= set->purge_delete_percentage) {
 		/* too many deleted records, purge */
 		want_purge_reason = t_strdup_printf(

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -480,13 +480,13 @@ imapc_rollback_send_expunge(struct imapc_save_context *ctx)
 					    uid)) {
 			/* Maximum length is reached send the rollback
 			   and wait for it to be finished. */
+			seqset_builder_deinit(&seqset_builder);
 			imapc_expunge_send_cmd_str(ctx, uids_str);
 			while (ctx->src_mbox->rollback_pending)
 				imapc_mailbox_run_nofetch(ctx->src_mbox);
 
 			/* Truncate the uids_str and create a new
 			   seqset_builder for the next command */
-			seqset_builder_deinit(&seqset_builder);
 			str_truncate(uids_str, 0);
 			seqset_builder = seqset_builder_init(uids_str);
 			/* Make sure the current uid which is part of
@@ -494,6 +494,7 @@ imapc_rollback_send_expunge(struct imapc_save_context *ctx)
 			seqset_builder_add(seqset_builder, uid);
 		}
 	}
+	seqset_builder_deinit(&seqset_builder);
 	if (str_len(uids_str) > 0)
 		imapc_expunge_send_cmd_str(ctx, uids_str);
 	while (ctx->src_mbox->rollback_pending)
@@ -698,7 +699,7 @@ static void imapc_mail_copy_bulk_flush(struct imapc_mailbox *mbox)
 	seqset_builder_deinit(&mbox->pending_copy_request->uidset_builder);
 
 	str_append(mbox->pending_copy_cmd, " ");
-	imap_append_astring(mbox->pending_copy_cmd, mbox->copy_dest_box);
+	imap_append_astring(mbox->pending_copy_cmd, mbox->copy_dest_box, 0);
 
 	imapc_command_send(cmd, str_c(mbox->pending_copy_cmd));
 
@@ -790,7 +791,8 @@ int imapc_copy(struct mail_save_context *_ctx, struct mail *mail)
 		   different source mailboxes within the same transaction. */
 		i_assert(ctx->src_mbox == NULL || &ctx->src_mbox->box == mail->box);
 		ctx->src_mbox = IMAPC_MAILBOX(mail->box);
-		if (!mail->expunged && imapc_is_mail_expunged(ctx->mbox, mail->uid))
+		if (!mail->expunged &&
+		    imapc_is_mail_expunged(ctx->src_mbox, mail->uid))
 			mail_set_expunged(mail);
 		/* same server, we can use COPY for the mail */
 		src_msgmap =

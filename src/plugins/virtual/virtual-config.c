@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -54,7 +54,7 @@ virtual_search_args_parse(const string_t *rule, const char **error_r)
 	input = i_stream_create_from_data(str_data(rule), str_len(rule));
 	(void)i_stream_read(input);
 
-	imap_parser = imap_parser_create(input, NULL, SIZE_MAX);
+	imap_parser = imap_parser_create(input, NULL, SIZE_MAX, NULL);
 	ret = imap_parser_finish_line(imap_parser, 0,  0, &args);
 	if (ret < 0) {
 		sargs = NULL;
@@ -343,17 +343,22 @@ static int virtual_config_box_metadata_match(struct mailbox *box,
 {
 	struct imap_metadata_transaction *imtrans;
 	struct mail_attribute_value value;
+	enum mail_error mail_error = MAIL_ERROR_NONE;
 	int ret;
 
 	imtrans = imap_metadata_transaction_begin(box);
 	ret = imap_metadata_get(imtrans, bbox->metadata_entry, &value);
 	if (ret < 0)
-		*error_r = t_strdup(imap_metadata_transaction_get_last_error(imtrans, NULL));
+		*error_r = t_strdup(imap_metadata_transaction_get_last_error(imtrans, &mail_error));
 	if (ret > 0)
 		ret = wildcard_match(value.value, bbox->metadata_value) ? 1 : 0;
 	if (ret >= 0 && bbox->negative_match)
 		ret = ret > 0 ? 0 : 1;
 	(void)imap_metadata_transaction_commit(&imtrans, NULL, NULL);
+	if (ret < 0 && mail_error == MAIL_ERROR_NOTFOUND) {
+		/* Ignore nonexistent / \NoSelect mailboxes */
+		ret = 0;
+	}
 	return ret;
 }
 
@@ -417,7 +422,8 @@ static int virtual_config_expand_wildcards(struct virtual_parse_context *ctx,
 	while ((info = mailbox_list_iter_next(iter)) != NULL) {
 		/* skip non-selectable mailboxes (especially mbox
 		   directories) */
-		if ((info->flags & MAILBOX_NOSELECT) != 0)
+		if ((info->flags & (MAILBOX_NOSELECT |
+				    MAILBOX_NONEXISTENT)) != 0)
 			continue;
 		if (strcmp(info->vname, ctx->mbox->box.vname) == 0) {
 			/* don't allow virtual folder to point to itself */

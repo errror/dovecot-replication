@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /*
    There's a bit tricky race condition with recursive deletion.
@@ -45,17 +45,17 @@
 #define ERROR_FORMAT_DNAME "%s(%s/%s) failed: %m"
 
 static void ATTR_FORMAT(3,4)
-unlink_directory_error(const char **error,
+unlink_directory_error(const char **first_error,
 		       int *first_errno,
 		       const char *fmt, ...)
 {
 	va_list args;
 	va_start(args, fmt);
 	const char *err = t_strdup_vprintf(fmt, args);
-	if (*error == NULL) {
+	if (*first_error == NULL) {
 		if (first_errno != NULL)
 			*first_errno = errno;
-		*error = err;
+		*first_error = err;
 	} else
 		i_error("%s", err);
 	va_end(args);
@@ -63,72 +63,31 @@ unlink_directory_error(const char **error,
 
 static int
 unlink_directory_r(const char *dir, enum unlink_directory_flags flags,
-		   const char **error)
+		   const char **first_error)
 {
 	DIR *dirp;
 	struct dirent *d;
 	struct stat st;
-        int dir_fd, old_errno;
+	int dir_fd, old_errno;
 
-#ifdef O_NOFOLLOW
 	dir_fd = open(dir, O_RDONLY | O_NOFOLLOW);
 	if (dir_fd == -1) {
-		unlink_directory_error(error, NULL,
-				       "open(%s, O_RDONLY | O_NOFOLLOW) failed: %m",
-				       dir);
+		unlink_directory_error(first_error, NULL,
+			"open(%s, O_RDONLY | O_NOFOLLOW) failed: %m", dir);
 		return -1;
 	}
-#else
-	struct stat st2;
-
-	if (lstat(dir, &st) < 0) {
-		unlink_directory_error(error_r, NULL, ERROR_FORMAT, "lstat", dir);
-		return -1;
-	}
-
-	if (!S_ISDIR(st.st_mode)) {
-		if ((st.st_mode & S_IFMT) != S_IFLNK) {
-			unlink_directory_error(error_r, NULL, "%s is not a directory: %s", dir);
-			errno = ENOTDIR;
-		} else {
-			/* be compatible with O_NOFOLLOW */
-			errno = ELOOP;
-			unlink_directory_error(error_r, NULL, "%s is a symlink, not a directory: %s", dir);
-		}
-		return -1;
-	}
-
-	dir_fd = open(dir, O_RDONLY);
-	if (dir_fd == -1) {
-		unlink_directory_error(error_r, NULL, "open(%s, O_RDONLY) failed: %m", dir);
-		return -1;
-	}
-
-	if (fstat(dir_fd, &st2) < 0) {
-		i_close_fd(&dir_fd);
-		unlink_directory_error(error_r, NULL, ERROR_FORMAT, "fstat", dir);
-		return -1;
-	}
-
-	if (st.st_ino != st2.st_ino ||
-	    !CMP_DEV_T(st.st_dev, st2.st_dev)) {
-		/* directory was just replaced with something else. */
-		i_close_fd(&dir_fd);
-		errno = ENOTDIR;
-		unlink_directory_error(error_r, NULL, "%s race condition: directory was just replaced", dir);
-		return -1;
-	}
-#endif
 	if (fchdir(dir_fd) < 0) {
-                i_close_fd(&dir_fd);
-		unlink_directory_error(error, NULL, ERROR_FORMAT, "fchdir", dir);
+		i_close_fd(&dir_fd);
+		unlink_directory_error(first_error, NULL, ERROR_FORMAT,
+				       "fchdir", dir);
 		return -1;
 	}
 
 	dirp = opendir(".");
 	if (dirp == NULL) {
 		i_close_fd(&dir_fd);
-		unlink_directory_error(error, NULL, "opendir(.) (in %s) failed: %m", dir);
+		unlink_directory_error(first_error, NULL,
+				       "opendir(.) (in %s) failed: %m", dir);
 		return -1;
 	}
 
@@ -138,10 +97,8 @@ unlink_directory_r(const char *dir, enum unlink_directory_flags flags,
 		d = readdir(dirp);
 		if (d == NULL) {
 			if (errno != 0) {
-				unlink_directory_error(error,
-						       &first_errno,
-						       ERROR_FORMAT,
-						       "readdir",
+				unlink_directory_error(first_error, &first_errno,
+						       ERROR_FORMAT, "readdir",
 						       dir);
 			}
 			break;
@@ -161,7 +118,7 @@ unlink_directory_r(const char *dir, enum unlink_directory_flags flags,
 
 			if (lstat(d->d_name, &st) < 0) {
 				if (errno != ENOENT) {
-					unlink_directory_error(error,
+					unlink_directory_error(first_error,
 							       &first_errno,
 							       ERROR_FORMAT,
 							       "lstat",
@@ -170,14 +127,15 @@ unlink_directory_r(const char *dir, enum unlink_directory_flags flags,
 				}
 			} else if (S_ISDIR(st.st_mode) &&
 				   (flags & UNLINK_DIRECTORY_FLAG_FILES_ONLY) == 0) {
-				if (unlink_directory_r(d->d_name, flags, error) < 0) {
+				if (unlink_directory_r(d->d_name, flags,
+						       first_error) < 0) {
 					if (first_errno == 0)
 						first_errno = errno;
 					if (errno != ENOENT)
 						break;
 				}
 				if (fchdir(dir_fd) < 0) {
-					unlink_directory_error(error,
+					unlink_directory_error(first_error,
 							       &first_errno,
 							       ERROR_FORMAT,
 							       "fchdir",
@@ -185,16 +143,14 @@ unlink_directory_r(const char *dir, enum unlink_directory_flags flags,
 					break;
 				}
 
-				if (rmdir(d->d_name) < 0 &&
-				    errno != ENOENT) {
+				if (rmdir(d->d_name) < 0 && errno != ENOENT) {
 					if (errno == EEXIST)
 						/* standardize errno */
 						errno = ENOTEMPTY;
-					unlink_directory_error(error,
+					unlink_directory_error(first_error,
 							       &first_errno,
 							       ERROR_FORMAT,
-							       "rmdir",
-							       dir);
+							       "rmdir", dir);
 					break;
 				}
 			} else if (S_ISDIR(st.st_mode) &&
@@ -207,25 +163,20 @@ unlink_directory_r(const char *dir, enum unlink_directory_flags flags,
 				   is worth logging about */
 				break;
 			} else
-                                /* so it wasn't a directory */
-				unlink_directory_error(error,
-						       &first_errno,
+				/* so it wasn't a directory */
+				unlink_directory_error(first_error, &first_errno,
 						       ERROR_FORMAT_DNAME,
-						       "unlink",
-						       dir,
+						       "unlink", dir,
 						       d->d_name);
 		}
 	}
 
 	i_close_fd(&dir_fd);
-	if (closedir(dirp) < 0)
-		unlink_directory_error(error,
-				       &first_errno,
-				       ERROR_FORMAT,
-				       "closedir",
-				       dir);
-
-	if (*error != NULL) {
+	if (closedir(dirp) < 0) {
+		unlink_directory_error(first_error, &first_errno,
+				       ERROR_FORMAT, "closedir", dir);
+	}
+	if (*first_error != NULL) {
 		errno = first_errno;
 		return -1;
 	}
@@ -260,7 +211,8 @@ int unlink_directory(const char *dir, enum unlink_directory_flags flags,
 
 	if (fchdir(fd) < 0) {
 		i_fatal("unlink_directory(%s): "
-			"Can't fchdir() back to our original dir %s: %m", dir, orig_dir);
+			"Can't fchdir() back to our original dir %s: %m", dir,
+			orig_dir);
 	}
 	i_close_fd(&fd);
 

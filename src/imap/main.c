@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "ioloop.h"
@@ -6,7 +6,6 @@
 #include "ostream.h"
 #include "path-util.h"
 #include "str.h"
-#include "base64.h"
 #include "process-title.h"
 #include "randgen.h"
 #include "restrict-access.h"
@@ -35,13 +34,13 @@
 
 #define IMAP_DIE_IDLE_SECS 10
 
-static bool verbose_proctitle = FALSE;
 static struct mail_storage_service_ctx *storage_service;
 static struct login_server *login_server = NULL;
 static struct timeout *to_proctitle;
 
 imap_client_created_func_t *hook_client_created = NULL;
 bool imap_debug = FALSE;
+bool verbose_proctitle = FALSE;
 
 struct event_category event_category_imap = {
 	.name = "imap",
@@ -312,8 +311,8 @@ static void main_stdio_run(const char *username)
 {
 	struct client *client;
 	struct mail_storage_service_input input;
-	struct imap_login_request request;
-	const char *value, *error, *input_base64;
+	struct imap_login_request request = { };
+	const char *error;
 
 	i_zero(&input);
 	input.service = "imap";
@@ -322,29 +321,10 @@ static void main_stdio_run(const char *username)
 		input.username = getlogin();
 	if (input.username == NULL)
 		i_fatal("USER environment missing");
-	if ((value = getenv("IP")) != NULL)
-		(void)net_addr2ip(value, &input.remote_ip);
-	if ((value = getenv("LOCAL_IP")) != NULL)
-		(void)net_addr2ip(value, &input.local_ip);
 
 	if (client_create_from_input(&input, NULL, STDIN_FILENO, STDOUT_FILENO,
 				     0, &client, &error) < 0)
 		i_fatal("%s", error);
-
-	input_base64 = getenv("CLIENT_INPUT");
-	if (input_base64 == NULL) {
-		/* IMAPLOGINTAG environment is compatible with mailfront */
-		i_zero(&request);
-		request.tag = getenv("IMAPLOGINTAG");
-	} else {
-		const buffer_t *input_buf = t_base64_decode_str(input_base64);
-		client_parse_imap_login_request(input_buf->data, input_buf->used,
-						&request);
-		if (request.input_size > 0) {
-			client_add_istream_prefix(client, request.input,
-						  request.input_size);
-		}
-	}
 
 	client_create_finish_io(client);
 	client_send_login_reply(client->output,
@@ -546,7 +526,12 @@ int main(int argc, char *argv[])
 	master_admin_clients_init(&admin_callbacks);
 	master_service_set_die_callback(master_service, imap_die);
 
-	if (master_service_settings_read_simple(master_service, &error) < 0)
+	struct master_service_settings_input set_input = {
+		.preserve_user = TRUE,
+	};
+	struct master_service_settings_output set_output;
+	if (master_service_settings_read(master_service, &set_input,
+					 &set_output, &error) < 0)
 		i_fatal("%s", error);
 
 	/* plugins may want to add commands, so this needs to be called early */

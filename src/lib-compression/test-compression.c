@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -8,6 +8,7 @@
 #include "sha1.h"
 #include "randgen.h"
 #include "test-common.h"
+#include "test-dir.h"
 #include "settings.h"
 #include "compression.h"
 #include "iostream-lz4.h"
@@ -47,7 +48,7 @@ static void test_compression_handler_detect(const struct compression_handler *ha
 	o_stream_unref(&output);
 
 	test_input = test_istream_create_data(buffer->data, buffer->used);
-	handler = compression_detect_handler(test_input);
+	compression_detect_handler(test_input, &handler);
 	i_stream_seek(test_input, 0);
 	test_assert(handler != NULL);
 	if (handler != NULL) {
@@ -150,6 +151,46 @@ test_compression_handler_empty(const struct compression_handler *handler,
 	i_stream_unref(&input);
 
 	buffer_free(&buffer);
+
+	test_end();
+}
+
+static void
+test_compression_handler_zero_frame(const struct compression_handler *handler,
+				    bool autodetect)
+{
+	test_begin(t_strdup_printf("compression handler %s (zero-len frame, autodetect=%s)",
+				   handler->name, autodetect ? "yes" : "no"));
+
+	/* Produce successive empty frames. Each frame needs its own ostream
+	   because o_stream_finish() propagates to the parent; compress each
+	   into a separate buffer then concatenate.
+	   lz4 uses a custom single-stream format and does not support
+	   concatenated frames, so limit it to one. */
+	unsigned int n_frames = strcmp(handler->name, "lz4") == 0 ? 1 : 3;
+	buffer_t *compressed = buffer_create_dynamic(pool_datastack_create(), 256);
+	for (unsigned int i = 0; i < n_frames; i++) {
+		buffer_t *frame_buf = buffer_create_dynamic(pool_datastack_create(), 64);
+		struct ostream *os = test_ostream_create(frame_buf);
+		struct ostream *output = handler->create_ostream_auto(os, set.event);
+		o_stream_unref(&os);
+		test_assert_idx(o_stream_finish(output) == 1, i);
+		o_stream_unref(&output);
+		test_assert_idx(frame_buf->used > 0, i);
+		buffer_append(compressed, frame_buf->data, frame_buf->used);
+	}
+
+	/* Decompress: must yield clean EOF with no error and no loop. */
+	struct istream *is = test_istream_create_data(compressed->data, compressed->used);
+	is->blocking = TRUE;
+	struct istream *input = !autodetect ? handler->create_istream(is) :
+		i_stream_create_decompress(is, 0);
+	i_stream_unref(&is);
+
+	test_assert(i_stream_read(input) == -1);
+	test_assert(input->eof);
+	test_assert(input->stream_errno == 0);
+	i_stream_unref(&input);
 
 	test_end();
 }
@@ -283,7 +324,8 @@ static void
 test_compression_handler(const struct compression_handler *handler,
 			 bool autodetect)
 {
-	const char *path = "test-compression.tmp";
+	static unsigned int seq = 0;
+	const char *path;
 	struct istream *file_input, *input;
 	struct ostream *file_output, *output;
 	unsigned char buf[IO_BLOCK_SIZE];
@@ -296,6 +338,8 @@ test_compression_handler(const struct compression_handler *handler,
 	int fd;
 	ssize_t ret;
 
+	path = t_strdup_printf("%s/%s-%u", test_dir_get(),
+			       handler->name, seq++);
 	test_begin(t_strdup_printf("compression handler %s (autodetect=%s)",
 				   handler->name, autodetect ? "yes" : "no"));
 
@@ -729,6 +773,49 @@ test_compression_handler_errors(const struct compression_handler *handler,
 	test_end();
 }
 
+static void
+test_compression_handler_partial_header(const struct compression_handler *handler,
+					bool autodetect)
+{
+	test_begin(t_strdup_printf("compression handler %s (partial header read, autodetect=%s)",
+				   handler->name, autodetect ? "yes" : "no"));
+
+	buffer_t *compressed = t_buffer_create(32);
+	struct ostream *os = test_ostream_create(compressed);
+	struct ostream *os2 = handler->create_ostream_auto(os, set.event);
+	o_stream_unref(&os);
+	o_stream_nsend_str(os2, "hello, world");
+	int ret = o_stream_finish(os2);
+	test_assert(ret > 0);
+	o_stream_unref(&os2);
+
+	struct istream *is = test_istream_create_data(compressed->data, compressed->used);
+	struct istream *is2;
+	if (autodetect)
+		is2 = i_stream_create_decompress(is, 0);
+	else
+		is2 = handler->create_istream(is);
+	buffer_t *decompressed = t_buffer_create(32);
+	const unsigned char *data;
+	size_t pos, len;
+	for (pos = 0; pos <= compressed->used; pos++) {
+		test_istream_set_size(is, pos);
+		while (i_stream_read_more(is2, &data, &len) > 0) {
+			buffer_append(decompressed, data, len);
+			i_stream_skip(is2, len);
+		}
+	}
+	i_stream_unref(&is);
+
+	test_assert(is2->eof);
+	test_assert(is2->stream_errno == 0);
+	test_assert_memcmp(decompressed->data, decompressed->used,
+			   "hello, world", strlen("hello, world"));
+	i_stream_unref(&is2);
+
+	test_end();
+}
+
 static void test_compression_int(bool autodetect)
 {
 	unsigned int i;
@@ -743,6 +830,7 @@ static void test_compression_int(bool autodetect)
 				test_compression_handler_detect(&compression_handlers[i]);
 			test_compression_handler_short(&compression_handlers[i], autodetect);
 			test_compression_handler_empty(&compression_handlers[i], autodetect);
+			test_compression_handler_zero_frame(&compression_handlers[i], autodetect);
 			test_compression_handler(&compression_handlers[i], autodetect);
 			test_compression_handler_seek(&compression_handlers[i], autodetect);
 			test_compression_handler_reset(&compression_handlers[i], autodetect);
@@ -750,6 +838,7 @@ static void test_compression_int(bool autodetect)
 			test_compression_handler_random_io(&compression_handlers[i], autodetect);
 			test_compression_handler_large_random_io(&compression_handlers[i], autodetect);
 			test_compression_handler_errors(&compression_handlers[i], autodetect);
+			test_compression_handler_partial_header(&compression_handlers[i], autodetect);
 		} T_END;
 	}
 }
@@ -930,7 +1019,6 @@ static void test_gz_large_header_int(bool autodetect)
 
 		input = !autodetect ? gz->create_istream(file_input) :
 			i_stream_create_decompress(file_input, 0);
-		test_assert_idx(i_stream_read(input) == 0, i);
 		test_assert_idx(i_stream_read(input) == -1 &&
 				input->stream_errno == EINVAL, i);
 		i_stream_unref(&input);
@@ -995,6 +1083,123 @@ static void test_lz4_small_header(void)
 		    input->stream_errno == 0);
 	i_stream_unref(&input);
 	i_stream_unref(&file_input);
+
+	test_end();
+}
+
+static const unsigned char lz4_chunk_crash_01[] = {
+	 0x44, 0x6f, 0x76, 0x65, 0x63, 0x6f, 0x74, 0x2d, 0x4c, 0x5a, 0x34, 0x0d,
+	 0x2a, 0x9b, 0xc5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x7a,
+	 0x32, 0x01, 0xff, 0xff, 0x00, 0x30
+};
+
+static const unsigned char lz4_chunk_crash_02[] = {
+	 0x44, 0x6f, 0x76, 0x65, 0x63, 0x6f, 0x74, 0x2d, 0x4c, 0x5a, 0x34, 0x0d,
+	 0x2a, 0x9b, 0xc5, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07, 0x7a,
+	 0x32, 0x01, 0xff, 0xff, 0x00, 0x30
+};
+
+static const unsigned char lz4_chunk_eof_03[] = {
+	0x44, 0x6f, 0x76, 0x65, 0x63, 0x6f, 0x74, 0x2d, 0x4c, 0x5a, 0x34, 0x0d,
+	0x2a, 0x9b, 0xc5, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+};
+
+static void test_lz4_chunk_size(void)
+{
+	const struct compression_handler *lz4;
+	struct istream *file_input, *input;
+
+	if (compression_lookup_handler("lz4", &lz4) <= 0)
+		return; /* not compiled in or unknown */
+
+	test_begin("lz4 chunk size");
+
+	file_input = test_istream_create_data(lz4_chunk_crash_01,
+					      sizeof(lz4_chunk_crash_01));
+	input = lz4->create_istream(file_input);
+	i_stream_unref(&file_input);
+
+	test_assert(i_stream_read(input) == -1);
+	test_assert(input->eof);
+	test_assert(input->stream_errno != 0);
+	const char *error = i_stream_get_error(input);
+	test_assert(strstr(error, "invalid lz4 max chunk size") != NULL);
+
+	i_stream_unref(&input);
+
+	file_input = test_istream_create_data(lz4_chunk_crash_02,
+					      sizeof(lz4_chunk_crash_02));
+	input = lz4->create_istream(file_input);
+	i_stream_unref(&file_input);
+
+	test_assert(i_stream_read(input) == -1);
+	test_assert(input->eof);
+	test_assert(input->stream_errno != 0);
+	error = i_stream_get_error(input);
+	test_assert(strstr(error, "invalid lz4 max chunk size") != NULL);
+
+	i_stream_unref(&input);
+
+	file_input = test_istream_create_data(lz4_chunk_eof_03,
+					      sizeof(lz4_chunk_eof_03));
+	input = lz4->create_istream(file_input);
+	i_stream_unref(&file_input);
+
+	/* no error, but no content either */
+	test_assert(i_stream_read(input) == -1);
+	test_assert(input->eof);
+	test_assert(input->stream_errno == 0);
+
+	i_stream_unref(&input);
+
+	test_end();
+}
+
+static void test_lz4_many_empty_chunks(void)
+{
+	const struct compression_handler *lz4;
+	struct istream *file_input, *input;
+
+	if (compression_lookup_handler("lz4", &lz4) <= 0)
+		return; /* not compiled in or unknown */
+
+	test_begin("lz4 many empty chunks");
+
+	/* A crafted lz4 stream can contain an unbounded number of chunks that
+	   each decompress to zero bytes. i_stream_lz4_read() must iterate over
+	   them rather than recurse once per chunk, or the stack is exhausted
+	   (tail-call optimization is not guaranteed). */
+	buffer_t *buf = buffer_create_dynamic(default_pool, 1024*512);
+	struct iostream_lz4_header hdr;
+	memcpy(hdr.magic, IOSTREAM_LZ4_MAGIC, IOSTREAM_LZ4_MAGIC_LEN);
+	/* a valid (64k) max uncompressed chunk size, big-endian */
+	hdr.max_uncompressed_chunk_size[0] = 0x00;
+	hdr.max_uncompressed_chunk_size[1] = 0x01;
+	hdr.max_uncompressed_chunk_size[2] = 0x00;
+	hdr.max_uncompressed_chunk_size[3] = 0x00;
+	buffer_append(buf, &hdr, sizeof(hdr));
+
+	/* Each chunk: 4-byte big-endian compressed length (1), then a single
+	   0x00 byte, which LZ4_decompress_safe() decodes to zero bytes. */
+	static const unsigned char empty_chunk[] = {
+		0x00, 0x00, 0x00, 0x01, 0x00
+	};
+	for (unsigned int i = 0; i < 100000; i++)
+		buffer_append(buf, empty_chunk, sizeof(empty_chunk));
+
+	file_input = test_istream_create_data(buf->data, buf->used);
+	file_input->blocking = TRUE;
+	input = lz4->create_istream(file_input);
+	i_stream_unref(&file_input);
+
+	/* All chunks are empty: clean EOF, no content, no error - and, with
+	   the iterative read, no stack overflow. */
+	test_assert(i_stream_read(input) == -1);
+	test_assert(input->eof);
+	test_assert(input->stream_errno == 0);
+
+	i_stream_unref(&input);
+	buffer_free(&buf);
 
 	test_end();
 }
@@ -1122,6 +1327,8 @@ int main(int argc, char *argv[])
 		test_gz_header,
 		test_gz_large_header,
 		test_lz4_small_header,
+		test_lz4_chunk_size,
+		test_lz4_many_empty_chunks,
 		test_compression_ext,
 		test_compression_deinit,
 		NULL
@@ -1138,5 +1345,6 @@ int main(int argc, char *argv[])
 		lib_deinit();
 		return 0;
 	}
+	test_dir_init("compression");
 	return test_run(test_functions);
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -3597,10 +3597,10 @@ static void server_connection_accept(void *context ATTR_UNUSED)
 
 	/* accept new client */
 	fd = net_accept(fd_listen, NULL, NULL);
-	if (fd == -1)
+	if (fd == -1) {
+		if (!NET_ACCEPT_ENOCONN(errno))
+			i_fatal("test server: accept() failed: %m");
 		return;
-	if (fd == -2) {
-		i_fatal("test server: accept() failed: %m");
 	}
 
 	server_connection_init(fd);
@@ -3818,7 +3818,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	test_subprocesses_init(debug);
+	test_init();
+	event_set_forced_debug(test_event, debug);
+	test_subprocesses_init();
 
 	/* listen on localhost */
 	i_zero(&bind_ip);
@@ -3827,7 +3829,6 @@ int main(int argc, char *argv[])
 
 	ret = test_run(test_functions);
 
-	test_subprocesses_deinit();
 	event_set_ptr(cctx->event, SETTINGS_EVENT_ROOT, NULL);
 
 	main_deinit();

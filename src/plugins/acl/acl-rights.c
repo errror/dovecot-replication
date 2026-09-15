@@ -1,12 +1,15 @@
-/* Copyright (c) 2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "str.h"
+#include "unichar.h"
 /* <settings checks> */
 #include "strescape.h"
 /* </settings checks> */
 #include "acl-api-private.h"
+
+#include <ctype.h>
 
 /* <settings checks> */
 const struct acl_letter_map acl_letter_map[] = {
@@ -43,6 +46,19 @@ static_assert(N_ELEMENTS(acl_letter_map) == N_ELEMENTS(all_mailbox_rights),
 	     "acl_letter_map size differs from all_mailbox_rights");
 
 /* </settings checks> */
+
+bool acl_id_is_valid(const char *id)
+{
+	size_t len = strlen(id);
+
+	if (len > ACL_ID_MAX_LEN)
+		return FALSE;
+	for (size_t i = 0; i < len; i++) {
+		if (i_iscntrl(id[i]))
+			return FALSE;
+	}
+	return uni_utf8_data_is_valid((const unsigned char *)id, len);
+}
 
 void acl_rights_write_id(string_t *dest, const struct acl_rights *right)
 {
@@ -441,8 +457,8 @@ bool acl_right_names_modify(pool_t pool,
 				array_push_back(&rights, &old_rights[i]);
 		}
 		new_rights = empty_str_array;
-		modify_rights = array_count(&rights) == 0 ? NULL :
-			array_front(&rights);
+		array_append_zero(&rights);
+		modify_rights = array_front(&rights);
 		acl_right_names_merge(pool, &new_rights, modify_rights, TRUE);
 		break;
 	case ACL_MODIFY_MODE_ADD:

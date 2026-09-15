@@ -1,34 +1,12 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
-#include "array.h"
 #include "process-title.h"
 #include "settings.h"
 #include "master-service.h"
 #include "doveadm.h"
 #include "doveadm-settings.h"
 #include "client-connection-private.h"
-
-bool doveadm_client_is_allowed_command(const struct doveadm_settings *set,
-				       const char *cmd_name)
-{
-	bool ret = FALSE;
-
-	if (array_is_empty(&set->doveadm_allowed_commands))
-		return TRUE;
-
-	T_BEGIN {
-		const char *const *cmds =
-			settings_boollist_get(&set->doveadm_allowed_commands);
-		for (; *cmds != NULL; cmds++) {
-			if (strcmp(*cmds, cmd_name) == 0) {
-				ret = TRUE;
-				break;
-			}
-		}
-	} T_END;
-	return ret;
-}
 
 static int client_connection_read_settings(struct client_connection *conn)
 {
@@ -55,7 +33,7 @@ int client_connection_init(struct client_connection *conn,
 	if (net_getsockname(fd, &conn->local_ip, &conn->local_port) == 0)
 		event_add_ip(conn->event, "local_ip", &conn->local_ip);
 	if (net_getpeername(fd, &conn->remote_ip, &conn->remote_port) == 0)
-		event_add_ip(conn->event, "remote_ip", &conn->local_ip);
+		event_add_ip(conn->event, "remote_ip", &conn->remote_ip);
 
 	ip = net_ip2addr(&conn->remote_ip);
 	if (ip[0] != '\0')

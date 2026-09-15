@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "connection.h"
@@ -13,10 +13,16 @@
 #include "time-util.h"
 #include "process-title.h"
 #include "master-service.h"
+#include "master-service-settings.h"
 #include "mail-storage-service.h"
+#include "auth-client.h"
 #include "imap-client.h"
 #include "imap-state.h"
 #include "imap-master-client.h"
+
+#if defined(HAVE_SYS_MKDEV_H)
+#  include <sys/mkdev.h> /* Solaris */
+#endif
 
 struct imap_master_client {
 	struct connection conn;
@@ -36,6 +42,9 @@ struct imap_master_input {
 	/* Timestamp when hibernation started */
 	struct timeval hibernation_start_time;
 
+	const char *auth_token;
+	const char *session_pid;
+
 	dev_t peer_dev;
 	ino_t peer_ino;
 
@@ -53,6 +62,8 @@ static void imap_master_client_destroy(struct connection *conn)
 		master_service_client_connection_destroyed(master_service);
 	connection_deinit(conn);
 	i_free(conn);
+
+	imap_refresh_proctitle();
 }
 
 static int
@@ -176,6 +187,10 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 			}
 		} else if (strcmp(key, "tag") == 0) {
 			master_input_r->tag = t_strdup(value);
+		} else if (strcmp(key, "auth_token") == 0) {
+			master_input_r->auth_token = t_strdup(value);
+		} else if (strcmp(key, "session_pid") == 0) {
+			master_input_r->session_pid = t_strdup(value);
 		} else if (strcmp(key, "bad-done") == 0) {
 			master_input_r->state_import_bad_idle_done = TRUE;
 		} else if (strcmp(key, "idle-continue") == 0) {
@@ -255,10 +270,136 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 	return 0;
 }
 
+struct imap_master_auth_result {
+	struct ioloop *ioloop;
+	char *error;
+};
+
+static void imap_master_auth_connected(struct auth_client *client ATTR_UNUSED,
+				       const char *error, void *context)
+{
+	struct imap_master_auth_result *result = context;
+
+	result->error = i_strdup(error);
+	io_loop_stop(result->ioloop);
+}
+
+static void
+imap_master_auth_callback(struct auth_client_request *request ATTR_UNUSED,
+			  enum auth_request_status status,
+			  const char *log_error,
+			  const char *data_base64 ATTR_UNUSED,
+			  const char *const *args ATTR_UNUSED,
+			  void *context)
+{
+	struct imap_master_auth_result *result = context;
+
+	i_assert(status != AUTH_REQUEST_STATUS_CONTINUE);
+
+	if (status != AUTH_REQUEST_STATUS_OK)
+		result->error = i_strdup(log_error);
+	io_loop_stop(result->ioloop);
+}
+
+static int
+imap_master_client_authenticate(const char *username, const char *session_id,
+				const char *auth_token, const char *session_pid,
+				const char **error_r)
+{
+	if (auth_token == NULL) {
+		*error_r = "Missing auth_token";
+		return -1;
+	}
+	if (session_pid == NULL) {
+		*error_r = "Missing session_pid";
+		return -1;
+	}
+	if (session_id == NULL) {
+		*error_r = "Missing session_id";
+		return -1;
+	}
+
+	const struct master_service_settings *master_set =
+		master_service_get_service_settings(master_service);
+	const char *auth_socket_path =
+		t_strconcat(master_set->base_dir, "/auth-token", NULL);
+
+	struct ioloop *ioloop = io_loop_create();
+	struct auth_client *auth_client =
+		auth_client_init(auth_socket_path, getpid(), imap_debug);
+
+	struct imap_master_auth_result result = {
+		.ioloop = ioloop,
+	};
+	auth_client_set_connect_notify(auth_client, imap_master_auth_connected,
+				       &result);
+	auth_client_connect(auth_client);
+	if (!auth_client_is_disconnected(auth_client))
+		io_loop_run(ioloop);
+
+	if (result.error != NULL) {
+		auth_client_deinit(&auth_client);
+		io_loop_destroy(&ioloop);
+		*error_r = t_strdup_printf("Failed to connect to %s: %s",
+					   auth_socket_path, result.error);
+		i_free(result.error);
+		return -1;
+	}
+	auth_client_set_connect_notify(auth_client, NULL, NULL);
+
+	/* payload: service \0 pid \0 username \0 session_id \0 auth_token */
+	string_t *token_payload = t_str_new(128);
+	str_append(token_payload, master_service_get_name(master_service));
+	str_append_c(token_payload, '\0');
+	str_append(token_payload, session_pid);
+	str_append_c(token_payload, '\0');
+	str_append(token_payload, username);
+	str_append_c(token_payload, '\0');
+	str_append(token_payload, session_id);
+	str_append_c(token_payload, '\0');
+	str_append(token_payload, auth_token);
+
+	string_t *initial_resp_b64 = t_str_new(256);
+	base64_encode(str_data(token_payload), str_len(token_payload),
+		      initial_resp_b64);
+
+	struct auth_request_info info = {
+		.mech = "DOVECOT-TOKEN",
+		.protocol = "imap",
+		.session_id = session_id,
+		.flags = AUTH_REQUEST_FLAG_CONN_SECURED,
+		.initial_resp_base64 = str_c(initial_resp_b64),
+	};
+
+	(void)auth_client_request_new(auth_client, &info,
+				      imap_master_auth_callback, &result);
+	io_loop_set_running(ioloop);
+	io_loop_run(ioloop);
+
+	auth_client_deinit(&auth_client);
+	io_loop_destroy(&ioloop);
+
+	if (result.error != NULL) {
+		*error_r = t_strdup_printf(
+			"DOVECOT-TOKEN authentication failed: %s "
+			"(session_pid=%s, token=%s)", result.error, session_pid,
+			auth_token);
+		i_free(result.error);
+		return -1;
+	}
+	return 0;
+}
+
 static int imap_master_client_verify(const struct imap_master_input *master_input,
+				     const struct mail_storage_service_input *input,
 				     int fd_client, const char **error_r)
 {
 	struct stat peer_st;
+
+	if (imap_master_client_authenticate(input->username, input->session_id,
+					    master_input->auth_token,
+					    master_input->session_pid, error_r) < 0)
+		return -1;
 
 	if (master_input->peer_ino == 0)
 		return 0;
@@ -304,14 +445,15 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 		i_close_fd(&fd_client);
 		return -1;
 	}
-	if (imap_master_client_verify(&master_input, fd_client, &error) < 0) {
+	if (imap_master_client_verify(&master_input, &input, fd_client, &error) < 0) {
 		e_error(conn->event, "imap-master: Failed to verify client input: %s", error);
 		o_stream_nsend_str(conn->output, t_strdup_printf(
 			"-Failed to verify client input: %s\n", error));
 		i_close_fd(&fd_client);
 		return -1;
 	}
-	process_title_set("[unhibernating]");
+	if (verbose_proctitle)
+		process_title_set("[unhibernating]");
 
 	/* NOTE: before client_create_from_input() on failures we need to close
 	   fd_client, but afterward it gets closed by client_destroy() */
@@ -395,9 +537,11 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 		client_destroy(imap_client, "Client state initialization failed");
 		return -1;
 	case IMAP_STATE_INCONSISTENT:
+		e_debug(event, "imap-master: Unhibernation failed: %s", error);
 		event_unref(&event);
-		client_destroy(imap_client, "Client state inconsistent");
-		return 0;
+		client_disconnect_with_error(imap_client,
+			"IMAP session state is inconsistent, please relogin.");
+		return -1;
 	case IMAP_STATE_OK:
 		break;
 	}
@@ -424,7 +568,6 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 		io_set_pending(imap_client->io);
 	}
 
-	imap_refresh_proctitle();
 	/* we'll always disconnect the client afterwards */
 	return -1;
 }
@@ -457,6 +600,8 @@ imap_master_client_input_line(struct connection *conn, const char *line)
 	ret = imap_master_client_input_args(conn, (const void *)args,
 					    fd_client, pool);
 	pool_unref(&pool);
+
+	imap_refresh_proctitle();
 	return ret;
 }
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lmtp-common.h"
 #include "ioloop.h"
@@ -45,7 +45,8 @@ lmtp_client_created_hook_set(lmtp_client_created_func_t *new_hook)
 void lmtp_anvil_init(void)
 {
 	if (anvil == NULL) {
-		const char *path = t_strdup_printf("%s/anvil", base_dir);
+		const char *path = t_strdup_printf("%s/anvil-connect-limit",
+						   base_dir);
 		anvil = anvil_client_init(path, NULL, 0);
 	}
 }
@@ -80,6 +81,7 @@ static void main_init(void)
 	lmtp_set.rcpt_domain_optional = TRUE;
 	lmtp_set.mail_path_allow_broken = TRUE;
 	lmtp_set.reason_code_module = "lmtp";
+	lmtp_set.max_recipients = SET_UINT_UNLIMITED;
 
 	lmtp_server = smtp_server_init(&lmtp_set);
 

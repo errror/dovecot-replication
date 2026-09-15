@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -259,6 +259,7 @@ imapc_mail_send_fetch(struct mail *_mail, enum mail_fetch_field fields,
 	if ((fields & (MAIL_FETCH_PHYSICAL_SIZE | MAIL_FETCH_VIRTUAL_SIZE)) != 0)
 		str_append(str, "RFC822.SIZE ");
 	if ((fields & MAIL_FETCH_GUID) != 0) {
+		i_assert(mbox->guid_fetch_field_name != NULL);
 		str_append(str, mbox->guid_fetch_field_name);
 		str_append_c(str, ' ');
 	}
@@ -289,7 +290,7 @@ imapc_mail_send_fetch(struct mail *_mail, enum mail_fetch_field fields,
 		for (i = 0; mail->fetching_headers[i] != NULL; i++) {
 			if (i > 0)
 				str_append_c(str, ' ');
-			imap_append_astring(str, mail->fetching_headers[i]);
+			imap_append_astring(str, mail->fetching_headers[i], 0);
 		}
 		str_append(str, ")] ");
 		mail->header_list_fetched = FALSE;
@@ -773,7 +774,7 @@ imapc_fetch_header_stream(struct imapc_mail *mail,
 
 	headers_ctx = mailbox_header_lookup_init(mail->imail.mail.mail.box,
 						 array_front(&hdr_arr));
-	index_mail_parse_header_init(&mail->imail, headers_ctx);
+	index_mail_parse_header_init(&mail->imail, headers_ctx, FALSE);
 
 	parser = message_parse_header_init(input, NULL, hdr_parser_flags);
 	while ((ret = message_parse_header_next(parser, &hdr)) > 0) T_BEGIN {
@@ -809,7 +810,8 @@ imapc_args_to_bodystructure(struct imapc_mail *mail,
 		ret = NULL;
 	} else {
 		string_t *str = t_str_new(128);
-		if (imap_bodystructure_write(parts, str, extended, &error) < 0) {
+		if (imap_bodystructure_write(parts, str, extended, 0,
+					     &error) < 0) {
 			/* All the input to imap_bodystructure_write() came
 			   from imap_bodystructure_parse_args(). We should never
 			   get here. Instead, if something is wrong the

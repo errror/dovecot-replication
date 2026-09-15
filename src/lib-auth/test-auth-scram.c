@@ -1,4 +1,4 @@
-/* Copyright (c) 2022 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "str.h"
@@ -37,36 +37,29 @@ struct backend_context {
 };
 
 static bool
-test_auth_set_username(struct auth_scram_server *asserver, const char *username,
-		       const char **error_r)
+test_auth_set_username(struct auth_scram_server *asserver, const char *username)
 {
 	struct backend_context *bctx =
 		container_of(asserver, struct backend_context, asserver);
 
-	if (bctx->expect_error == AUTH_SCRAM_SERVER_ERROR_BAD_USERNAME) {
-		*error_r = "Bad username";
+	if (bctx->expect_error == AUTH_SCRAM_SERVER_ERROR_BAD_USERNAME)
 		return FALSE;
-	}
 
 	bctx->username = p_strdup(bctx->pool, username);
-	*error_r = NULL;
 	return TRUE;
 }
 
 static bool
 test_auth_set_login_username(struct auth_scram_server *asserver,
-			     const char *username, const char **error_r)
+			     const char *username)
 {
 	struct backend_context *bctx =
 		container_of(asserver, struct backend_context, asserver);
 
-	if (bctx->expect_error == AUTH_SCRAM_SERVER_ERROR_BAD_LOGIN_USERNAME) {
-		*error_r = "Bad login username";
+	if (bctx->expect_error == AUTH_SCRAM_SERVER_ERROR_BAD_LOGIN_USERNAME)
 		return FALSE;
-	}
 
 	bctx->login_username = p_strdup(bctx->pool, username);
-	*error_r = NULL;
 	return TRUE;
 }
 
@@ -180,6 +173,15 @@ test_auth_client_output(struct backend_context *bctx,
 		case 21:
 			output = "n,,n=frop,r=0980923401388";
 			break;
+		case 22:
+			output = "p";
+			break;
+		case 23:
+			output = "p=";
+			break;
+		case 24:
+			output = "p.a";
+			break;
 		default:
 			auth_scram_client_output(&bctx->asclient, output_r,
 						 output_len_r);
@@ -225,6 +227,18 @@ test_auth_client_output(struct backend_context *bctx,
 			output = t_strconcat(parts[0], ",", parts[1], ",",
 					     "q=frop",
 					     NULL);
+			break;
+		case 25:
+			output = t_strconcat(parts[0], ",", parts[1], ",",
+					     "p", NULL);
+			break;
+		case 26:
+			output = t_strconcat(parts[0], ",", parts[1], ",",
+					     "p=", NULL);
+			break;
+		case 27:
+			output = t_strconcat(parts[0], ",", parts[1], ",",
+					     "p.a", NULL);
 			break;
 		default:
 			return;
@@ -548,6 +562,42 @@ static void test_auth_server_error(void)
 	test_auth_server_error_one(
 		&hash_method_sha1, AUTH_SCRAM_CBIND_SERVER_SUPPORT_REQUIRED,
 		AUTH_SCRAM_SERVER_ERROR_PROTOCOL_VIOLATION, 21);
+	test_end();
+
+	test_begin("auth server error sha1 - invalid client proof (missing '=' and payload)");
+	test_auth_server_error_one(
+		&hash_method_sha1, AUTH_SCRAM_CBIND_SERVER_SUPPORT_AVAILABLE,
+		AUTH_SCRAM_SERVER_ERROR_PROTOCOL_VIOLATION, 22);
+	test_end();
+
+	test_begin("auth server error sha1 - invalid client proof (missing payload)");
+	test_auth_server_error_one(
+		&hash_method_sha1, AUTH_SCRAM_CBIND_SERVER_SUPPORT_AVAILABLE,
+		AUTH_SCRAM_SERVER_ERROR_PROTOCOL_VIOLATION, 23);
+	test_end();
+
+	test_begin("auth server error sha1 - invalid client proof (missing '=')");
+	test_auth_server_error_one(
+		&hash_method_sha1, AUTH_SCRAM_CBIND_SERVER_SUPPORT_AVAILABLE,
+		AUTH_SCRAM_SERVER_ERROR_PROTOCOL_VIOLATION, 24);
+	test_end();
+
+	test_begin("auth server error sha1 - invalid client proof in final (missing '=' and payload)");
+	test_auth_server_error_one(
+		&hash_method_sha1, AUTH_SCRAM_CBIND_SERVER_SUPPORT_NONE,
+		AUTH_SCRAM_SERVER_ERROR_PROTOCOL_VIOLATION, 25);
+	test_end();
+
+	test_begin("auth server error sha1 - invalid client proof in final (missing payload)");
+	test_auth_server_error_one(
+		&hash_method_sha1, AUTH_SCRAM_CBIND_SERVER_SUPPORT_NONE,
+		AUTH_SCRAM_SERVER_ERROR_PROTOCOL_VIOLATION, 26);
+	test_end();
+
+	test_begin("auth server error sha1 - invalid client proof in final (missing '=')");
+	test_auth_server_error_one(
+		&hash_method_sha1, AUTH_SCRAM_CBIND_SERVER_SUPPORT_NONE,
+		AUTH_SCRAM_SERVER_ERROR_PROTOCOL_VIOLATION, 27);
 	test_end();
 }
 

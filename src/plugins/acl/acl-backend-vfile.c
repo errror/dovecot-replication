@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -7,7 +7,6 @@
 #include "nfs-workarounds.h"
 #include "settings.h"
 #include "mailbox-list-private.h"
-#include "acl-global-file.h"
 #include "acl-cache.h"
 #include "acl-backend-vfile.h"
 
@@ -16,7 +15,6 @@
 #include <sys/stat.h>
 
 #define ACL_ESTALE_RETRY_COUNT NFS_ESTALE_RETRY_COUNT
-#define ACL_VFILE_DEFAULT_CACHE_SECS 30
 
 static struct acl_backend *acl_backend_vfile_alloc(void)
 {
@@ -30,27 +28,12 @@ static struct acl_backend *acl_backend_vfile_alloc(void)
 }
 
 static int
-acl_backend_vfile_init(struct acl_backend *_backend, const char **error_r)
+acl_backend_vfile_init(struct acl_backend *_backend, const char **error_r ATTR_UNUSED)
 {
-	struct event *event = _backend->event;
-	struct stat st;
+	struct acl_backend_vfile *backend =
+		container_of(_backend, struct acl_backend_vfile, backend);
 
-	const char *global_path = _backend->set->acl_global_path;
-
-	if (*global_path != '\0') {
-		if (stat(global_path, &st) < 0) {
-			*error_r = t_strdup_printf("stat(%s) failed: %m", global_path);
-			return -1;
-		} else if (S_ISDIR(st.st_mode)) {
-			*error_r = t_strdup_printf("Global ACL directories are no longer supported");
-			return -1;
-		} else {
-			_backend->global_file =	acl_global_file_init(
-				global_path, _backend->set->acl_cache_ttl / 1000, event);
-			e_debug(event, "vfile: Deprecated Global ACL file: %s", global_path);
-		}
-	}
-
+	backend->cache_secs = _backend->set->acl_cache_ttl;
 	_backend->cache =
 		acl_cache_init(_backend,
 			       sizeof(struct acl_backend_vfile_validity));
@@ -66,41 +49,53 @@ static void acl_backend_vfile_deinit(struct acl_backend *_backend)
 		array_free(&backend->acllist);
 		pool_unref(&backend->acllist_pool);
 	}
-	if (_backend->global_file != NULL)
-		acl_global_file_deinit(&_backend->global_file);
 	pool_unref(&backend->backend.pool);
 }
 
-static const char *
+static int
 acl_backend_vfile_get_local_dir(struct acl_backend *backend,
-				const char *name, const char *vname)
+				const char *name, const char *vname,
+				const char **dir_r)
 {
 	struct mail_namespace *ns = mailbox_list_get_namespace(backend->list);
 	struct mailbox_list *list = ns->list;
 	struct mail_storage *storage;
 	enum mailbox_list_path_type type;
-	const char *dir, *inbox;
+	const char *inbox;
 
 	if (*name == '\0')
 		name = NULL;
 
-	if (backend->set->acl_globals_only)
-		return NULL;
+	if (backend->set->acl_globals_only) {
+		*dir_r = NULL;
+		return 0;
+	}
 
 	/* ACL files are very important. try to keep them among the main
 	   mail files. that's not possible though with a) if the mailbox is
 	   a file or b) if the mailbox path doesn't point to filesystem. */
-	if (mailbox_list_get_storage(&list, &vname, 0, &storage) < 0)
-		return NULL;
+	if (mailbox_list_get_storage(&list, &vname, 0, &storage) < 0) {
+		*dir_r = NULL;
+		return -1;
+	}
+
 	i_assert(list == ns->list);
 
 	type = mail_storage_get_acl_list_path_type(storage);
 	if (name == NULL) {
-		if (!mailbox_list_get_root_path(list, type, &dir))
-			return NULL;
+		if (!mailbox_list_get_root_path(list, type, dir_r)) {
+			*dir_r = NULL;
+			return 0;
+		}
 	} else {
-		if (mailbox_list_get_path(list, name, type, &dir) <= 0)
-			return NULL;
+		int ret = mailbox_list_get_path(list, name, type, dir_r);
+		if (ret <= 0) {
+			if (ret < 0 &&
+			    mailbox_list_get_last_mail_error(list) == MAIL_ERROR_NOTFOUND)
+				ret = 0;
+			*dir_r = NULL;
+			return ret;
+		}
 	}
 
 	/* verify that the directory isn't same as INBOX's directory.
@@ -108,11 +103,12 @@ acl_backend_vfile_get_local_dir(struct acl_backend *backend,
 	if (name == NULL &&
 	    mailbox_list_get_path(list, "INBOX",
 				  MAILBOX_LIST_PATH_TYPE_MAILBOX, &inbox) > 0 &&
-	    strcmp(inbox, dir) == 0) {
+	    strcmp(inbox, *dir_r) == 0) {
 		/* can't have default ACLs with this setup */
-		return NULL;
+		*dir_r = NULL;
+		return 0;
 	}
-	return dir;
+	return 0;
 }
 
 static struct acl_object *
@@ -132,9 +128,12 @@ acl_backend_vfile_object_init(struct acl_backend *_backend,
 			vname = *name == '\0' ? "" :
 				mailbox_list_get_vname(_backend->list, name);
 
-			dir = acl_backend_vfile_get_local_dir(_backend, name, vname);
+			int ret = acl_backend_vfile_get_local_dir(_backend, name,
+								  vname, &dir);
 			aclobj->local_path = dir == NULL ? NULL :
 				i_strconcat(dir, "/"ACL_FILENAME, NULL);
+			if (ret < 0)
+				aclobj->failed = TRUE;
 		} else {
 			/* Invalid mailbox name, just use the default
 			   global ACL files */
@@ -174,19 +173,7 @@ acl_backend_vfile_has_acl(struct acl_backend *_backend, const char *name)
 	struct mailbox *box =
 		mailbox_alloc(_backend->list, vname,
 			      MAILBOX_FLAG_READONLY | MAILBOX_FLAG_IGNORE_ACLS);
-	if (_backend->global_file != NULL) {
-		/* check global ACL file */
-		ret = acl_global_file_refresh(_backend->global_file);
-		if (ret == 0 && acl_global_file_have_any(_backend->global_file, box->vname))
-			ret = 1;
-	} else {
-		/* global ACLs disabled */
-		ret = 0;
-	}
-
-	if (ret != 0) {
-		/* error / global ACL found */
-	} else if (mailbox_open(box) == 0) {
+	if (mailbox_open(box) == 0) {
 		/* mailbox exists */
 		ret = 1;
 	} else {
@@ -432,28 +419,9 @@ int acl_backend_vfile_object_get_mtime(struct acl_object *aclobj,
 
 	if (validity->local_validity.last_mtime != 0)
 		*mtime_r = validity->local_validity.last_mtime;
-	else if (validity->global_validity.last_mtime != 0)
-		*mtime_r = validity->global_validity.last_mtime;
 	else
 		*mtime_r = 0;
 	return 0;
-}
-
-static int
-acl_backend_global_file_refresh(struct acl_object *_aclobj,
-				struct acl_vfile_validity *validity)
-{
-	struct acl_backend_vfile *backend =
-		container_of(_aclobj->backend, struct acl_backend_vfile, backend);
-	struct stat st;
-
-	if (acl_global_file_refresh(_aclobj->backend->global_file) < 0)
-		return -1;
-
-	acl_global_file_last_stat(_aclobj->backend->global_file, &st);
-	if (validity == NULL)
-		return 1;
-	return acl_vfile_validity_has_changed(backend, validity, &st) ? 1 : 0;
 }
 
 static int acl_backend_vfile_object_refresh_cache(struct acl_object *_aclobj)
@@ -465,20 +433,26 @@ static int acl_backend_vfile_object_refresh_cache(struct acl_object *_aclobj)
 	struct acl_backend_vfile_validity *old_validity;
 	struct acl_backend_vfile_validity validity;
 	time_t mtime;
-	int ret = 0;
+	int ret;
+
+	if (aclobj->failed)
+		return -1;
 
 	old_validity = acl_cache_get_validity(_aclobj->backend->cache,
 					      _aclobj->name);
-	if (_aclobj->backend->global_file != NULL)
-		ret = acl_backend_global_file_refresh(_aclobj, old_validity == NULL ? NULL :
-						      &old_validity->global_validity);
-	if (ret == 0) {
-		ret = acl_backend_vfile_refresh(_aclobj, aclobj->local_path,
-						old_validity == NULL ? NULL :
-						&old_validity->local_validity);
-	}
-	if (ret <= 0)
+	ret = acl_backend_vfile_refresh(_aclobj, aclobj->local_path,
+					old_validity == NULL ? NULL :
+					&old_validity->local_validity);
+	if (ret < 0)
 		return ret;
+	/* ret==0 means the name-level validity cache says no re-read is needed.
+	   That's only safe when THIS object's rights were already populated by
+	   an earlier query on the same object. A freshly allocated object shares
+	   the backend's name-keyed validity cache with other objects, so the
+	   cache can be warm while this object's rights array was never created.
+	   Force at least one real read in that case. */
+	if (ret == 0 && array_is_created(&_aclobj->rights))
+		return 0;
 
 	/* either global or local ACLs changed, need to re-read both */
 	if (!array_is_created(&_aclobj->rights)) {
@@ -491,16 +465,6 @@ static int acl_backend_vfile_object_refresh_cache(struct acl_object *_aclobj)
 	}
 
 	i_zero(&validity);
-	if (_aclobj->backend->global_file != NULL) {
-		struct stat st;
-
-		acl_object_add_global_acls(_aclobj);
-		acl_global_file_last_stat(_aclobj->backend->global_file, &st);
-		validity.global_validity.last_read_time = ioloop_time;
-		validity.global_validity.last_mtime = st.st_mtime;
-		validity.global_validity.last_size = st.st_size;
-	}
-
 	if (acl_backend_get_mailbox_acl(_aclobj->backend, _aclobj) < 0)
 		return -1;
 

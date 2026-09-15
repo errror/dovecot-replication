@@ -34,8 +34,11 @@ struct config_line {
 	enum config_line_type type;
 	const char *key;
 	const char *value;
-	/* value is inside "quotes" */
+	/* key/value is inside "quotes" */
+	bool key_quoted;
 	bool value_quoted;
+	/* non-NULL if value was set using <<MARKER heredoc syntax */
+	const char *heredoc_marker;
 };
 
 /* Returns TRUE if section is inside strlist { .. } or boollist { .. } */
@@ -80,6 +83,7 @@ HASH_TABLE_DEFINE_TYPE(include_group, const char *,
 struct config_parser_context {
 	pool_t pool;
 	const char *path;
+	enum config_parse_flags flags;
 
 	ARRAY_TYPE(config_path) seen_paths;
 	HASH_TABLE_TYPE(config_key) all_keys;
@@ -93,7 +97,7 @@ struct config_parser_context {
 	uint8_t change_counter;
 	unsigned int create_order_counter;
 
-	string_t *value;
+	string_t *prefixed_value;
 	const char *error;
 
 	const char *dovecot_config_version;
@@ -103,14 +107,13 @@ struct config_parser_context {
 
 	struct old_set_parser *old;
 
+	ARRAY_TYPE(const_string) var_chain_keys;
 	HASH_TABLE(const char *, const char *) seen_settings;
 	struct config_filter_context *filter;
 	bool dump_defaults:1;
 	bool expand_values:1;
-	bool hide_errors:1;
-	bool delay_errors:1;
-	bool hide_obsolete_warnings:1;
-	bool ignore_unknown:1;
+	/* All config_filter_parsers have reverse_default_sibling set. */
+	bool reverse_parsers_set:1;
 };
 
 extern void (*hook_config_parser_begin)(struct config_parser_context *ctx);
@@ -120,8 +123,33 @@ extern int (*hook_config_parser_end)(struct config_parser_context *ctx,
 				     struct config_parsed *new_config,
 				     struct event *event, const char **error_r);
 
-int config_apply_line(struct config_parser_context *ctx, const char *key,
-		      const char *value, const char **full_key_r) ATTR_NULL(4);
+static inline const char *
+set_str_expanded(const union config_module_parser_setting *value)
+{
+	uint8_t prefix = (uint8_t)value->prefixed_str[0];
+	if ((prefix & CONFIG_VALUE_PREFIX_HEREDOC) != 0) {
+		/* HEREDOC or HEREDOC|FILE_INLINE: skip marker+\n */
+		const char *p = strchr(value->prefixed_str + 1, '\n');
+		i_assert(p != NULL);
+		return p + 1;
+	}
+	i_assert(prefix == CONFIG_VALUE_PREFIX_EXPANDED ||
+		 prefix == CONFIG_VALUE_PREFIX_FILE_INLINE);
+	return value->prefixed_str + 1;
+}
+
+static inline const char *
+set_str_heredoc_marker(const union config_module_parser_setting *value)
+{
+	i_assert(((uint8_t)value->prefixed_str[0] & CONFIG_VALUE_PREFIX_HEREDOC) != 0);
+	const char *p = strchr(value->prefixed_str + 1, '\n');
+	i_assert(p != NULL);
+	return t_strdup_until(value->prefixed_str + 1, p);
+}
+
+/* Apply a key-value setting. $VARIABLE expansion is not done for the value. */
+int config_apply_key_value(struct config_parser_context *ctx, const char *key,
+			   const char *value, const char **full_key_r) ATTR_NULL(4);
 void config_parser_apply_line(struct config_parser_context *ctx,
 			      const struct config_line *line);
 void config_parser_set_change_counter(struct config_parser_context *ctx,

@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libindex.la
 
 AM_CPPFLAGS = \
@@ -74,9 +76,8 @@ test_programs = \
 	test-mail-index-write \
 	test-mail-transaction-log-append \
 	test-mail-transaction-log-file \
-	test-mail-transaction-log-view
-
-noinst_PROGRAMS = $(test_programs)
+	test-mail-transaction-log-view \
+	test-mailbox-log
 
 test_libs = \
 	../lib-test/libtest.la \
@@ -140,10 +141,9 @@ test_mail_transaction_log_view_SOURCES = test-mail-transaction-log-view.c
 test_mail_transaction_log_view_LDADD = mail-transaction-log-view.lo $(test_minimal_libs)
 test_mail_transaction_log_view_DEPENDENCIES = $(test_deps)
 
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done
+test_mailbox_log_SOURCES = test-mailbox-log.c
+test_mailbox_log_LDADD = mailbox-log.lo $(test_libs)
+test_mailbox_log_DEPENDENCIES = $(test_deps)
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)

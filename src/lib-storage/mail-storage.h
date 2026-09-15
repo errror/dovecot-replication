@@ -74,10 +74,6 @@ enum mailbox_flags {
 	   quota updates (possibly resulting in broken quota). and This is
 	   useful for example when deleting entire user accounts. */
 	MAILBOX_FLAG_DELETE_UNSAFE	= 0x400,
-	/* Mailbox is created implicitly if it does not exist. */
-	MAILBOX_FLAG_AUTO_CREATE	= 0x1000,
-	/* Mailbox is subscribed to implicitly when it is created automatically */
-	MAILBOX_FLAG_AUTO_SUBSCRIBE	= 0x2000,
 	/* Run fsck for mailbox index before doing anything else. This may be
 	   useful in fixing index corruption errors that aren't otherwise
 	   detected and that are causing the full mailbox opening to fail. */
@@ -89,6 +85,12 @@ enum mailbox_flags {
 	   plugin to determine correctly whether the mailbox should be allowed
 	   to be opened. */
 	MAILBOX_FLAG_ATTRIBUTE_SESSION	= 0x10000,
+	/* Skip normalizing the mailbox name to Unicode NFC form. */
+	MAILBOX_FLAG_RAW_NAME           = 0x20000,
+	/* Never implicitly create the mailbox, even if it would normally be
+	   autocreated (e.g. INBOX). Accessing a nonexistent mailbox fails
+	   with MAIL_ERROR_NOTFOUND instead. */
+	MAILBOX_FLAG_NO_AUTOCREATE	= 0x40000,
 };
 
 enum mailbox_feature {
@@ -118,6 +120,7 @@ enum mailbox_status_items {
 	STATUS_FTS_LAST_INDEXED_UID	= 0x800,
 	STATUS_CHECK_OVER_QUOTA		= 0x1000, /* return error if over quota */
 	STATUS_HIGHESTPVTMODSEQ		= 0x2000,
+	STATUS_DELETED                  = 0x4000,
 	/* status items that must not be looked up with
 	   mailbox_get_open_status(), because they can return failure. */
 #define MAILBOX_STATUS_FAILING_ITEMS \
@@ -265,6 +268,7 @@ struct mailbox_status {
 	uint32_t messages; /* STATUS_MESSAGES */
 	uint32_t recent; /* STATUS_RECENT */
 	uint32_t unseen; /* STATUS_UNSEEN */
+	uint32_t deleted; /* STATUS_DELETED */
 
 	uint32_t uidvalidity; /* STATUS_UIDVALIDITY */
 	uint32_t uidnext; /* STATUS_UIDNEXT */
@@ -473,6 +477,11 @@ struct mail_storage_callbacks {
 	void (*notify_progress)(struct mailbox *mailbox,
 				const struct mail_storage_progress_details *dtl,
 				void *context);
+
+	/* "* LIST (<flags>) <sep> <newname> (OLDNAME (<oldname>)) */
+	void (*notify_mailbox_implicit_rename)(struct mailbox *mailbox,
+					       const char *old_vname,
+					       void *context);
 };
 
 struct mailbox_virtual_pattern {
@@ -653,6 +662,11 @@ mailbox_get_settings(struct mailbox *box) ATTR_PURE;
 const char *mailbox_get_vname(const struct mailbox *box) ATTR_PURE;
 /* Returns the backend name of given mailbox. */
 const char *mailbox_get_name(const struct mailbox *box) ATTR_PURE;
+/* Returns the original vname if it has been NFC normalized */
+bool mailbox_was_vname_changed_by_nfc(struct mailbox *box,
+				      const char **orig_vname_r);
+/* Suppress lib-storage notification */
+void mailbox_suppress_nfc_name_change_notification(struct mailbox *box);
 
 /* Returns TRUE if mailbox is read-only. */
 bool mailbox_is_readonly(struct mailbox *box);

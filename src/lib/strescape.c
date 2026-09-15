@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -304,8 +304,8 @@ static char **p_strsplit_tabescaped_inplace(pool_t pool, char *data)
 
 	alloc_count = 32;
 	array = pool == unsafe_data_stack_pool ?
-		t_malloc_no0(sizeof(char *) * alloc_count) :
-		p_malloc(pool, sizeof(char *) * alloc_count);
+		t_malloc_no0(MALLOC_MULTIPLY(sizeof(char *), alloc_count)) :
+		p_new(pool, char *, alloc_count);
 
 	array[0] = data; count = 1;
 	char *need_unescape = NULL;
@@ -319,10 +319,8 @@ static char **p_strsplit_tabescaped_inplace(pool_t pool, char *data)
 		}
 		if (count+1 >= alloc_count) {
 			new_alloc_count = nearest_power(alloc_count+1);
-			array = p_realloc(pool, array,
-					  sizeof(char *) * alloc_count,
-					  sizeof(char *) *
-					  new_alloc_count);
+			array = p_realloc_type(pool, array, char *,
+					       alloc_count, new_alloc_count);
 			alloc_count = new_alloc_count;
 		}
 		*data++ = '\0';

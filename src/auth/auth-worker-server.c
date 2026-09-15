@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "base64.h"
@@ -137,7 +137,7 @@ bool auth_worker_auth_request_new(struct auth_worker_command *cmd, unsigned int 
 	struct auth_request *auth_request;
 	const char *key, *value;
 
-	auth_request = auth_request_new_dummy(cmd->event);
+	auth_request = auth_request_new(cmd->event);
 
 	cmd->server->refcount++;
 	auth_request->context = cmd;
@@ -374,7 +374,7 @@ auth_worker_handle_passw(struct auth_worker_command *cmd,
 static void
 lookup_credentials_callback(enum passdb_result result,
 			    const unsigned char *credentials, size_t size,
-			    struct auth_request *request)
+			    const char *scheme, struct auth_request *request)
 {
 	struct auth_worker_command *cmd = request->context;
 	struct auth_worker_server *server = cmd->server;
@@ -396,8 +396,8 @@ lookup_credentials_callback(enum passdb_result result,
 		if (request->user_returned_by_lookup)
 			str_append_tabescaped(str, request->fields.user);
 		str_append_c(str, '\t');
-		if (request->wanted_credentials_scheme[0] != '\0') {
-			str_printfa(str, "{%s.b64}", request->wanted_credentials_scheme);
+		if (scheme != NULL) {
+			str_printfa(str, "{%s.b64}", scheme);
 			base64_encode(credentials, size, str);
 		} else {
 			i_assert(size == 0);
@@ -455,58 +455,6 @@ auth_worker_handle_passl(struct auth_worker_command *cmd,
 	auth_request_passdb_lookup_begin(auth_request);
 	auth_request->passdb->passdb->iface.
 		lookup_credentials(auth_request, lookup_credentials_callback);
-	return TRUE;
-}
-
-static void
-set_credentials_callback(bool success, struct auth_request *request)
-{
-	struct auth_worker_command *cmd = request->context;
-	struct auth_worker_server *server = cmd->server;
-
-	string_t *str;
-
-	str = t_str_new(64);
-	str_printfa(str, "%u\t%s\n", request->id, success ? "OK" : "FAIL");
-	auth_worker_send_reply(server, request, str);
-
-	auth_worker_request_finished(cmd, success ? NULL :
-				     "Failed to set credentials");
-	auth_request_unref(&request);
-}
-
-static bool
-auth_worker_handle_setcred(struct auth_worker_command *cmd,
-			   unsigned int id, const char *const *args,
-			   const char **error_r)
-{
-	struct auth_request *auth_request;
-	unsigned int passdb_id;
-	const char *creds;
-
-	/* <passdb id> <credentials> [<args>] */
-	if (str_to_uint(args[0], &passdb_id) < 0 || args[1] == NULL) {
-		*error_r = "BUG: Auth worker server sent us invalid SETCRED";
-		return FALSE;
-	}
-	creds = args[1];
-
-	if (!auth_worker_auth_request_new(cmd, id, args + 2, &auth_request)) {
-		*error_r = "BUG: SETCRED had missing parameters";
-		return FALSE;
-	}
-
-	while (auth_request->passdb->passdb->id != passdb_id) {
-		auth_request->passdb = auth_request->passdb->next;
-		if (auth_request->passdb == NULL) {
-			*error_r = "BUG: SETCRED had invalid passdb ID";
-			auth_request_unref(&auth_request);
-			return FALSE;
-		}
-	}
-
-	auth_request->passdb->passdb->iface.
-		set_credentials(auth_request, creds, set_credentials_callback);
 	return TRUE;
 }
 
@@ -775,7 +723,6 @@ static void auth_worker_handle_token_continue(struct db_oauth2_request *db_reque
 		str_printfa(str, "FAIL\t%d\t%s", result, error);
 	else {
 		str_printfa(str, "OK\t%d\t%s\t", result, db_request->username);
-		auth_request_set_field(auth_request, "token", db_request->token, "PLAIN");
 		reply_append_extra_fields(str, auth_request);
 	}
 	str_append_c(str, '\n');
@@ -913,8 +860,6 @@ auth_worker_server_input_args(struct connection *conn, const char *const *args)
 		ret = auth_worker_handle_passl(cmd, id, args + 2, &error);
 	else if (strcmp(args[1], "PASSW") == 0)
 		ret = auth_worker_handle_passw(cmd, id, args + 2, &error);
-	else if (strcmp(args[1], "SETCRED") == 0)
-		ret = auth_worker_handle_setcred(cmd, id, args + 2, &error);
 	else if (strcmp(args[1], "USER") == 0)
 		ret = auth_worker_handle_user(cmd, id, args + 2, &error);
 	else if (strcmp(args[1], "LIST") == 0)

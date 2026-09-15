@@ -81,14 +81,19 @@ struct sql_db_vfuncs {
 
 	int (*connect)(struct sql_db *db);
 	void (*disconnect)(struct sql_db *db);
-	const char *(*escape_string)(struct sql_db *db, const char *string);
+	int (*escape_string)(struct sql_db *db, const char *string,
+			     const char **output_r, const char **error_r);
 
 	void (*exec)(struct sql_db *db, const char *query);
+	/* Only implement this if the driver can really do asynchronous callbacks,
+	   otherwise let sql API handle it. */
 	void (*query)(struct sql_db *db, const char *query,
 		      sql_query_callback_t *callback, void *context);
 	struct sql_result *(*query_s)(struct sql_db *db, const char *query);
 
 	struct sql_transaction_context *(*transaction_begin)(struct sql_db *db);
+	/* Only implement this if the driver can really do asynchronous callbacks,
+	   otherwise let sql API handle it. */
 	void (*transaction_commit)(struct sql_transaction_context *ctx,
 				   sql_commit_callback_t *callback,
 				   void *context);
@@ -154,6 +159,9 @@ struct sql_db {
 	struct event *event;
 	HASH_TABLE(char *, struct sql_prepared_statement *) prepared_stmt_hash;
 
+	struct sql_query_result_delayed *query_delayed_list;
+	struct sql_commit_result_delayed *commit_delayed_list;
+
 	enum sql_db_state state;
 	/* last time we started connecting to this server
 	   (which may or may not have succeeded) */
@@ -208,6 +216,7 @@ struct sql_statement {
 	pool_t pool;
 	const char *query_template;
 	ARRAY_TYPE(const_string) args;
+	ARRAY(bool) args_need_escaping;
 
 	/* Tell the driver to not log this query with expanded values.
 	   This works only for prepared statements. */
@@ -245,6 +254,7 @@ struct sql_transaction_context {
 	/* commit() must use this query list if head is non-NULL. */
 	struct sql_transaction_query *head, *tail;
 
+	char *failed_error;
 	bool non_atomic;
 };
 
@@ -270,7 +280,8 @@ inline static const char *sql_db_table_prefix(struct sql_db *db) {
 void sql_transaction_add_query(struct sql_transaction_context *ctx, pool_t pool,
 			       const char *query, unsigned int *affected_rows);
 const char *sql_statement_get_log_query(struct sql_statement *stmt);
-const char *sql_statement_get_query(struct sql_statement *stmt);
+int sql_statement_get_query(struct sql_statement *stmt,
+			    const char **query_r, const char **error_r);
 
 void sql_connection_log_finished(struct sql_db *db);
 struct event_passthrough *

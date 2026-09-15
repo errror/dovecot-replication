@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -477,18 +477,23 @@ shared_mail_user_init(struct mail_storage *_storage,
 	return 0;
 }
 
+static bool
+shared_storage_match(struct mail_storage *storage ATTR_UNUSED,
+		     struct mailbox_list *list ATTR_UNUSED)
+{
+	/* allow multiple independent shared namespaces */
+	return FALSE;
+}
+
 struct mail_storage shared_storage = {
 	.name = MAIL_SHARED_STORAGE_NAME,
 	.class_flags = 0, /* unknown at this point */
 
 	.v = {
-		shared_storage_alloc,
-		shared_storage_create,
-		index_storage_destroy,
-		NULL,
-		NULL,
-		fail_mailbox_alloc,
-		NULL,
-		NULL,
+		.alloc = shared_storage_alloc,
+		.create = shared_storage_create,
+		.destroy = index_storage_destroy,
+		.mailbox_alloc = fail_mailbox_alloc,
+		.storage_match = shared_storage_match,
 	}
 };

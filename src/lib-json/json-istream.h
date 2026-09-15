@@ -144,6 +144,27 @@ void json_istream_ascend_to(struct json_istream *stream,
 int json_istream_walk(struct json_istream *stream,
 		      struct json_node *node_r);
 
+/* The returned value stream may be referenced by the caller and remains
+   valid after json_istream_skip(). However, once the JSON istream is
+   advanced past the value - the next json_istream_read*(),
+   json_istream_walk*(), json_istream_read_tree*() or json_istream_finish() -
+   the JSON istream takes back the right to finish delivery of that value.
+
+   If the value was delivered in full, the caller's stream is unaffected:
+   with a temp_path_prefix the content is spooled and remains fully readable
+   and seekable.
+
+   If the value could not be delivered in full (truncated input, read
+   error), the caller's stream is truncated at the last successfully
+   delivered byte and reports EPIPE in stream_errno. This holds with or
+   without a temp_path_prefix: the EPIPE originates in the JSON string
+   decoder backing the value stream, and is visible on whichever stream
+   the caller was handed. The call never returns partial-looking success
+   and never keeps the parser blocked.
+
+   A caller that must retain the complete value across further parsing must
+   pass a temp_path_prefix. */
+
 /* Equivalent to json_istream_read(), but reads strings bigger than
   `threshold' octets as an istream with `max_buffer_size'. When
   `temp_path_prefix' is not NULL, the returned stream is made seekable and
@@ -182,6 +203,25 @@ int json_istream_walk_stream(struct json_istream *stream,
    */
 int json_istream_read_tree(struct json_istream *stream,
 			   struct json_tree **tree_r);
+
+/* Like json_istream_read_tree(), but for string values >= `threshold' bytes
+   the decoded string is stored as an istream in the tree node instead of
+   being copied to pool memory.  `stream->input' must be seekable (asserted):
+   a range stream (i_stream_create_range()) pointing into the original input
+   is used, avoiding the tree-pool copy (escaped strings are decoded lazily
+   on read via the istream-json-string filter instead).  A string exceeding
+   `max_buffer_size' bytes in this range-delivery mode is a hard parse
+   error, since by the time the size is known the input has already been
+   consumed past recovery for any fallback.
+   Use json_tree_node_get_str_istream() to read string values from the
+   returned tree.
+
+   For test purposes only: not yet called from any in-tree code outside
+   lib-json's own tests and fuzzers. */
+int json_istream_read_tree_lazy_strings(struct json_istream *stream,
+					size_t threshold,
+					size_t max_buffer_size,
+					struct json_tree **tree_r);
 
 /* Same as json_istream_read_tree(), but read current node from stream and all
    its children into the provided existing tree node as a new child. */

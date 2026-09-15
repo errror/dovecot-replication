@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -21,6 +21,7 @@ struct mailbox_notify_file {
 
 static void notify_delay_callback(struct mailbox *box)
 {
+	i_assert(box->notify_callback != NULL);
 	timeout_remove(&box->to_notify_delay);
 	box->notify_callback(box, box->notify_context);
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -144,6 +144,8 @@ bool config_export_type(string_t *str, const void *value,
 	}
 	case SET_STR:
 	case SET_STR_NOVARS:
+	case SET_PATH_FILE:
+	case SET_PATH_DIR:
 	case SET_FILE:
 	case SET_ENUM: {
 		const char *const *val = value;
@@ -178,6 +180,35 @@ get_default_value(const char *old_default_value,
 			str_truncate(value, p - str_c(value));
 	}
 	return str_c(value);
+}
+
+static void
+settings_check_old_export_array(struct config_export_context *ctx,
+				const struct setting_define *def,
+				const ARRAY_TYPE(const_string) **val)
+{
+	/* Array fields aren't explicitly set. See if the default fields have
+	   changed. We can't differentiate between the config adding to the
+	   array vs. replacing the whole array. For now that shouldn't really
+	   make a difference, since these defaults are changed only for
+	   @*defaults groups, which shouldn't be changed by configs anyway. */
+	const char *key_with_path = def->key;
+	if (ctx->path_prefix[0] != '\0')
+		key_with_path = t_strconcat(ctx->path_prefix, def->key, NULL);
+
+	const char *old_default = NULL;
+        if (!old_settings_default(ctx->dovecot_config_version,
+				  def->key, key_with_path,
+				  &old_default))
+		return;
+
+	const char *const *list =
+		t_strsplit(old_default, SETTINGS_FILTER_ARRAY_SEPARATORS);
+	unsigned int list_count = str_array_length(list);
+	ARRAY_TYPE(const_string) *list_arr = t_new(ARRAY_TYPE(const_string), 1);
+	t_array_init(list_arr, list_count);
+	array_append(list_arr, list, list_count);
+	*val = list_arr;
 }
 
 static void
@@ -253,6 +284,8 @@ settings_export(struct config_export_context *ctx,
 		case SET_IN_PORT:
 		case SET_STR:
 		case SET_STR_NOVARS:
+		case SET_PATH_FILE:
+		case SET_PATH_DIR:
 		case SET_ENUM: {
 			bool default_changed = FALSE;
 			const char *old_default = NULL;
@@ -273,7 +306,7 @@ settings_export(struct config_export_context *ctx,
 
 			if (!dump_default &&
 			    strcmp(get_default_value(old_default, info, def),
-				   module_parser->settings[define_idx].str) == 0) {
+				   set_str_expanded(&module_parser->settings[define_idx])) == 0) {
 				/* Explicitly set setting value wasn't
 				   actually changed from its default. */
 				break;
@@ -282,16 +315,16 @@ settings_export(struct config_export_context *ctx,
 					CONFIG_PARSER_CHANGE_DEFAULTS) {
 				/* explicitly set */
 				str_append(ctx->value,
-					module_parser->settings[define_idx].str);
+					   set_str_expanded(&module_parser->settings[define_idx]));
 			} else if (module_parser->change_counters[define_idx] ==
 				   CONFIG_PARSER_CHANGE_DEFAULTS && !default_changed) {
 				/* default not changed by old version checks */
 				str_append(ctx->value,
-					module_parser->settings[define_idx].str);
+					   set_str_expanded(&module_parser->settings[define_idx]));
 			} else if (module_parser->change_counters[define_idx] ==
 				   CONFIG_PARSER_CHANGE_GROUP) {
 				str_append(ctx->value,
-					module_parser->settings[define_idx].str);
+					   set_str_expanded(&module_parser->settings[define_idx]));
 			} else {
 				str_append(ctx->value,
 					get_default_value(old_default, info, def));
@@ -301,11 +334,11 @@ settings_export(struct config_export_context *ctx,
 		}
 		case SET_STRLIST:
 		case SET_BOOLLIST: {
-			const ARRAY_TYPE(const_string) *val =
-				module_parser->settings[define_idx].array.values;
-			const char *const *strings;
+			const ARRAY_TYPE(const_string) *prefixed_val =
+				module_parser->settings[define_idx].list.prefixed_values;
+			const char *const *prefixed_strings;
 
-			value_stop_list = module_parser->settings[define_idx].array.stop_list;
+			value_stop_list = module_parser->settings[define_idx].list.stop_list;
 			if (hash_table_is_created(ctx->keys) &&
 			    hash_table_lookup(ctx->keys, def->key) != NULL) {
 				/* already added all of these */
@@ -314,11 +347,11 @@ settings_export(struct config_export_context *ctx,
 			if ((ctx->flags & CONFIG_DUMP_FLAG_DEDUPLICATE_KEYS) != 0)
 				hash_table_insert(ctx->keys, def->key, def->key);
 
-			if (val != NULL) {
-				strings = array_get(val, &count);
+			if (prefixed_val != NULL) {
+				prefixed_strings = array_get(prefixed_val, &count);
 				i_assert(count % 2 == 0);
 			} else {
-				strings = NULL;
+				prefixed_strings = NULL;
 				count = 0;
 			}
 
@@ -337,12 +370,14 @@ settings_export(struct config_export_context *ctx,
 			export_set.type = def->type == SET_STRLIST ?
 				CONFIG_KEY_NORMAL : CONFIG_KEY_BOOLLIST_ELEM;
 			for (i = 0; i < count; i += 2) T_BEGIN {
+				i_assert(prefixed_strings[i][0] == CONFIG_VALUE_PREFIX_EXPANDED);
+				i_assert(prefixed_strings[i + 1][0] == CONFIG_VALUE_PREFIX_EXPANDED);
 				export_set.key = t_strdup_printf("%s%c%s",
 						      def->key,
 						      SETTINGS_SEPARATOR,
-						      strings[i]);
+						      prefixed_strings[i] + 1);
 				export_set.list_idx = i / 2;
-				export_set.value = strings[i+1];
+				export_set.value = prefixed_strings[i + 1] + 1;
 				/* only the last element stops the list */
 				export_set.value_stop_list = value_stop_list &&
 					i + 2 == count;
@@ -357,11 +392,14 @@ settings_export(struct config_export_context *ctx,
 		}
 		case SET_FILTER_ARRAY: {
 			const ARRAY_TYPE(const_string) *val =
-				module_parser->settings[define_idx].array.values;
+				module_parser->settings[define_idx].filter_array;
 			const char *name;
 
 			if (val == NULL)
 				break;
+
+			if (module_parser->change_counters[define_idx] <= CONFIG_PARSER_CHANGE_DEFAULTS)
+				settings_check_old_export_array(ctx, def, &val);
 
 			array_foreach_elem(val, name) {
 				if (str_len(ctx->value) > 0)
@@ -384,12 +422,20 @@ settings_export(struct config_export_context *ctx,
 					type = CONFIG_KEY_FILTER_ARRAY;
 				else
 					type = CONFIG_KEY_NORMAL;
+				uint8_t prefix = 0;
+				if (def->type != SET_FILTER_ARRAY &&
+				    module_parser->settings[define_idx].prefixed_str != NULL)
+					prefix = (uint8_t)module_parser->settings[define_idx].prefixed_str[0];
 				struct config_export_setting export_set = {
 					.type = type,
 					.def_type = def->type,
 					.key = def->key,
 					.key_define_idx = define_idx,
 					.value = str_c(ctx->value),
+					.heredoc_marker = (prefix & CONFIG_VALUE_PREFIX_HEREDOC) != 0 ?
+						set_str_heredoc_marker(&module_parser->settings[define_idx]) : NULL,
+					.value_is_file_inline =
+						(prefix & CONFIG_VALUE_PREFIX_FILE_INLINE) != 0,
 				};
 				ctx->callback(&export_set, ctx->context);
 				if ((ctx->flags & CONFIG_DUMP_FLAG_DEDUPLICATE_KEYS) != 0)

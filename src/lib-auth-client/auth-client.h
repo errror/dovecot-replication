@@ -26,16 +26,24 @@ enum auth_request_flags {
 };
 
 enum auth_request_status {
+	/* auth_client_request_abort() was called */
 	AUTH_REQUEST_STATUS_ABORT = -3,
+	/* Internal client-side error, e.g. disconnected from auth server. */
 	AUTH_REQUEST_STATUS_INTERNAL_FAIL = -2,
+	/* Authentication failed. See "code" and "reason" in args for
+	   details. */
 	AUTH_REQUEST_STATUS_FAIL = -1,
+	/* Authentication continues. data_base64 contains the SASL response
+	   that needs to be sent to the client. */
 	AUTH_REQUEST_STATUS_CONTINUE,
+	/* Authentication finished successfully. data_base64 may contain the
+	   final SASL response that needs to be sent to the client. */
 	AUTH_REQUEST_STATUS_OK
 };
 
 struct auth_mech_desc {
 	char *name;
-        enum mech_security_flags flags;
+        enum sasl_mech_security_flags flags;
 };
 
 struct auth_connect_id {
@@ -69,8 +77,14 @@ struct auth_request_info {
 	const char *initial_resp_base64;
 };
 
+/* Continue/finish authentication. data_base64 is set for
+   AUTH_REQUEST_STATUS_CONTINUE and perhaps AUTH_REQUEST_STATUS_OK.
+   args is set for all statuses except AUTH_REQUEST_STATUS_CONTINUE.
+   log_error contains an error that can be logged as the reason why
+   authentication failed. */
 typedef void auth_request_callback_t(struct auth_client_request *request,
 				     enum auth_request_status status,
+				     const char *log_error,
 				     const char *data_base64,
 				     const char *const *args, void *context);
 
@@ -78,8 +92,10 @@ typedef int auth_channel_binding_callback_t(const char *type, void *context,
 					    const buffer_t **data_r,
 					    const char **error_r);
 
+/* Called when auth connection is ready after handshake (error == NULL), or if
+   connection or handshaked failed (error != NULL). */
 typedef void auth_connect_notify_callback_t(struct auth_client *client,
-					    bool connected, void *context);
+					    const char *error, void *context);
 
 /* Create new authentication client. */
 struct auth_client *

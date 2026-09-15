@@ -1,8 +1,9 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "array.h"
 #include "ipwd.h"
+#include "auth-cache.h"
 #include "auth-worker-connection.h"
 #include "userdb.h"
 
@@ -98,9 +99,22 @@ gid_t userdb_parse_gid(struct auth_request *request, const char *str)
 	}
 }
 
+int userdb_set_cache_key(struct userdb_module *module,
+			 const struct userdb_parameters *userdb_params,
+			 pool_t pool, const char *query,
+			 const ARRAY_TYPE(const_string) *fields,
+			 const char *exclude_driver, const char **error_r)
+{
+	if (!userdb_params->use_cache)
+		return 0;
+
+	return auth_cache_parse_key_and_fields(pool, query, fields,
+			exclude_driver, &module->default_cache_key, error_r);
+}
+
 struct userdb_module *
 userdb_preinit(pool_t pool, struct event *event,
-	       const struct auth_userdb_settings *set)
+	       const struct auth_userdb_settings *set, bool use_cache)
 {
 	static unsigned int auth_userdb_id = 0;
 	struct userdb_module_interface *iface;
@@ -121,7 +135,10 @@ userdb_preinit(pool_t pool, struct event *event,
 	}
 
 	if (iface->preinit != NULL) {
-		if (iface->preinit(pool, event, &userdb, &error) < 0)
+		struct userdb_parameters params = {
+			.use_cache = use_cache && set->use_cache,
+		};
+		if (iface->preinit(pool, event, &params, &userdb, &error) < 0)
 			i_fatal("userdb %s: %s", set->name, error);
 		userdb->blocking = set->use_worker;
 	} else {

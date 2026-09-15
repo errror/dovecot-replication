@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "array.h"
@@ -15,15 +15,22 @@
 #include "imap-commands-util.h"
 
 struct mail_namespace *
-client_find_namespace_full(struct client *client,
+client_find_namespace_full(struct client_command_context *cmd,
 			   const char **mailbox, const char **client_error_r)
 {
+	struct client *client = cmd->client;
 	struct mail_namespace *namespaces = client->user->namespaces;
 	struct mail_namespace *ns;
 	string_t *utf8_name;
 
 	utf8_name = t_str_new(64);
-	if (imap_utf7_to_utf8(*mailbox, utf8_name) < 0) {
+	if (cmd->utf8) {
+		if (!uni_utf8_str_is_valid(*mailbox)) {
+			*client_error_r = "NO Mailbox name is not valid UTF-8";
+			return NULL;
+		}
+		str_append(utf8_name, *mailbox);
+	} else if (imap_utf7_to_utf8(*mailbox, utf8_name) < 0) {
 		*client_error_r = "NO Mailbox name is not valid mUTF-7";
 		return NULL;
 	}
@@ -58,7 +65,7 @@ client_find_namespace(struct client_command_context *cmd, const char **mailbox)
 	struct mail_namespace *ns;
 	const char *client_error;
 
-	ns = client_find_namespace_full(cmd->client, mailbox, &client_error);
+	ns = client_find_namespace_full(cmd, mailbox, &client_error);
 	if (ns == NULL)
 		client_send_tagline(cmd, client_error);
 	return ns;
@@ -180,6 +187,9 @@ imap_get_error_string(const char *error_string, enum mail_error error)
 		break;
 	case MAIL_ERROR_LIMIT:
 		resp_code = IMAP_RESP_CODE_LIMIT;
+		break;
+	case MAIL_ERROR_TOOBIG:
+		resp_code = IMAP_RESP_CODE_TOOBIG;
 		break;
 	case MAIL_ERROR_INTERRUPTED:
 		break;

@@ -1,18 +1,18 @@
-/* Copyright (c) 2021 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "settings.h"
-#include "sql-api-private.h"
 #include "test-common.h"
 #include "sql-api-private.h"
-
-void driver_sqlite_init(void);
-void driver_sqlite_deinit(void);
 
 static const char sql_create_db[] =
 "CREATE TABLE bar(\n"
 "  foo VARCHAR(255)\n"
-");\n";
+");\n"
+"CREATE TABLE test2(\n"
+"   str VARCHAR(255), uuid VARCHAR(36),\n"
+"   num INT, blob BLOB\n"
+")\n";
 
 static void setup_database(struct sql_db *sql)
 {
@@ -62,8 +62,68 @@ static void test_sql_sqlite(void)
 	test_assert(sql_result_next_row(cursor) == SQL_RESULT_NEXT_LAST);
 
 	sql_result_unref(cursor);
-	sql_unref(&sql);
 
+	struct sql_prepared_statement *prep_stmt =
+		sql_prepared_statement_init(sql, "INSERT INTO bar VALUES(?)");
+	struct sql_statement *stmt =
+		sql_statement_init_prepared(prep_stmt);
+	sql_statement_bind_str(stmt, 0, "value3");
+	cursor = sql_statement_query_s(&stmt);
+	test_assert(sql_result_next_row(cursor) == SQL_RESULT_NEXT_LAST);
+	sql_result_unref(cursor);
+
+	stmt = sql_statement_init(sql, "SELECT foo FROM bar WHERE foo = ?");
+	sql_statement_bind_str(stmt, 0, "value3");
+	cursor = sql_statement_query_s(&stmt);
+	test_assert(sql_result_next_row(cursor) == SQL_RESULT_NEXT_OK);
+	test_assert_ucmp(sql_result_get_fields_count(cursor), ==, 1);
+	test_assert_strcmp(sql_result_get_field_name(cursor, 0), "foo");
+	test_assert_strcmp(sql_result_get_field_value(cursor, 0), "value3");
+	sql_result_unref(cursor);
+	sql_prepared_statement_unref(&prep_stmt);
+
+	stmt = sql_statement_init(sql, "INSERT INTO test2 VALUES(?,?,?,?)");
+	sql_statement_bind_str(stmt, 0, "test_str");
+	guid_128_t uuid;
+	int ret = guid_128_from_uuid_string("426b3821-3c6c-4ed7-a936-ec8d664c53d0", uuid);
+	i_assert(ret == 0);
+	sql_statement_bind_uuid(stmt, 1, uuid);
+	sql_statement_bind_int64(stmt, 2, 123456);
+	sql_statement_bind_binary(stmt, 3, "\xFF\xFF\x00\x00\xFF", 5);
+	cursor = sql_statement_query_s(&stmt);
+	test_assert(sql_result_next_row(cursor) == SQL_RESULT_NEXT_LAST);
+	sql_result_unref(cursor);
+
+	stmt = sql_statement_init(sql, "SELECT * FROM test2");
+	cursor = sql_statement_query_s(&stmt);
+	test_assert(sql_result_next_row(cursor) == SQL_RESULT_NEXT_OK);
+	test_assert_ucmp(sql_result_get_fields_count(cursor), ==, 4);
+	test_assert_strcmp(sql_result_get_field_name(cursor, 0), "str");
+	test_assert_strcmp(sql_result_get_field_value(cursor, 0), "test_str");
+	test_assert_strcmp(sql_result_get_field_name(cursor, 1), "uuid");
+	test_assert_strcmp(sql_result_get_field_value(cursor, 1), "426b3821-3c6c-4ed7-a936-ec8d664c53d0");
+	test_assert_strcmp(sql_result_get_field_name(cursor, 2), "num");
+	test_assert_strcmp(sql_result_get_field_value(cursor, 2), "123456");
+	size_t size;
+	const unsigned char *value =
+		sql_result_get_field_value_binary(cursor, 3, &size);
+	test_assert_ucmp(size, ==, 5);
+	test_assert_memcmp(value, size, "\xFF\xFF\x00\x00\xFF", 5);
+	sql_result_unref(cursor);
+
+	prep_stmt = sql_prepared_statement_init(sql, "SELECT foo FROM bar WHERE foo = ?");
+	sql_disconnect(sql);
+	stmt = sql_statement_init_prepared(prep_stmt);
+	sql_statement_bind_str(stmt, 0, "value3");
+	cursor = sql_statement_query_s(&stmt);
+	test_assert(sql_result_next_row(cursor) == SQL_RESULT_NEXT_OK);
+	test_assert_ucmp(sql_result_get_fields_count(cursor), ==, 1);
+	test_assert_strcmp(sql_result_get_field_name(cursor, 0), "foo");
+	test_assert_strcmp(sql_result_get_field_value(cursor, 0), "value3");
+	sql_result_unref(cursor);
+	sql_prepared_statement_unref(&prep_stmt);
+
+	sql_unref(&sql);
 	driver_sqlite_deinit();
 	sql_drivers_deinit_without_drivers();
 	settings_simple_deinit(&set);
@@ -71,9 +131,93 @@ static void test_sql_sqlite(void)
 	test_end();
 }
 
+static void test_sql_sqlite_errors(void)
+{
+	test_begin("test sql api errors");
+
+	struct settings_simple set;
+	settings_simple_init(&set, (const char *const []) {
+		"sql_driver", "sqlite",
+		"sqlite_path", "test-database-errors.db",
+		"sqlite_journal_mode", "wal",
+		NULL,
+	});
+	struct sql_db *sql = NULL;
+	const char *error = NULL;
+
+	sql_drivers_init_without_drivers();
+	driver_sqlite_init();
+
+	if (sql_init_auto(set.event, &sql, &error) <= 0)
+		i_fatal("%s", error);
+	sql_disconnect(sql);
+	i_unlink_if_exists("test-database-errors.db");
+	sql_exec(sql, "CREATE TABLE pk(id INTEGER PRIMARY KEY)");
+	sql_exec(sql, "INSERT INTO pk VALUES(1)");
+
+	/* SQLite's own message is reported, not just the generic text for the
+	   result code, which would be "SQL logic error" for all of these. */
+	struct sql_result *result =
+		sql_query_s(sql, "SELECT x FROM nosuchtable");
+	test_assert(sql_result_next_row(result) < 0);
+	error = sql_result_get_error(result);
+	test_assert(strstr(error, "no such table: nosuchtable") != NULL);
+	test_assert(strstr(error, "rc=1") != NULL);
+	sql_result_unref(result);
+
+	result = sql_query_s(sql, "SELCT bogus");
+	test_assert(sql_result_next_row(result) < 0);
+	error = sql_result_get_error(result);
+	test_assert(strstr(error, "syntax error") != NULL);
+	sql_result_unref(result);
+
+	result = sql_query_s(sql, "SELECT nosuchcolumn FROM pk");
+	test_assert(sql_result_next_row(result) < 0);
+	error = sql_result_get_error(result);
+	test_assert(strstr(error, "no such column: nosuchcolumn") != NULL);
+	sql_result_unref(result);
+
+	/* A failing sqlite3_step() reports the extended result code, which
+	   says which kind of constraint failed (SQLITE_CONSTRAINT_PRIMARYKEY
+	   rather than plain SQLITE_CONSTRAINT). */
+	result = sql_query_s(sql, "INSERT INTO pk VALUES(1)");
+	test_assert(sql_result_next_row(result) < 0);
+	error = sql_result_get_error(result);
+	test_assert(strstr(error, "UNIQUE constraint failed: pk.id") != NULL);
+	test_assert(strstr(error, "rc=19") != NULL);
+	test_assert(strstr(error, "extended_rc=1555") != NULL);
+	sql_result_unref(result);
+
+	/* The transaction keeps the whole error of the statement that failed,
+	   not just its result code. */
+	struct sql_transaction_context *t = sql_transaction_begin(sql);
+	sql_update(t, "INSERT INTO pk VALUES(1)");
+	test_assert(sql_transaction_commit_s(&t, &error) < 0);
+	test_assert(strstr(error, "UNIQUE constraint failed: pk.id") != NULL);
+	test_assert(strstr(error, "extended_rc=1555") != NULL);
+
+	/* Errors that driver-sqlite generates itself have no SQLite message or
+	   extended code, so they fall back to the text for the result code. */
+	result = sql_query_s(sql, "");
+	test_assert(sql_result_next_row(result) < 0);
+	error = sql_result_get_error(result);
+	test_assert(strstr(error, "rc=21") != NULL);
+	test_assert(strstr(error, "extended_rc=21") != NULL);
+	sql_result_unref(result);
+
+	sql_unref(&sql);
+	driver_sqlite_deinit();
+	sql_drivers_deinit_without_drivers();
+	settings_simple_deinit(&set);
+	i_unlink_if_exists("test-database-errors.db");
+
+	test_end();
+}
+
 int main(void) {
 	static void (*const test_functions[])(void) = {
 		test_sql_sqlite,
+		test_sql_sqlite_errors,
 		NULL
 	};
 	return test_run(test_functions);

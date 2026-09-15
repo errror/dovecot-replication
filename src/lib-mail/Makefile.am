@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libmail.la
 
 AM_CPPFLAGS = \
@@ -81,6 +83,7 @@ pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
 test_programs = \
+	test-iostream-dot \
 	test-istream-dot \
 	test-istream-attachment \
 	test-istream-binary-converter \
@@ -111,10 +114,20 @@ test_programs = \
 	test-rfc2231-parser \
 	test-rfc822-parser
 
+test_deps = $(noinst_LTLIBRARIES) \
+	../lib-charset/libcharset.la \
+	../lib-test/libtest.la \
+	../lib/liblib.la
+
+test_libs = $(test_deps) $(LIBDOVECOT_TEST_LIBS)
+
 fuzz_programs =
 
 if USE_FUZZER
-fuzz_programs += fuzz-message-parser
+fuzz_programs += fuzz-message-parser \
+		 fuzz-qp-decoder \
+		 fuzz-message-date \
+		 fuzz-message-decoder
 
 nodist_EXTRA_fuzz_message_parser_SOURCES = force-cxx-linking.cxx
 
@@ -124,21 +137,47 @@ fuzz_message_parser_SOURCES = fuzz-message-parser.c
 fuzz_message_parser_LDADD = $(test_libs)
 fuzz_message_parser_DEPENDENCIES = $(test_deps)
 
+nodist_EXTRA_fuzz_qp_decoder_SOURCES = force-cxx-linking.cxx
+
+fuzz_qp_decoder_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_qp_decoder_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_qp_decoder_SOURCES = fuzz-qp-decoder.c
+fuzz_qp_decoder_LDADD = $(test_libs)
+fuzz_qp_decoder_DEPENDENCIES = $(test_deps)
+
+nodist_EXTRA_fuzz_message_date_SOURCES = force-cxx-linking.cxx
+
+fuzz_message_date_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_message_date_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_message_date_SOURCES = fuzz-message-date.c
+fuzz_message_date_LDADD = $(test_libs)
+fuzz_message_date_DEPENDENCIES = $(test_deps)
+
+nodist_EXTRA_fuzz_message_decoder_SOURCES = force-cxx-linking.cxx
+
+fuzz_message_decoder_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_message_decoder_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_message_decoder_SOURCES = fuzz-message-decoder.c
+fuzz_message_decoder_LDADD = $(test_libs)
+fuzz_message_decoder_DEPENDENCIES = $(test_deps)
+
 endif
 
-noinst_PROGRAMS = $(fuzz_programs) $(test_programs)
+noinst_PROGRAMS += $(fuzz_programs)
 
-test_libs = \
-	$(noinst_LTLIBRARIES) \
-	../lib-charset/libcharset.la \
-	../lib-test/libtest.la \
-	../lib/liblib.la
-
-test_deps = $(noinst_LTLIBRARIES) $(test_libs)
+EXTRA_DIST = \
+	fuzz-message-date.dict \
+	fuzz-message-decoder.dict \
+	fuzz-message-parser.dict \
+	fuzz-qp-decoder.dict
 
 test_istream_dot_SOURCES = test-istream-dot.c
 test_istream_dot_LDADD = $(test_libs)
 test_istream_dot_DEPENDENCIES = $(test_deps)
+
+test_iostream_dot_SOURCES = test-iostream-dot.c
+test_iostream_dot_LDADD = $(test_libs)
+test_iostream_dot_DEPENDENCIES = $(test_deps)
 
 test_istream_qp_decoder_SOURCES = test-istream-qp-decoder.c
 test_istream_qp_decoder_LDADD = $(test_libs)
@@ -251,8 +290,3 @@ test_rfc822_parser_DEPENDENCIES = $(test_deps)
 test_message_part_serialize_SOURCES = test-message-part-serialize.c
 test_message_part_serialize_LDADD = $(test_libs)
 test_message_part_serialize_DEPENDENCIES = $(test_deps)
-
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done

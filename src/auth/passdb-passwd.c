@@ -1,7 +1,6 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
-#include "auth-cache.h"
 #include "passdb.h"
 #include "settings.h"
 
@@ -10,7 +9,6 @@
 #include "safe-memset.h"
 #include "ipwd.h"
 
-#define PASSWD_CACHE_KEY "%u"
 #define PASSWD_PASS_SCHEME "CRYPT"
 
 #undef DEF
@@ -30,8 +28,14 @@ static const struct setting_define auth_passwd_setting_defines[] = {
 
 static const struct setting_keyvalue auth_passwd_default_settings_keyvalue[] = {
 	{ "passdb_passwd/passdb_use_worker", "yes" },
-	{ "passdb_passwd/passdb_default_password_scheme", "crypt" },
 	{ "userdb_passwd/userdb_use_worker", "yes" },
+
+	/* This now now the same as the default passdb_default_password_scheme,
+	   but it needs to be here explicitly as long as settings-history-core.txt
+	   supports dovecot_config_version with
+	   passdb_default_password_scheme=PLAIN default */
+	{ "passdb_passwd/passdb_default_password_scheme", "CRYPT" },
+
 	{ NULL, NULL }
 };
 
@@ -119,7 +123,7 @@ passwd_lookup_credentials(struct auth_request *request,
 
 	res = passwd_lookup(request, &pw);
 	if (res != PASSDB_RESULT_OK) {
-		callback(res, NULL, 0, request);
+		callback(res, NULL, 0, NULL, request);
 		return;
 	}
 	/* make sure we're using the username exactly as it's in the database */
@@ -128,9 +132,11 @@ passwd_lookup_credentials(struct auth_request *request,
 				  PASSWD_PASS_SCHEME, callback, request);
 }
 
-static int passwd_preinit(pool_t pool, struct event *event,
-			  struct passdb_module **module_r,
-			  const char **error_r )
+static int
+passwd_preinit(pool_t pool, struct event *event,
+	       const struct passdb_parameters *passdb_params,
+	       struct passdb_module **module_r,
+	       const char **error_r)
 {
 	const struct auth_passdb_post_settings *post_set;
 	struct passdb_module *module = p_new(pool, struct passdb_module, 1);
@@ -141,13 +147,13 @@ static int passwd_preinit(pool_t pool, struct event *event,
 			 SETTINGS_GET_FLAG_NO_EXPAND,
 			 &post_set, error_r) < 0)
 		return -1;
-	module->default_cache_key = auth_cache_parse_key_and_fields(pool,
-								    PASSWD_CACHE_KEY,
-								    &post_set->fields,
-								    "passwd");
+
+	int ret = passdb_set_cache_key(module, passdb_params, pool,
+				       AUTH_CACHE_KEY_USER,
+				       &post_set->fields, "passwd", error_r);
 	settings_free(post_set);
 	*module_r = module;
-	return 0;
+	return ret;
 }
 
 static void passwd_deinit(struct passdb_module *module ATTR_UNUSED)

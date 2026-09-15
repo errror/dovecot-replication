@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -169,8 +169,9 @@ void *hash2_insert_hash(struct hash2_table *hash, unsigned int key_hash)
 		value->next = NULL;
 		memset(value + 1, 0, hash->value_size);
 	} else {
-		value = p_malloc(hash->value_pool,
-				 sizeof(*value) + hash->value_size);
+		size_t value_alloc_size =
+			MALLOC_ADD(sizeof(*value), hash->value_size);
+		value = p_malloc(hash->value_pool, value_alloc_size);
 	}
 	value->key_hash = key_hash;
 

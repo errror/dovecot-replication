@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -66,6 +66,12 @@ mailbox_list_subscription_fill_one(struct mailbox_list *list,
 		   one easy way is to just ask to join a reference and
 		   pattern */
 		(void)mailbox_list_join_refpattern(ns->list, ns_name, "");
+		/* If the namespace changes to the newly created one, start
+		   the lookup all over again. */
+		struct mail_namespace *ns2 =
+			mail_namespace_find_unsubscribable(namespaces, ns_name);
+		if (ns != ns2)
+			return mailbox_list_subscription_fill_one(list, src_list, name);
 	}
 
 	/* When listing pub/ namespace, skip over the namespace
@@ -105,6 +111,51 @@ mailbox_list_subscription_fill_one(struct mailbox_list *list,
 	return 0;
 }
 
+static void
+mailbox_list_subscriptions_apply_nfc_renames(struct mailbox_list *src_list,
+					     struct mailbox_list *dest_list,
+					     const char *path,
+					     const ARRAY_TYPE(const_string) *renames)
+{
+	const char *const *names;
+	unsigned int i, count;
+	const char *temp_prefix = mailbox_list_get_temp_prefix(src_list);
+
+	names = array_get(renames, &count);
+	for (i = 0; i < count; i += 2) {
+		const char *old_name = names[i];
+		const char *new_name = names[i + 1];
+
+		/* Add the NFC name first so a crash between the two
+		   operations leaves the subscription intact (just under
+		   the non-NFC name, which a later refresh will retry). */
+		if (subsfile_set_subscribed(src_list, path, temp_prefix,
+					    new_name, TRUE) < 0) {
+			mailbox_list_set_critical(dest_list,
+				"Failed to add NFC-normalized subscription "
+				"'%s' to %s: %s", new_name, path,
+				mailbox_list_get_last_internal_error(src_list,
+								     NULL));
+			break;
+		}
+		if (subsfile_set_subscribed(src_list, path, temp_prefix,
+					    old_name, FALSE) < 0) {
+			mailbox_list_set_critical(dest_list,
+				"Failed to remove non-NFC subscription '%s' "
+				"from %s: %s", old_name, path,
+				mailbox_list_get_last_internal_error(src_list,
+								     NULL));
+			break;
+		}
+		e_debug(dest_list->event,
+			"Subscription '%s' renamed to '%s' "
+			"for NFC normalization", old_name, new_name);
+	}
+	/* The file mtime changed; invalidate so a subsequent read re-stats
+	   but tree state is already correct. */
+	dest_list->subscriptions_mtime = (time_t)-1;
+}
+
 int mailbox_list_subscriptions_refresh(struct mailbox_list *src_list,
 				       struct mailbox_list *dest_list)
 {
@@ -113,7 +164,9 @@ int mailbox_list_subscriptions_refresh(struct mailbox_list *src_list,
 	enum mailbox_list_path_type type;
 	const char *path, *name;
 	char sep;
-	int ret;
+	bool nfc = src_list->mail_set->mailbox_list_normalize_names_to_nfc;
+	ARRAY_TYPE(const_string) nfc_renames = ARRAY_INIT;
+	pool_t nfc_pool = NULL;
 
 	/* src_list is subscriptions=yes, dest_list is subscriptions=no
 	   (or the same as src_list) */
@@ -158,11 +211,28 @@ int mailbox_list_subscriptions_refresh(struct mailbox_list *src_list,
 	if (subsfile_list_fstat(subsfile_ctx, &st) == 0)
 		dest_list->subscriptions_mtime = st.st_mtime;
 	while ((name = subsfile_list_next(subsfile_ctx)) != NULL) T_BEGIN {
-		T_BEGIN {
-			ret = mailbox_list_subscription_fill_one(dest_list,
-								 src_list, name);
-		} T_END;
-		if (ret < 0) {
+		const char *nfc_name = name;
+		bool change_to_nfc = FALSE;
+
+		if (nfc) {
+			/* The subscription file stores storage names (e.g.
+			   mUTF7), where non-NFC characters are hidden inside
+			   the encoding and look like plain ASCII. Normalize the
+			   decoded vname instead and convert back, so the same
+			   NFC form is used as in mailbox listing. */
+			const char *vname =
+				mailbox_list_get_vname(src_list, name);
+			const char *nfc_vname;
+			int nfc_ret = uni_utf8_to_nfc(vname, strlen(vname),
+						      &nfc_vname);
+			if (nfc_ret >= 0 && strcmp(vname, nfc_vname) != 0) {
+				nfc_name = mailbox_list_get_storage_name(
+					src_list, nfc_vname);
+				change_to_nfc = TRUE;
+			}
+		}
+		if (mailbox_list_subscription_fill_one(dest_list, src_list,
+						       nfc_name) < 0) {
 			e_warning(dest_list->event,
 				  "Subscriptions file %s: "
 				  "Removing invalid entry: %s",
@@ -171,38 +241,37 @@ int mailbox_list_subscriptions_refresh(struct mailbox_list *src_list,
 				mailbox_list_get_temp_prefix(src_list),
 				name, FALSE);
 
+		} else if (change_to_nfc) {
+			/* The on-disk subscription name was not in NFC form.
+			   Remember to rewrite it after we're done reading. */
+			if (nfc_pool == NULL) {
+				nfc_pool = pool_alloconly_create(
+					"subscriptions nfc renames", 256);
+				p_array_init(&nfc_renames, nfc_pool, 4);
+			}
+			const char *old_name_dup = p_strdup(nfc_pool, name);
+			const char *new_name_dup = p_strdup(nfc_pool, nfc_name);
+			array_push_back(&nfc_renames, &old_name_dup);
+			array_push_back(&nfc_renames, &new_name_dup);
 		}
 	} T_END;
 
 	if (subsfile_list_deinit(&subsfile_ctx) < 0) {
 		dest_list->subscriptions_mtime = (time_t)-1;
+		pool_unref(&nfc_pool);
 		return -1;
 	}
+
+	if (array_not_empty(&nfc_renames)) {
+		mailbox_list_subscriptions_apply_nfc_renames(
+			src_list, dest_list, path, &nfc_renames);
+	}
+	pool_unref(&nfc_pool);
 	return 0;
 }
 
-void mailbox_list_set_subscription_flags(struct mailbox_list *list,
-					 const char *vname,
-					 enum mailbox_info_flags *flags)
-{
-	struct mailbox_node *node;
-
-	*flags &= ENUM_NEGATE(MAILBOX_SUBSCRIBED | MAILBOX_CHILD_SUBSCRIBED);
-
-	node = mailbox_tree_lookup(list->subscriptions, vname);
-	if (node != NULL) {
-		*flags |= node->flags & MAILBOX_SUBSCRIBED;
-
-		/* the only reason why node might have a child is if one of
-		   them is subscribed */
-		if (node->children != NULL)
-			*flags |= MAILBOX_CHILD_SUBSCRIBED;
-	}
-}
-
 void mailbox_list_subscriptions_fill(struct mailbox_list_iterate_context *ctx,
-				     struct mailbox_tree_context *tree,
-				     bool default_nonexistent)
+				     struct mailbox_tree_context *tree)
 {
 	struct mailbox_list_iter_update_context update_ctx;
 	struct mailbox_tree_iterate_context *iter;
@@ -213,8 +282,6 @@ void mailbox_list_subscriptions_fill(struct mailbox_list_iterate_context *ctx,
 	update_ctx.tree_ctx = tree;
 	update_ctx.glob = ctx->glob;
 	update_ctx.leaf_flags = MAILBOX_SUBSCRIBED;
-	if (default_nonexistent)
-		update_ctx.leaf_flags |= MAILBOX_NONEXISTENT;
 	update_ctx.parent_flags = MAILBOX_CHILD_SUBSCRIBED;
 	update_ctx.match_parents =
 		(ctx->flags & MAILBOX_LIST_ITER_SELECT_RECURSIVEMATCH) != 0;
@@ -224,97 +291,4 @@ void mailbox_list_subscriptions_fill(struct mailbox_list_iterate_context *ctx,
 	while (mailbox_tree_iterate_next(iter, &name) != NULL)
 		mailbox_list_iter_update(&update_ctx, name);
 	mailbox_tree_iterate_deinit(&iter);
-}
-
-struct mailbox_list_iterate_context *
-mailbox_list_subscriptions_iter_init(struct mailbox_list *list,
-				     const char *const *patterns,
-				     enum mailbox_list_iter_flags flags)
-{
-	struct subscriptions_mailbox_list_iterate_context *ctx;
-	pool_t pool;
-	char sep = mail_namespace_get_sep(list->ns);
-
-	pool = pool_alloconly_create("mailbox list subscriptions iter", 1024);
-	ctx = p_new(pool, struct subscriptions_mailbox_list_iterate_context, 1);
-	ctx->ctx.pool = pool;
-	ctx->ctx.list = list;
-	ctx->ctx.flags = flags;
-	ctx->ctx.glob = imap_match_init_multiple(pool, patterns, TRUE, sep);
-	array_create(&ctx->ctx.module_contexts, pool, sizeof(void *), 5);
-
-	ctx->tree = mailbox_tree_init(sep);
-	mailbox_list_subscriptions_fill(&ctx->ctx, ctx->tree, FALSE);
-
-	ctx->info.ns = list->ns;
-	/* the tree usually has only those entries we want to iterate through,
-	   but there are also non-matching root entries (e.g. "LSUB foo/%" will
-	   include the "foo"), which we'll drop with MAILBOX_MATCHED. */
-	ctx->iter = mailbox_tree_iterate_init(ctx->tree, NULL, MAILBOX_MATCHED);
-	return &ctx->ctx;
-}
-
-const struct mailbox_info *
-mailbox_list_subscriptions_iter_next(struct mailbox_list_iterate_context *_ctx)
-{
-	struct subscriptions_mailbox_list_iterate_context *ctx =
-		(struct subscriptions_mailbox_list_iterate_context *)_ctx;
-	struct mailbox_list *list = _ctx->list;
-	struct mailbox_node *node;
-	enum mailbox_info_flags subs_flags;
-	const char *vname, *storage_name, *error;
-	int ret;
-
-	node = mailbox_tree_iterate_next(ctx->iter, &vname);
-	if (node == NULL)
-		return mailbox_list_iter_default_next(_ctx);
-
-	ctx->info.vname = vname;
-	subs_flags = node->flags & (MAILBOX_SUBSCRIBED |
-				    MAILBOX_CHILD_SUBSCRIBED);
-
-	if ((_ctx->flags & MAILBOX_LIST_ITER_RETURN_NO_FLAGS) != 0 &&
-	    (_ctx->flags & MAILBOX_LIST_ITER_RETURN_CHILDREN) == 0) {
-		/* don't care about flags, just return it */
-		ctx->info.flags = subs_flags;
-		return &ctx->info;
-	}
-
-	storage_name = mailbox_list_get_storage_name(list, vname);
-	if (!mailbox_list_is_valid_name(list, storage_name, &error)) {
-		/* broken entry in subscriptions file */
-		ctx->info.flags = MAILBOX_NONEXISTENT;
-	} else if (mailbox_list_mailbox(list, storage_name,
-					&ctx->info.flags) < 0) {
-		ctx->info.flags = 0;
-		_ctx->failed = TRUE;
-	} else if ((_ctx->flags & MAILBOX_LIST_ITER_RETURN_CHILDREN) != 0 &&
-		   (ctx->info.flags & (MAILBOX_CHILDREN |
-				       MAILBOX_NOCHILDREN)) == 0) {
-		ret = mailbox_has_children(list, storage_name);
-		if (ret < 0)
-			_ctx->failed = TRUE;
-		else if (ret == 0)
-			ctx->info.flags |= MAILBOX_NOCHILDREN;
-		else
-			ctx->info.flags |= MAILBOX_CHILDREN;
-
-	}
-
-	ctx->info.flags &= ENUM_NEGATE(MAILBOX_SUBSCRIBED | MAILBOX_CHILD_SUBSCRIBED);
-	ctx->info.flags |=
-		node->flags & (MAILBOX_SUBSCRIBED | MAILBOX_CHILD_SUBSCRIBED);
-	return &ctx->info;
-}
-
-int mailbox_list_subscriptions_iter_deinit(struct mailbox_list_iterate_context *_ctx)
-{
-	struct subscriptions_mailbox_list_iterate_context *ctx =
-		(struct subscriptions_mailbox_list_iterate_context *)_ctx;
-	int ret = _ctx->failed ? -1 : 0;
-
-	mailbox_tree_iterate_deinit(&ctx->iter);
-	mailbox_tree_deinit(&ctx->tree);
-	pool_unref(&_ctx->pool);
-	return ret;
 }

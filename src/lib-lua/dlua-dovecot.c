@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -6,6 +6,7 @@
 #include "str.h"
 #include "base64.h"
 #include "time-util.h"
+#include "lib-event-private.h"
 #include "dlua-script-private.h"
 #include "dict-lua.h"
 #include "doveadm-client-lua.h"
@@ -180,10 +181,12 @@ static int dlua_event_pt_inc_int(lua_State *L)
 
 static int dlua_event_pt_log_debug(lua_State *L)
 {
+	struct dlua_script *script = dlua_script_from_state(L);
 	DLUA_REQUIRE_ARGS(L, 2);
 	struct event_passthrough *event = dlua_check_event_passthrough(L, 1);
 	const char *str = luaL_checkstring(L, 2);
 
+	script->pending_event_passthrough = NULL;
 	dlua_event_log(L, event->event(), LOG_TYPE_DEBUG, str);
 
 	lua_pushvalue(L, 1);
@@ -193,10 +196,12 @@ static int dlua_event_pt_log_debug(lua_State *L)
 
 static int dlua_event_pt_log_info(lua_State *L)
 {
+	struct dlua_script *script = dlua_script_from_state(L);
 	DLUA_REQUIRE_ARGS(L, 2);
 	struct event_passthrough *event = dlua_check_event_passthrough(L, 1);
 	const char *str = luaL_checkstring(L, 2);
 
+	script->pending_event_passthrough = NULL;
 	dlua_event_log(L, event->event(), LOG_TYPE_INFO, str);
 
 	lua_pushvalue(L, 1);
@@ -206,10 +211,12 @@ static int dlua_event_pt_log_info(lua_State *L)
 
 static int dlua_event_pt_log_warning(lua_State *L)
 {
+	struct dlua_script *script = dlua_script_from_state(L);
 	DLUA_REQUIRE_ARGS(L, 2);
 	struct event_passthrough *event = dlua_check_event_passthrough(L, 1);
 	const char *str = luaL_checkstring(L, 2);
 
+	script->pending_event_passthrough = NULL;
 	dlua_event_log(L, event->event(), LOG_TYPE_WARNING, str);
 
 	lua_pushvalue(L, 1);
@@ -219,10 +226,12 @@ static int dlua_event_pt_log_warning(lua_State *L)
 
 static int dlua_event_pt_log_error(lua_State *L)
 {
+	struct dlua_script *script = dlua_script_from_state(L);
 	DLUA_REQUIRE_ARGS(L, 2);
 	struct event_passthrough *event = dlua_check_event_passthrough(L, 1);
 	const char *str = luaL_checkstring(L, 2);
 
+	script->pending_event_passthrough = NULL;
 	dlua_event_log(L, event->event(), LOG_TYPE_ERROR, str);
 
 	lua_pushvalue(L, 1);
@@ -284,6 +293,12 @@ void dlua_push_event(lua_State *L, struct event *event)
 	lua_setfield(L, -2, "__gc");
 	lua_setmetatable(L, -2);
 	lua_setfield(L, -2, "item");
+}
+
+void dlua_push_timeval(lua_State *L, const struct timeval *tv)
+{
+	lua_pushinteger(L, tv == NULL ? 0 :
+			tv->tv_sec * 1000000LL + tv->tv_usec);
 }
 
 static int dlua_event_append_log_prefix(lua_State *L)
@@ -470,18 +485,38 @@ static int dlua_event_log_error(lua_State *L)
 	return 1;
 }
 
+void dlua_event_passthrough_abort(struct dlua_script *script)
+{
+	if (script->pending_event_passthrough != NULL) {
+		struct event *event =
+			script->pending_event_passthrough->event();
+		const char *source_filename = t_strdup(event->source_filename);
+		int source_linenum = event->source_linenum;
+		event_send_abort(event);
+		script->pending_event_passthrough = NULL;
+
+		e_error(script->event,
+			"Passthrough event leaked by Lua script at %s:%d",
+			source_filename, source_linenum);
+	}
+}
+
 #undef event_create_passthrough
 #undef event_create
 static int dlua_event_passthrough_event(lua_State *L)
 {
+	struct dlua_script *script = dlua_script_from_state(L);
 	DLUA_REQUIRE_ARGS(L, 1);
 	struct event *event = dlua_check_event(L, 1);
 	const char *file;
 	unsigned int line;
 
+	dlua_event_passthrough_abort(script);
+
 	dlua_get_file_line(L, 1, &file, &line);
 	struct event_passthrough *e =
 		event_create_passthrough(event, file, line);
+	script->pending_event_passthrough = e;
 	dlua_push_event_passthrough(L, e);
 
 	return 1;

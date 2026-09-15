@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -119,7 +119,8 @@ i_stream_dot_return(struct istream_private *stream, size_t dest, ssize_t ret)
 static ssize_t i_stream_dot_read(struct istream_private *stream)
 {
 	/* @UNSAFE */
-	struct dot_istream *dstream = (struct dot_istream *)stream;
+	struct dot_istream *dstream =
+		container_of(stream, struct dot_istream, istream);
 	const unsigned char *data;
 	size_t i, dest, size, avail;
 	ssize_t ret, ret1;
@@ -155,8 +156,28 @@ static ssize_t i_stream_dot_read(struct istream_private *stream)
 	data = i_stream_get_data(stream->parent, &size);
 	for (i = 0; i < size && dest < stream->buffer_size; i++) {
 		switch (dstream->state) {
-		case DOT_STATE_SEEN_NONE:
+		case DOT_STATE_SEEN_NONE: {
+			/* ensure we don't read too far, since we can only
+			   fill w_buffer up to it's size */
+			size_t maxlen =
+				I_MIN(size - i, stream->buffer_size - dest);
+			size_t len;
+			if (dstream->accept_bare_lf)
+				len = i_memcspn(data + i, maxlen, "\r\n", 2);
+			else /* we only need to find new CR */
+				len = i_memcspn(data + i, maxlen, "\r", 1);
+
+			/* if there was data, copy it and try again */
+			if (len > 0) {
+				memcpy(PTR_OFFSET(stream->w_buffer, dest),
+				       data + i, len);
+				dest += len;
+				i += len;
+			}
+			if (i == size || dest == stream->buffer_size)
+				goto end;
 			break;
+		}
 		case DOT_STATE_SEEN_CR:
 			/* CR seen */
 			if (data[i] == '\n')
@@ -243,5 +264,6 @@ i_stream_create_dot(struct istream *input, enum istream_dot_flags flags)
 	dstream->state_no_cr = TRUE;
 	dstream->state_no_lf = TRUE;
 	return i_stream_create(&dstream->istream, input,
-			       i_stream_get_fd(input), 0);
+			       i_stream_get_fd(input),
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }

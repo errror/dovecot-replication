@@ -1,4 +1,4 @@
-/* Copyright (c) 2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -146,7 +146,7 @@ cmd_mailbox_cache_decision_run_per_field(struct mailbox_cache_cmd_context *ctx,
 							      *field_name);
 		if (idx == UINT_MAX) {
 			doveadm_print("<not found>");
-			doveadm_print("");
+			doveadm_print_empty(1);
 			continue;
 		}
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "connection.h"
@@ -12,12 +12,14 @@
 #include "iostream-ssl.h"
 #include "llist.h"
 #include "array.h"
+#include "base64.h"
 #include "hash.h"
 #include "str.h"
 #include "strescape.h"
 #include "time-util.h"
 #include "settings.h"
 #include "master-service.h"
+#include "dsasl-client.h"
 #include "client-common.h"
 #include "login-proxy-state.h"
 #include "login-proxy.h"
@@ -65,6 +67,8 @@ struct login_proxy {
 	struct io *client_wait_io, *server_io, *side_channel_io;
 	struct istream *client_input, *server_input;
 	struct ostream *client_output, *server_output;
+	struct istream *pre_rawlog_input, *rawlog_input;
+	struct ostream *pre_rawlog_output, *rawlog_output;
 	struct istream *multiplex_input, *multiplex_orig_input;
 	struct istream *side_channel_input;
 	struct iostream_proxy *iostream_proxy;
@@ -226,6 +230,51 @@ static void proxy_side_channel_input(struct login_proxy *proxy)
 		proxy->client->login_proxy = NULL;
 }
 
+static void proxy_rawlog_init(struct login_proxy *proxy)
+{
+	if (proxy->rawlog_dir == NULL)
+		return;
+
+	proxy->pre_rawlog_input = proxy->server_input;
+	proxy->pre_rawlog_output = proxy->server_output;
+	if (iostream_rawlog_create(proxy->event, "login_proxy_rawlog_dir",
+				   proxy->rawlog_dir, &proxy->server_input,
+				   &proxy->server_output) < 0)
+		return;
+	proxy->rawlog_input = proxy->server_input;
+	proxy->rawlog_output = proxy->server_output;
+}
+
+static void proxy_rawlog_deinit(struct login_proxy *proxy)
+{
+	if (proxy->rawlog_input == NULL)
+		return;
+
+	i_assert(proxy->rawlog_input == proxy->server_input);
+	i_assert(proxy->rawlog_output == proxy->server_output);
+	i_stream_ref(proxy->pre_rawlog_input);
+	o_stream_ref(proxy->pre_rawlog_output);
+	i_stream_destroy(&proxy->rawlog_input);
+	o_stream_destroy(&proxy->rawlog_output);
+	proxy->server_input = proxy->pre_rawlog_input;
+	proxy->server_output = proxy->pre_rawlog_output;
+	proxy->pre_rawlog_input = NULL;
+	proxy->pre_rawlog_output = NULL;
+}
+
+static void proxy_multiplex_deinit(struct login_proxy *proxy)
+{
+	if (proxy->multiplex_input == NULL)
+		return;
+
+	i_assert(proxy->server_input == proxy->multiplex_input);
+	i_stream_unref(&proxy->side_channel_input);
+	i_stream_unref(&proxy->server_input);
+	proxy->server_input = proxy->multiplex_orig_input;
+	proxy->multiplex_input = NULL;
+	proxy->multiplex_orig_input = NULL;
+}
+
 static void proxy_plain_connected(struct login_proxy *proxy)
 {
 	proxy->server_input =
@@ -236,13 +285,6 @@ static void proxy_plain_connected(struct login_proxy *proxy)
 
 	proxy->server_io =
 		io_add(proxy->server_fd, IO_READ, proxy_prelogin_input, proxy);
-
-	if (proxy->rawlog_dir != NULL) {
-		if (iostream_rawlog_create(proxy->rawlog_dir,
-					   &proxy->server_input,
-					   &proxy->server_output) < 0)
-			i_free(proxy->rawlog_dir);
-	}
 }
 
 static void proxy_fail_connect(struct login_proxy *proxy)
@@ -311,6 +353,10 @@ login_proxy_set_destination(struct login_proxy *proxy, const char *host,
 	proxy->port = port;
 	proxy->state_rec = login_proxy_state_get(proxy_state, &proxy->ip,
 						 proxy->port);
+
+	event_add_str(proxy->event, "dest_host", host);
+	event_add_ip(proxy->event, "dest_ip", ip);
+	event_add_int(proxy->event, "dest_port", port);
 
 	/* Include destination ip:port also in the log prefix */
 	event_set_append_log_prefix(
@@ -419,6 +465,8 @@ static void proxy_wait_connect(struct login_proxy *proxy)
 		if (login_proxy_starttls(proxy) < 0) {
 			/* proxy is already destroyed */
 		}
+	} else {
+		proxy_rawlog_init(proxy);
 	}
 }
 
@@ -527,9 +575,6 @@ int login_proxy_new(struct client *client, struct event *event,
 	/* add event fields */
 	event_add_ip(proxy->event, "source_ip",
 		     login_proxy_get_source_host(proxy));
-	event_add_ip(proxy->event, "dest_ip", &set->ip);
-	event_add_int(proxy->event, "dest_port", set->port);
-	event_add_str(event, "dest_host", set->host);
 	event_add_str(event, "master_user", client->proxy_master_user);
 
 	client_ref(client);
@@ -570,9 +615,9 @@ static void login_proxy_disconnect(struct login_proxy *proxy)
 
 	io_remove(&proxy->side_channel_io);
 	io_remove(&proxy->server_io);
-	i_stream_destroy(&proxy->multiplex_orig_input);
-	proxy->multiplex_input = NULL;
-	i_stream_destroy(&proxy->side_channel_input);
+	proxy_multiplex_deinit(proxy);
+	proxy_rawlog_deinit(proxy);
+
 	i_stream_destroy(&proxy->server_input);
 	o_stream_destroy(&proxy->server_output);
 	if (proxy->server_fd != -1) {
@@ -748,6 +793,11 @@ login_proxy_free_full(struct login_proxy **_proxy, const char *log_msg,
 		i_assert(log_msg != NULL || proxy->client->destroyed);
 		login_proxy_detached_unlink(proxy);
 
+		if (master_service_get_client_limit(master_service) == 1) {
+			/* matching set in login_proxy_detach() */
+			master_service_set_current_user(master_service, NULL);
+		}
+
 		if ((flags & LOGIN_PROXY_FREE_FLAG_DELAYED) != 0)
 			delay_ms = login_proxy_delay_disconnect(proxy);
 
@@ -806,6 +856,14 @@ bool login_proxy_failed(struct login_proxy *proxy, struct event *event,
 {
 	const char *log_prefix;
 	bool try_reconnect = TRUE;
+
+	if (type == LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT) {
+		proxy->redirect_callback(proxy->client, event, reason);
+		/* return value doesn't matter here, because we can't be
+		   coming from login_proxy_connect(). */
+		return FALSE;
+	}
+
 	event_add_str(event, "error", reason);
 
 	switch (type) {
@@ -829,18 +887,15 @@ bool login_proxy_failed(struct login_proxy *proxy, struct event *event,
 	case LOGIN_PROXY_FAILURE_TYPE_PROTOCOL:
 		log_prefix = "Remote server sent invalid input: ";
 		break;
-	case LOGIN_PROXY_FAILURE_TYPE_AUTH:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_NOT_REPLIED:
+	case LOGIN_PROXY_FAILURE_TYPE_AUTH_LIMIT_REACHED_REPLIED:
 		log_prefix = "";
 		try_reconnect = FALSE;
 		break;
 	case LOGIN_PROXY_FAILURE_TYPE_AUTH_TEMPFAIL:
 		log_prefix = "";
 		break;
-	case LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT:
-		proxy->redirect_callback(proxy->client, event, reason);
-		/* return value doesn't matter here, because we can't be
-		   coming from login_proxy_connect(). */
-		return FALSE;
 	default:
 		i_unreached();
 	}
@@ -854,13 +909,60 @@ bool login_proxy_failed(struct login_proxy *proxy, struct event *event,
 		return TRUE;
 	}
 
-	if (type != LOGIN_PROXY_FAILURE_TYPE_AUTH &&
+	i_free(proxy->client->last_proxy_auth_failure_reason);
+	proxy->client->last_proxy_auth_failure_reason =
+		i_strdup_printf("%s%s", log_prefix, reason);
+
+	if (type != LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED &&
+	    type != LOGIN_PROXY_FAILURE_TYPE_AUTH_LIMIT_REACHED_REPLIED &&
+	    type != LOGIN_PROXY_FAILURE_TYPE_AUTH_NOT_REPLIED &&
 	    type != LOGIN_PROXY_FAILURE_TYPE_AUTH_TEMPFAIL)
 		e_error(event, "%s%s", log_prefix, reason);
 	else if (proxy->client->set->auth_verbose)
 		client_proxy_log_failure(proxy->client, reason);
 	proxy->failure_callback(proxy->client, type, reason, FALSE);
 	return FALSE;
+}
+
+int login_proxy_sasl_step(struct client *client, string_t *str)
+{
+	const unsigned char *data;
+	size_t data_len;
+	const char *error;
+
+	enum dsasl_client_result sasl_res =
+		dsasl_client_input(client->proxy_sasl_client,
+				   str_data(str), str_len(str), &error);
+	if (sasl_res == DSASL_CLIENT_RESULT_OK) {
+		sasl_res = dsasl_client_output(client->proxy_sasl_client,
+					       &data, &data_len, &error);
+	}
+	switch (sasl_res) {
+	case DSASL_CLIENT_RESULT_OK:
+		break;
+	case DSASL_CLIENT_RESULT_AUTH_FAILED:
+		login_proxy_failed(client->login_proxy,
+				   login_proxy_get_event(client->login_proxy),
+				   LOGIN_PROXY_FAILURE_TYPE_AUTH_NOT_REPLIED,
+				   error);
+		return -1;
+	case DSASL_CLIENT_RESULT_ERR_PROTOCOL: {
+		const char *reason = t_strdup_printf(
+			"Invalid authentication data: %s", error);
+		login_proxy_failed(client->login_proxy,
+				   login_proxy_get_event(client->login_proxy),
+				   LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, reason);
+		return -1;
+	}
+	case DSASL_CLIENT_RESULT_ERR_INTERNAL:
+		login_proxy_failed(client->login_proxy,
+				   login_proxy_get_event(client->login_proxy),
+				   LOGIN_PROXY_FAILURE_TYPE_INTERNAL, error);
+		return -1;
+	}
+	str_truncate(str, 0);
+	base64_encode(data, data_len, str);
+	return 0;
 }
 
 bool login_proxy_is_ourself(const struct client *client, const char *host,
@@ -924,8 +1026,18 @@ void login_proxy_redirect_finish(struct login_proxy *proxy,
 	/* disconnect from current backend */
 	login_proxy_disconnect(proxy);
 
-	e_debug(proxy->event, "Redirecting to %s", net_ipport2str(ip, port));
+	struct event_passthrough *ef = event_create_passthrough(proxy->event)->
+		add_str("disconnect_reason", "Redirecting")->
+		add_str("disconnect_side", LOGIN_PROXY_SIDE_SELF)->
+		add_str("error_code", "proxy_dest_redirected")->
+		set_name("proxy_session_finished");
+	e_debug(ef->event(), "Redirecting to %s", net_ipport2str(ip, port));
+
 	login_proxy_set_destination(proxy, net_ip2addr(ip), ip, port);
+	struct event_passthrough *es = event_create_passthrough(proxy->event)->
+		set_name("proxy_session_started");
+	e_debug(es->event(), "Started redirected proxy session");
+
 	(void)login_proxy_connect(proxy);
 }
 
@@ -1150,11 +1262,7 @@ void login_proxy_detach(struct login_proxy *proxy)
 		/* both sides of the proxy want multiplexing and there are no
 		   plugins hooking into the ostream. We can just step out of
 		   the way and let the two sides multiplex directly. */
-		i_stream_unref(&proxy->side_channel_input);
-		i_stream_unref(&proxy->server_input);
-		proxy->server_input = proxy->multiplex_orig_input;
-		proxy->multiplex_input = NULL;
-		proxy->multiplex_orig_input = NULL;
+		proxy_multiplex_deinit(proxy);
 
 		o_stream_unref(&proxy->client_output);
 		proxy->client_output = client->multiplex_orig_output;
@@ -1195,6 +1303,17 @@ void login_proxy_detach(struct login_proxy *proxy)
 	DLLIST_REMOVE(&login_proxies_pending, proxy);
 	login_proxy_detached_link(proxy);
 
+	if (master_service_get_client_limit(master_service) == 1) {
+		/* High-security mode (one connection per process): doveadm kick
+		   reaches us as SIGTERM + KICK-USER-SIGNAL, which the master
+		   service signal handler matches against current_user. Set it so
+		   the kick is recognized and terminates this proxied connection.
+		   With client_limit>1 the kick uses the admin socket instead and
+		   current_user must stay unset. */
+		master_service_set_current_user(master_service,
+						client->virtual_user);
+	}
+
 	client->login_proxy = NULL;
 }
 
@@ -1212,19 +1331,17 @@ int login_proxy_starttls(struct login_proxy *proxy)
 	if ((proxy->ssl_flags & AUTH_PROXY_SSL_FLAG_ANY_CERT) != 0)
 		ssl_flags |= SSL_IOSTREAM_FLAG_ALLOW_INVALID_CERT;
 
-	io_remove(&proxy->side_channel_io);
-	io_remove(&proxy->server_io);
-
 	if (proxy->multiplex_orig_input != NULL) {
-		/* restart multiplexing after TLS iostreams are set up */
-		i_assert(proxy->server_input == proxy->multiplex_input);
-		i_stream_unref(&proxy->server_input);
-		proxy->server_input = proxy->multiplex_orig_input;
-		i_stream_unref(&proxy->side_channel_input);
-		proxy->multiplex_input = NULL;
-		proxy->multiplex_orig_input = NULL;
+		/* restart multiplexing after TLS iostreams are set up.
+		   Multiplex sits on top of rawlog, so it must be removed
+		   before proxy_rawlog_deinit() to satisfy its server_input ==
+		   rawlog_input assertion. */
+		proxy_multiplex_deinit(proxy);
 		add_multiplex_istream = TRUE;
 	}
+	proxy_rawlog_deinit(proxy);
+	io_remove(&proxy->side_channel_io);
+	io_remove(&proxy->server_io);
 	const struct ssl_iostream_client_autocreate_parameters parameters = {
 		.event_parent = proxy->event,
 		.host = proxy->host,
@@ -1248,16 +1365,42 @@ int login_proxy_starttls(struct login_proxy *proxy)
 		const char *reason = t_strdup_printf(
 			"Failed to start SSL handshake: %s",
 			ssl_iostream_get_last_error(proxy->server_ssl_iostream));
-		login_proxy_failed(proxy, proxy->event,
-				   LOGIN_PROXY_FAILURE_TYPE_INTERNAL, reason);
+
+		enum login_proxy_failure_type type =
+			login_proxy_failed_because_invalid_cert(proxy) ?
+			LOGIN_PROXY_FAILURE_TYPE_INTERNAL_CONFIG :
+			LOGIN_PROXY_FAILURE_TYPE_INTERNAL;
+		login_proxy_failed(proxy, proxy->event, type, reason);
 		return -1;
 	}
+	proxy_rawlog_init(proxy);
 
 	proxy->server_io = io_add_istream(proxy->server_input,
 					  proxy_prelogin_input, proxy);
 	if (add_multiplex_istream)
 		login_proxy_multiplex_input_start(proxy);
 	return 0;
+}
+
+bool login_proxy_failed_because_invalid_cert(struct login_proxy *proxy)
+{
+	if (proxy->server_ssl_iostream == NULL)
+		return FALSE;
+
+	enum ssl_iostream_state state =
+		ssl_iostream_get_state(proxy->server_ssl_iostream);
+	return state == SSL_IOSTREAM_STATE_INVALID_CERT ||
+		state == SSL_IOSTREAM_STATE_NAME_MISMATCH;
+}
+
+void login_proxy_input_halt(struct login_proxy *proxy)
+{
+	io_remove(&proxy->server_io);
+}
+
+bool login_proxy_multiplex_input_started(struct login_proxy *proxy)
+{
+	return proxy->multiplex_input != NULL;
 }
 
 void login_proxy_multiplex_input_start(struct login_proxy *proxy)
@@ -1371,13 +1514,23 @@ void login_proxy_init(const char *proxy_notify_pipe_path)
 void login_proxy_deinit(void)
 {
 	struct login_proxy *proxy;
+	const char *log_msg, *reason;
+
+	if (master_service_is_user_kicked(master_service)) {
+		/* The process is exiting because a proxied connection was
+		   kicked via SIGTERM (high-security mode), not because of a
+		   normal shutdown. Log it as such. */
+		log_msg = LOGIN_PROXY_KILL_PREFIX KILLED_BY_ADMIN_REASON;
+		reason = KILLED_BY_ADMIN_REASON;
+	} else {
+		log_msg = LOGIN_PROXY_KILL_PREFIX KILLED_BY_SHUTDOWN_REASON;
+		reason = KILLED_BY_SHUTDOWN_REASON;
+	}
 
 	while (login_proxies != NULL) {
 		proxy = login_proxies;
-		login_proxy_free_full(&proxy,
-			LOGIN_PROXY_KILL_PREFIX KILLED_BY_SHUTDOWN_REASON,
-			KILLED_BY_SHUTDOWN_REASON,
-			LOGIN_PROXY_SIDE_SELF, 0);
+		login_proxy_free_full(&proxy, log_msg, reason,
+				      LOGIN_PROXY_SIDE_SELF, 0);
 	}
 	i_assert(detached_login_proxies_count == 0);
 

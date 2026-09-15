@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -394,6 +394,19 @@ static ssize_t i_stream_multiplex_ichannel_read(struct istream_private *stream)
 		container_of(stream, struct multiplex_ichannel, istream);
 	struct multiplex_istream *mstream = channel->mstream;
 
+	if (channel->cid != 0 && i_stream_io_ever_added(&stream->istream)) {
+		/* Only channel 0's IO is owned by the parent istream, so only
+		   it can notice input that is already buffered in the parent
+		   (e.g. an SSL istream) instead of in the socket. Without an
+		   IO for channel 0 this channel would hang. Note that the IOs
+		   can be temporarily removed, so only check that they have
+		   existed. */
+		struct multiplex_ichannel *channel0 = get_channel(mstream, 0);
+
+		i_assert(channel0 != NULL);
+		i_assert(i_stream_io_ever_added(&channel0->istream.istream));
+	}
+
 	/* if previous multiplex read dumped data for us
 	   actually serve it here. */
 	if (channel->pending_count > 0) {
@@ -480,18 +493,37 @@ i_stream_add_channel_real(struct multiplex_istream *mstream, uint8_t cid)
 	channel->cid = cid;
 	channel->mstream = mstream;
 	channel->istream.read = i_stream_multiplex_ichannel_read;
-	channel->istream.switch_ioloop_to = i_stream_multiplex_ichannel_switch_ioloop_to;
 	channel->istream.iostream.close = i_stream_multiplex_ichannel_close;
 	channel->istream.iostream.destroy = i_stream_multiplex_ichannel_destroy;
 	channel->istream.max_buffer_size = mstream->bufsize;
 	channel->istream.istream.blocking = mstream->blocking;
-	if (cid == 0)
+	if (cid == 0) {
 		channel->istream.fd = i_stream_get_fd(mstream->parent);
-	else
+		/* The parent isn't our istream-parent, but the ioloop IO for
+		   this channel must still be owned by the parent's root
+		   istream. Otherwise i_stream_set_input_pending() calls done
+		   by the parent (e.g. an SSL istream that still has buffered
+		   input which the fd won't notify about) are lost and the
+		   stream hangs. Only channel 0 does this: the other channels
+		   have no fd and get their IO triggered explicitly by
+		   i_stream_multiplex_add(). */
+		channel->istream.io_parent = mstream->parent;
+	} else {
 		channel->istream.fd = -1;
+		/* io_parent isn't set, so the parent's ioloop items must be
+		   switched here. */
+		channel->istream.switch_ioloop_to =
+			i_stream_multiplex_ichannel_switch_ioloop_to;
+	}
 	array_push_back(&channel->mstream->channels, &channel);
 
-	return i_stream_create(&channel->istream, NULL, channel->istream.fd, 0);
+	/* Only channel 0 declares the parent it reads. The other channels
+	   own their own IO, which is triggered explicitly. */
+	enum istream_hidden_inputs hidden_inputs = cid == 0 ?
+		ISTREAM_HIDDEN_INPUTS_DECLARED :
+		ISTREAM_HIDDEN_INPUTS_UNCHECKED;
+	return i_stream_create(&channel->istream, NULL, channel->istream.fd,
+			       hidden_inputs, 0);
 }
 
 struct istream *i_stream_multiplex_add_channel(struct istream *stream, uint8_t cid)

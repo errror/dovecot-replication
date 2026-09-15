@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -178,6 +178,8 @@ imap_urlauth_fetch_local(struct imap_urlauth_fetch *ufetch, const char *url,
 	const char *error, *errormsg = NULL, *bpstruct = NULL;
 	enum mail_error error_code;
 	struct imap_msgpart_url *mpurl = NULL;
+	bool utf8 = HAS_ALL_BITS(url_flags, IMAP_URLAUTH_FETCH_FLAG_UTF8);
+	enum imap_quote_flags qflags = (utf8 ? IMAP_QUOTE_FLAG_UTF8 : 0);
 	int ret;
 
 	bool success = TRUE;
@@ -208,8 +210,8 @@ imap_urlauth_fetch_local(struct imap_urlauth_fetch *ufetch, const char *url,
 		imap_msgpart_url_set_decode_to_binary(mpurl);
 	if (success &&
 	    (url_flags & IMAP_URLAUTH_FETCH_FLAG_BODYPARTSTRUCTURE) != 0) {
-		ret = imap_msgpart_url_get_bodypartstructure(
-			mpurl, &bpstruct, &error);
+		ret = imap_msgpart_url_get_bodypartstructure(mpurl, qflags,
+							     &bpstruct, &error);
 		if (ret <= 0) {
 			errormsg = t_strdup_printf(
 				"Failed to read URLAUTH \"%s\": %s",
@@ -282,8 +284,7 @@ static int
 imap_urlauth_fetch_request_callback(struct imap_urlauth_fetch_reply *reply,
 				    void *context)
 {
-	struct imap_urlauth_fetch *ufetch =
-		(struct imap_urlauth_fetch *)context;
+	struct imap_urlauth_fetch *ufetch = context;
 	struct imap_urlauth_fetch_reply error_reply;
 	int ret = 1;
 

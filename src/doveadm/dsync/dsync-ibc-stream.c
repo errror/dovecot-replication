@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -10,7 +10,7 @@
 #include "ostream.h"
 #include "str.h"
 #include "strescape.h"
-#include "master-service.h"
+#include "version.h"
 #include "mail-cache.h"
 #include "mail-storage-private.h"
 #include "dsync-serializer.h"
@@ -25,14 +25,15 @@
 #define DSYNC_IBC_STREAM_OUTBUF_THROTTLE_SIZE (1024*128)
 
 #define DSYNC_PROTOCOL_VERSION_MAJOR 3
-#define DSYNC_PROTOCOL_VERSION_MINOR 5
-#define DSYNC_HANDSHAKE_VERSION "VERSION\tdsync\t3\t5\n"
+#define DSYNC_PROTOCOL_VERSION_MINOR 6
+#define DSYNC_HANDSHAKE_VERSION "VERSION\tdsync\t3\t6\n"
 
 #define DSYNC_PROTOCOL_MINOR_HAVE_ATTRIBUTES 1
 #define DSYNC_PROTOCOL_MINOR_HAVE_SAVE_GUID 2
 #define DSYNC_PROTOCOL_MINOR_HAVE_FINISH 3
 #define DSYNC_PROTOCOL_MINOR_HAVE_HDR_HASH_V2 4
 #define DSYNC_PROTOCOL_MINOR_HAVE_HDR_HASH_V3 5
+#define DSYNC_PROTOCOL_MINOR_HAVE_BACKUP_FULL_ATTRS 6
 
 enum item_type {
 	ITEM_NONE,
@@ -714,7 +715,7 @@ dsync_ibc_stream_send_handshake(struct dsync_ibc *_ibc,
 	}
 	if (set->sync_until_timestamp > 0) {
 		dsync_serializer_encode_add(encoder, "sync_until_timestamp",
-			t_strdup_printf("%ld", (long)set->sync_since_timestamp));
+			t_strdup_printf("%ld", (long)set->sync_until_timestamp));
 	}
 	if (set->sync_max_size > 0) {
 		dsync_serializer_encode_add(encoder, "sync_max_size",
@@ -886,6 +887,8 @@ dsync_ibc_stream_recv_handshake(struct dsync_ibc *_ibc,
 		set->hashed_headers = (const char*const*)p_strsplit_tabescaped(pool, value);
 	set->hdr_hash_v2 = ibc->minor_version >= DSYNC_PROTOCOL_MINOR_HAVE_HDR_HASH_V2;
 	set->hdr_hash_v3 = ibc->minor_version >= DSYNC_PROTOCOL_MINOR_HAVE_HDR_HASH_V3;
+	set->backup_full_attrs =
+		ibc->minor_version >= DSYNC_PROTOCOL_MINOR_HAVE_BACKUP_FULL_ATTRS;
 
 	*set_r = set;
 	return DSYNC_IBC_RECV_RET_OK;
@@ -1492,12 +1495,12 @@ dsync_ibc_stream_send_mailbox_attribute(struct dsync_ibc *_ibc,
 {
 	struct dsync_ibc_stream *ibc = (struct dsync_ibc_stream *)_ibc;
 	struct dsync_serializer_encoder *encoder;
-	string_t *str = t_str_new(128);
 	char type[2];
 
 	if (ibc->minor_version < DSYNC_PROTOCOL_MINOR_HAVE_ATTRIBUTES)
 		return;
 
+	string_t *str = str_new(default_pool, 128);
 	str_append_c(str, items[ITEM_MAILBOX_ATTRIBUTE].chr);
 	encoder = dsync_ibc_send_encode_begin(ibc, ITEM_MAILBOX_ATTRIBUTE);
 
@@ -1533,11 +1536,12 @@ dsync_ibc_stream_send_mailbox_attribute(struct dsync_ibc *_ibc,
 	dsync_ibc_stream_send_string(ibc, str);
 
 	if (attr->value_stream != NULL) {
-		ibc->value_output_last = '\0';
+		ibc->value_output_last = '\n';
 		ibc->value_output = attr->value_stream;
 		i_stream_ref(ibc->value_output);
 		(void)dsync_ibc_stream_send_value_stream(ibc);
 	}
+	str_free(&str);
 }
 
 static enum dsync_ibc_recv_ret
@@ -1912,7 +1916,7 @@ dsync_ibc_stream_send_mail(struct dsync_ibc *_ibc,
 	dsync_ibc_stream_send_string(ibc, str);
 
 	if (mail->input != NULL) {
-		ibc->value_output_last = '\0';
+		ibc->value_output_last = '\n';
 		ibc->value_output = mail->input;
 		i_stream_ref(ibc->value_output);
 		(void)dsync_ibc_stream_send_value_stream(ibc);

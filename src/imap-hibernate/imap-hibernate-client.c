@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "connection.h"
@@ -11,6 +11,10 @@
 #include "master-service.h"
 #include "imap-client.h"
 #include "imap-hibernate-client.h"
+
+#if defined(HAVE_SYS_MKDEV_H)
+#  include <sys/mkdev.h> /* Solaris */
+#endif
 
 struct imap_hibernate_client {
 	struct connection conn;
@@ -35,8 +39,17 @@ static void imap_hibernate_client_destroy(struct connection *conn)
 
 	if (!client->imap_client_created)
 		master_service_client_connection_destroyed(master_service);
-	else if (client->finished)
-		imap_client_create_finish(client->imap_client);
+	else if (client->imap_client != NULL) {
+		imap_client_set_destroy_ref(client->imap_client, NULL);
+		if (client->finished)
+			imap_client_create_finish(client->imap_client);
+		else {
+			/* The imap process disconnected before it had sent
+			   all of the fds. The client can't be hibernated. */
+			imap_client_destroy(&client->imap_client,
+				"Hibernation failed: imap process disconnected too early");
+		}
+	}
 	connection_deinit(conn);
 	i_free(conn);
 }
@@ -125,6 +138,10 @@ imap_hibernate_client_parse_input(const char *const *args, pool_t pool,
 			}
 		} else if (strcmp(key, "stats") == 0) {
 			state_r->stats = value;
+		} else if (strcmp(key, "auth_token") == 0) {
+			state_r->auth_token = value;
+		} else if (strcmp(key, "session_pid") == 0) {
+			state_r->session_pid = value;
 		} else if (strcmp(key, "idle-cmd") == 0) {
 			state_r->idle_cmd = TRUE;
 		} else if (strcmp(key, "session") == 0) {
@@ -256,6 +273,9 @@ imap_hibernate_client_input_args(struct connection *conn,
 		return -1;
 	}
 	client->imap_client = imap_client_create(fd, &state);
+	/* the client can be destroyed already before it's finished, e.g. if
+	   the user is kicked. make sure our pointer is set to NULL then. */
+	imap_client_set_destroy_ref(client->imap_client, &client->imap_client);
 	/* the transferred imap client fd is now counted as the client. */
 	client->imap_client_created = TRUE;
 	return state.have_notify_fd ? 0 : 1;

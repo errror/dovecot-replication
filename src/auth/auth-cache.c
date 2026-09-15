@@ -1,12 +1,12 @@
-/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "array.h"
-#include "lib-signals.h"
 #include "hash.h"
 #include "str.h"
 #include "strescape.h"
 #include "var-expand.h"
+#include "wildcard-match.h"
 #include "auth-request.h"
 #include "auth-cache.h"
 
@@ -64,8 +64,10 @@ static void auth_cache_key_add_tab_idx(string_t *str, unsigned int i)
 	str_append_c(str, '}');
 }
 
-static char *auth_cache_parse_key_exclude(pool_t pool, const char *query,
-					  const char *exclude_driver)
+static int auth_cache_parse_key_exclude(pool_t pool, const char *query,
+					const char *exclude_driver,
+					const char **cache_key_r,
+					const char **error_r)
 {
 	string_t *str;
 	bool key_seen[AUTH_REQUEST_VAR_TAB_COUNT];
@@ -76,13 +78,20 @@ static char *auth_cache_parse_key_exclude(pool_t pool, const char *query,
 
 	struct var_expand_program *prog;
 	if (var_expand_program_create(query, &prog, &error) < 0) {
-		e_debug(auth_event, "auth-cache: var_expand_program_create('%s') failed: %s",
-			query, error);
-		return p_strdup(pool, "");
+		*error_r = t_strdup_printf("var_expand_program_create(%s) failed: %s",
+					   query, error);
+		return -1;
 	}
 
 	const char *const *vars = var_expand_program_variables(prog);
 	str = t_str_new(32);
+
+	if (*vars == NULL && *query != '\0') {
+		var_expand_program_free(&prog);
+		*error_r = t_strdup_printf("%s: Cache key must contain at least one variable",
+					   query);
+		return -1;
+	}
 
 	for (; *vars != NULL; vars++) {
 		/* ignore any providers */
@@ -117,32 +126,35 @@ static char *auth_cache_parse_key_exclude(pool_t pool, const char *query,
 
 	var_expand_program_free(&prog);
 
-	return p_strdup(pool, str_c(str));
+	*cache_key_r = p_strdup(pool, str_c(str));
+	return 0;
 }
 
-char *auth_cache_parse_key(pool_t pool, const char *query)
+int auth_cache_parse_key_and_fields(pool_t pool, const char *query,
+				    const ARRAY_TYPE(const_string) *fields,
+				    const char *exclude_driver,
+				    const char **cache_key_r,
+				    const char **error_r)
 {
-	return auth_cache_parse_key_exclude(pool, query, NULL);
-}
-
-char *auth_cache_parse_key_and_fields(pool_t pool, const char *query,
-				      const ARRAY_TYPE(const_string) *fields,
-				      const char *exclude_driver)
-{
-	if (array_is_empty(fields))
-		return auth_cache_parse_key_exclude(pool, query, exclude_driver);
-
-	string_t *full_query = t_str_new(128);
-	str_append(full_query, query);
-
-	unsigned int i, count;
-	const char *const *str = array_get(fields, &count);
-	for (i = 0; i < count; i += 2) {
-		str_append_c(full_query, '\t');
-		str_append(full_query, str[i + 1]);
+	if (fields != NULL && !array_is_empty(fields)) {
+		unsigned int i, count;
+		const char *const *str = array_get(fields, &count);
+		string_t *full_query = t_str_new(128);
+		str_append(full_query, query);
+		for (i = 0; i < count; i += 2) {
+			str_append_c(full_query, '\t');
+			str_append(full_query, str[i + 1]);
+		}
+		query = str_c(full_query);
 	}
-	return auth_cache_parse_key_exclude(pool, str_c(full_query),
-					    exclude_driver);
+
+	const char *error;
+	if (auth_cache_parse_key_exclude(pool, query, exclude_driver,
+					 cache_key_r, &error) < 0) {
+		*error_r = t_strdup_printf("auth-cache: %s", error);
+		return -1;
+	}
+	return 0;
 }
 
 static void
@@ -189,43 +201,6 @@ auth_cache_node_destroy(struct auth_cache *cache, struct auth_cache_node *node)
 	i_free(node);
 }
 
-static void sig_auth_cache_clear(const siginfo_t *si ATTR_UNUSED, void *context)
-{
-	struct auth_cache *cache = context;
-
-	e_info(cache->event, "SIGHUP received, %u cache entries flushed",
-	       auth_cache_clear(cache));
-}
-
-static void sig_auth_cache_stats(const siginfo_t *si ATTR_UNUSED, void *context)
-{
-	struct auth_cache *cache = context;
-	unsigned int total_count;
-	size_t cache_used;
-
-	total_count = cache->hit_count + cache->miss_count;
-	e_info(cache->event, "Authentication cache hits %u/%u (%u%%)",
-	       cache->hit_count, total_count,
-	       total_count == 0 ? 100 : (cache->hit_count * 100 / total_count));
-
-	e_info(cache->event, "Authentication cache inserts: "
-	       "positive: %u entries %llu bytes, "
-	       "negative: %u entries %llu bytes",
-	       cache->pos_entries, cache->pos_size,
-	       cache->neg_entries, cache->neg_size);
-
-	cache_used = cache->max_size - cache->size_left;
-	e_info(cache->event, "Authentication cache current size: "
-	       "%zu bytes used of %zu bytes (%u%%)",
-	       cache_used, cache->max_size,
-	       (unsigned int)(cache_used * 100ULL / cache->max_size));
-
-	/* reset counters */
-	cache->hit_count = cache->miss_count = 0;
-	cache->pos_entries = cache->neg_entries = 0;
-	cache->pos_size = cache->neg_size = 0;
-}
-
 struct auth_cache *auth_cache_new(size_t max_size, unsigned int ttl_secs,
 				  unsigned int neg_ttl_secs
 )
@@ -240,10 +215,6 @@ struct auth_cache *auth_cache_new(size_t max_size, unsigned int ttl_secs,
 	cache->neg_ttl_secs = neg_ttl_secs;
 	cache->event = event_create(auth_event);
 
-	lib_signals_set_handler(SIGHUP, LIBSIG_FLAGS_SAFE,
-				sig_auth_cache_clear, cache);
-	lib_signals_set_handler(SIGUSR2, LIBSIG_FLAGS_SAFE,
-				sig_auth_cache_stats, cache);
 	return cache;
 }
 
@@ -252,13 +223,32 @@ void auth_cache_free(struct auth_cache **_cache)
 	struct auth_cache *cache = *_cache;
 
 	*_cache = NULL;
-	lib_signals_unset_handler(SIGHUP, sig_auth_cache_clear, cache);
-	lib_signals_unset_handler(SIGUSR2, sig_auth_cache_stats, cache);
 
 	auth_cache_clear(cache);
 	hash_table_destroy(&cache->hash);
 	event_unref(&cache->event);
 	i_free(cache);
+}
+
+void auth_cache_get_status(const struct auth_cache *cache,
+			   struct auth_cache_status *status_r)
+{
+	i_zero(status_r);
+	status_r->hit_count = cache->hit_count;
+	status_r->miss_count = cache->miss_count;
+	status_r->pos_entries = cache->pos_entries;
+	status_r->neg_entries = cache->neg_entries;
+	status_r->pos_size = cache->pos_size;
+	status_r->neg_size = cache->neg_size;
+	status_r->max_size = cache->max_size;
+	status_r->used_size = cache->max_size - cache->size_left;
+}
+
+void auth_cache_reset_counters(struct auth_cache *cache)
+{
+	cache->hit_count = cache->miss_count = 0;
+	cache->pos_entries = cache->neg_entries = 0;
+	cache->pos_size = cache->neg_size = 0;
 }
 
 unsigned int auth_cache_clear(struct auth_cache *cache)
@@ -272,9 +262,10 @@ unsigned int auth_cache_clear(struct auth_cache *cache)
 }
 
 static bool auth_cache_node_is_user(struct auth_cache_node *node,
-				    const char *username)
+				    const char *user_mask)
 {
-	const char *data = node->data, *suffix;
+	const char *data = node->data;
+	bool ret = FALSE;
 
 	/* The cache nodes begin with "P"/"U", passdb/userdb ID, optional
 	   "+" master user, "\t" and then usually followed by the username.
@@ -283,7 +274,7 @@ static bool auth_cache_node_is_user(struct auth_cache_node *node,
 	   cache key instead of '%u', it means that cache entries can be
 	   removed only when @domain isn't in the username parameter. */
 	if (*data != 'P' && *data != 'U')
-		return FALSE;
+		return ret;
 	data++;
 
 	while (*data >= '0' && *data <= '9')
@@ -294,34 +285,36 @@ static bool auth_cache_node_is_user(struct auth_cache_node *node,
 			data++;
 	}
 	if (*data != '\t')
-		return FALSE;
+		return ret;
 	data++;
 
-	return str_begins(data, username, &suffix) &&
-		(suffix[0] == '\t' || suffix[0] == '\0');
+	T_BEGIN {
+		ret = wildcard_match(t_strcut(data, '\t'), user_mask);
+	} T_END;
+	return ret;
 }
 
 static bool auth_cache_node_is_one_of_users(struct auth_cache_node *node,
-					    const char *const *usernames)
+					    const char *const *user_masks)
 {
 	unsigned int i;
 
-	for (i = 0; usernames[i] != NULL; i++) {
-		if (auth_cache_node_is_user(node, usernames[i]))
+	for (i = 0; user_masks[i] != NULL; i++) {
+		if (auth_cache_node_is_user(node, user_masks[i]))
 			return TRUE;
 	}
 	return FALSE;
 }
 
 unsigned int auth_cache_clear_users(struct auth_cache *cache,
-				    const char *const *usernames)
+				    const char *const *user_masks)
 {
 	struct auth_cache_node *node, *next;
 	unsigned int ret = 0;
 
 	for (node = cache->tail; node != NULL; node = next) {
 		next = node->next;
-		if (auth_cache_node_is_one_of_users(node, usernames)) {
+		if (auth_cache_node_is_one_of_users(node, user_masks)) {
 			auth_cache_node_destroy(cache, node);
 			ret++;
 		}
@@ -344,6 +337,8 @@ auth_request_expand_cache_key(const struct auth_request *request,
 {
 	static bool error_logged = FALSE;
 	const char *error;
+
+	i_assert(key != NULL);
 
 	/* Uniquely identify the request's passdb/userdb with the P/U prefix
 	   and by "%{id}", which expands to the passdb/userdb ID number. */
@@ -474,7 +469,7 @@ void auth_cache_remove(struct auth_cache *cache,
 {
 	struct auth_cache_node *node;
 
-	key = auth_request_expand_cache_key(request, key, request->fields.user);
+	key = auth_request_expand_cache_key(request, key, request->fields.translated_username);
 	node = hash_table_lookup(cache->hash, key);
 	if (node == NULL)
 		return;

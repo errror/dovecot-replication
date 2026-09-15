@@ -1,13 +1,12 @@
-/* Copyright (c) 2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "test-common.h"
+#include "test-dir.h"
 #include "istream.h"
 #include "master-service.h"
 #include "message-size.h"
 #include "test-mail-storage-common.h"
-
-static struct event *test_event;
 
 static int
 test_mail_save_trans(struct mailbox_transaction_context *trans,
@@ -748,11 +747,10 @@ int main(int argc, char **argv)
 					     MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME,
 					     &argc, &argv, "");
 
-	test_event = event_create(NULL);
 	if (null_strcmp(argv[1], "-D") == 0)
 		event_set_forced_debug(test_event, TRUE);
+	test_dir_init("test-mail");
 	ret = test_run(tests);
-	event_unref(&test_event);
 	master_service_deinit(&master_service);
 	return ret;
 }

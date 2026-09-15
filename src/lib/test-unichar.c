@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-lib.h"
 #include "str.h"
@@ -121,12 +121,102 @@ static void test_unichar_surrogates(void)
 	test_end();
 }
 
+static void test_unichar_collation(void)
+{
+	const char *in[] = {
+		/* Plain ASCII letters will be upper-cased */
+		"Plain!",
+		/* U+00FC " " U+00B3 */
+		"\xc3\xbc \xc2\xb3",
+		/* U+01C4 "enan" */
+		"\xC7\x84\x65\x6E\x61\x6E",
+		/* Bad characters will be substituted with replacement character */
+		"Bad \xFF Characters",
+		/* "c" U+00F4 "t" U+00E9 */
+		"c\xC3\xB4t\xC3\xA9",
+	};
+	const char *exp[] = {
+		/* Plain ASCII letters are upper-cased */
+		"PLAIN!",
+		/* "U" U+0308 " 3" */
+		"U\xcc\x88 3",
+		/* "Dz" U+030C "ENAN" */
+		"\x44\x7A\xCC\x8C\x45\x4E\x41\x4E",
+		/* Bad characters are substituted with replacement character */
+		"BAD \xEF\xBF\xBD CHARACTERS",
+		/* "CO" U+0302 "TE" U+0301 */
+		"CO\xCC\x82TE\xCC\x81",
+	};
+
+	unsigned int n_in = N_ELEMENTS(in), n_exp = N_ELEMENTS(exp), i;
+	buffer_t *collate_out;
+
+	i_assert(n_in == n_exp);
+
+	test_begin("unichar collation");
+
+	collate_out = buffer_create_dynamic(default_pool, 32);
+
+	for (i = 0; i < n_in; i++) {
+		buffer_set_used_size(collate_out, 0);
+		uni_utf8_to_decomposed_titlecase(in[i], strlen(in[i]),
+						 collate_out);
+		test_assert_strcmp_idx(str_c(collate_out), exp[i], i);
+	}
+
+	buffer_free(&collate_out);
+	test_end();
+}
+
+static void test_unichar_grapheme_clusters(void)
+{
+	const char *in[] = {
+		/* Simple ASCII */
+		"frop",
+		/* U+1019 U+1039 U+1018 U+102C U+1037 */
+		"\xE1\x80\x99\xE1\x80\xB9\xE1\x80\x98\xE1\x80\xAC\xE1\x80\xB7"
+	};
+	/* Use TAB to mark grapheme boundaries */
+	const char *tb[] = {
+		/* Simple ASCII: break points after every byte */
+		"f\tr\to\tp\t",
+		/* U+1019 U+1039 U+1018 U+102C U+1037 */
+		"\xE1\x80\x99\xE1\x80\xB9\xE1\x80\x98\t\xE1\x80\xAC\xE1\x80\xB7\t",
+	};
+	unsigned int n_in = N_ELEMENTS(in), n_tb = N_ELEMENTS(tb), i;
+
+	i_assert(n_in == n_tb);
+
+	test_begin("unichar grapheme clusters");
+
+	string_t *tb_buf = t_str_new(256);
+	for (i = 0; i < n_in; i++) {
+		struct uni_gc_scanner gcsc;
+
+		str_truncate(tb_buf, 0);
+		uni_gc_scanner_init(&gcsc, in[i], strlen(in[i]));
+
+		while (!uni_gc_scan_at_end(&gcsc)) {
+			const unsigned char *gc;
+			size_t gc_size;
+
+			gc = uni_gc_scan_get(&gcsc, &gc_size);
+			if (gc_size == 0)
+				break;
+
+			str_append_data(tb_buf, gc, gc_size);
+			str_append_c(tb_buf, '\t');
+			uni_gc_scan_shift(&gcsc);
+		}
+
+		test_assert_strcmp_idx(str_c(tb_buf), tb[i], i);
+	}
+	test_end();
+}
+
 void test_unichar(void)
 {
 	static const char overlong_utf8[] = "\xf8\x80\x95\x81\xa1";
-	static const char collate_in[] = "\xc3\xbc \xc2\xb3";
-	static const char collate_exp[] = "U\xcc\x88 3";
-	buffer_t *collate_out;
 	unichar_t chr, chr2;
 	string_t *str = t_str_new(16);
 
@@ -167,13 +257,9 @@ void test_unichar(void)
 	}
 	test_end();
 
-	test_begin("unichar collation");
-	collate_out = buffer_create_dynamic(default_pool, 32);
-	uni_utf8_to_decomposed_titlecase(collate_in, sizeof(collate_in),
-					 collate_out);
-	test_assert(strcmp(collate_out->data, collate_exp) == 0);
-	buffer_free(&collate_out);
+	test_unichar_collation();
 
+	test_begin("unichar overlong");
 	test_assert(!uni_utf8_str_is_valid(overlong_utf8));
 	test_assert(uni_utf8_get_char(overlong_utf8, &chr2) < 0);
 	test_end();
@@ -182,4 +268,6 @@ void test_unichar(void)
 	test_unichar_uni_utf8_partial_strlen_n();
 	test_unichar_valid_unicode();
 	test_unichar_surrogates();
+
+	test_unichar_grapheme_clusters();
 }

@@ -4,6 +4,8 @@
 #include "iostream-ssl.h"
 
 struct dsasl_client_settings {
+	struct event *event_parent;
+
 	/* authentication ID - must be set with most mechanisms */
 	const char *authid;
 	/* authorization ID (who to log in as, if authentication ID is a
@@ -11,6 +13,24 @@ struct dsasl_client_settings {
 	const char *authzid;
 	/* password - must be set with most mechanisms */
 	const char *password;
+
+	/* protocol using SASL */
+	const char *protocol;
+	/* host name */
+	const char *host;
+	/* port */
+	in_port_t port;
+};
+
+enum dsasl_client_result {
+	DSASL_CLIENT_RESULT_OK,
+	/* The final response from server returned a failed authentication.
+	   The error string contains details. */
+	DSASL_CLIENT_RESULT_AUTH_FAILED,
+	/* Remote server sent invalid SASL protocol input */
+	DSASL_CLIENT_RESULT_ERR_PROTOCOL,
+	/* Internal client error */
+	DSASL_CLIENT_RESULT_ERR_INTERNAL,
 };
 
 typedef int
@@ -36,14 +56,16 @@ void dsasl_client_enable_channel_binding(
 	dsasl_client_channel_binding_callback_t *callback, void *context);
 
 /* Call for server input. */
-int dsasl_client_input(struct dsasl_client *client,
-		       const unsigned char *input, size_t input_len,
-		       const char **error_r);
+enum dsasl_client_result
+dsasl_client_input(struct dsasl_client *client,
+		   const unsigned char *input, size_t input_len,
+		   const char **error_r);
 /* Call for getting server output. Also used to get the initial SASL response
    if supported by the protocol. */
-int dsasl_client_output(struct dsasl_client *client,
-			const unsigned char **output_r, size_t *output_len_r,
-			const char **error_r);
+enum dsasl_client_result
+dsasl_client_output(struct dsasl_client *client,
+		    const unsigned char **output_r, size_t *output_len_r,
+		    const char **error_r);
 
 /* Call for setting extra parameters for authentication, these are mechanism
    dependent. -1 = error, 0 = not found, 1 = ok
@@ -60,5 +82,7 @@ int dsasl_client_get_result(struct dsasl_client *client,
 
 void dsasl_clients_init(void);
 void dsasl_clients_deinit(void);
+
+void dsasl_clients_init_gssapi(void);
 
 #endif

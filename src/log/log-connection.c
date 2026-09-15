@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -507,7 +507,7 @@ log_connection_destroy(struct log_connection *log, bool shutting_down)
 
 	iter = hash_table_iterate_init(log->clients);
 	while (hash_table_iterate(iter, log->clients, &key, &client)) {
-		i_free(client);
+		log_client_free(log, client, POINTER_CAST_TO(key, pid_t));
 		client_count++;
 	}
 	hash_table_iterate_deinit(&iter);

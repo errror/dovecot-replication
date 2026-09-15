@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,6 +7,7 @@
 #include "str-parse.h"
 #include "read-full.h"
 #include "var-expand.h"
+#include "unichar.h"
 #include "settings-parser.h"
 
 #include <sys/stat.h>
@@ -34,7 +35,7 @@ struct setting_parser_context {
 
 const char *set_value_unknown = "UNKNOWN_VALUE_WITH_VARIABLES";
 
-#ifdef DEBUG
+#ifdef DEBUG_FAST
 static const char *boollist_eol_sentry = "boollist-eol";
 #endif
 static const char *set_array_stop = "array-stop";
@@ -277,7 +278,7 @@ get_file(struct setting_parser_context *ctx, bool dup_value, const char **value)
 
 	const char *error;
 	if (settings_parse_read_file(*value, *value, ctx->set_pool, NULL,
-				     value, &error) < 0) {
+				     "", value, &error) < 0) {
 		settings_parser_set_error(ctx, error);
 		return -1;
 	}
@@ -298,7 +299,8 @@ get_in_port_zero(struct setting_parser_context *ctx, const char *value,
 
 int settings_parse_read_file(const char *path, const char *value_path,
 			     pool_t pool, struct stat *st_r,
-			     const char **output_r, const char **error_r)
+			     const char *prefix, const char **output_r,
+			     const char **error_r)
 {
 	struct stat st;
 	int fd;
@@ -312,12 +314,17 @@ int settings_parse_read_file(const char *path, const char *value_path,
 		i_close_fd(&fd);
 		return -1;
 	}
+	size_t prefix_len = strlen(prefix);
 	size_t value_path_len = strlen(value_path);
-	char *buf = p_malloc(pool, value_path_len + 1 + st.st_size + 1);
-	memcpy(buf, value_path, value_path_len);
-	buf[value_path_len] = '\n';
+	size_t buf_size = MALLOC_ADD3(prefix_len, value_path_len, 1);
+	buf_size = MALLOC_ADD3(buf_size, (size_t)st.st_size, 1);
+	char *buf = p_malloc(pool, buf_size);
+	memcpy(buf, prefix, prefix_len);
+	memcpy(buf + prefix_len, value_path, value_path_len);
+	buf[prefix_len + value_path_len] = '\n';
 
-	int ret = read_full(fd, buf + value_path_len + 1, st.st_size);
+	int ret = read_full(fd, buf + prefix_len + value_path_len + 1,
+			    st.st_size);
 	i_close_fd(&fd);
 	if (ret < 0) {
 		*error_r = t_strdup_printf("read(%s) failed: %m", path);
@@ -328,7 +335,7 @@ int settings_parse_read_file(const char *path, const char *value_path,
 			"read(%s) failed: Unexpected EOF", path);
 		return -1;
 	}
-	if (memchr(buf + value_path_len + 1, '\0', st.st_size) != NULL) {
+	if (memchr(buf + prefix_len + value_path_len + 1, '\0', st.st_size) != NULL) {
 		*error_r = t_strdup_printf(
 			"%s contains NUL characters - This is not supported",
 			path);
@@ -471,7 +478,7 @@ const char *const *settings_boollist_get(const ARRAY_TYPE(const_string) *array)
 	if (array_not_empty(array)) {
 		strings = array_get(array, &count);
 		i_assert(strings[count] == NULL);
-#ifdef DEBUG
+#ifdef DEBUG_FAST
 	i_assert(strings[count+1] == boollist_eol_sentry ||
 		 (strings[count+1] == set_array_stop &&
 		  strings[count+2] == boollist_eol_sentry));
@@ -514,8 +521,10 @@ const char *settings_file_get_value(pool_t pool,
 	const char *path = file->path != NULL ? file->path : "";
 	size_t path_len = strlen(path);
 	size_t content_len = strlen(file->content);
+	size_t value_size = MALLOC_ADD3(path_len, 1, content_len);
+	value_size = MALLOC_ADD(value_size, 1);
 
-	char *value = p_malloc(pool, path_len + 1 + content_len + 1);
+	char *value = p_malloc(pool, value_size);
 	memcpy(value, path, path_len);
 	value[path_len] = '\n';
 	memcpy(value + path_len + 1, file->content, content_len);
@@ -527,7 +536,7 @@ void settings_boollist_finish(ARRAY_TYPE(const_string) *array, bool stop)
 	array_append_zero(array);
 	if (stop)
 		array_push_back(array, &set_array_stop);
-#ifdef DEBUG
+#ifdef DEBUG_FAST
 	array_push_back(array, &boollist_eol_sentry);
 	array_pop_back(array);
 #endif
@@ -683,6 +692,17 @@ settings_parse(struct setting_parser_context *ctx,
 		break;
 	case SET_STR:
 	case SET_STR_NOVARS:
+	case SET_PATH_FILE:
+	case SET_PATH_DIR:
+		if (HAS_ANY_BITS(def->flags, SET_FLAG_UNICODE_NFC) &&
+		    value != set_value_unknown) {
+			if (uni_utf8_to_nfc(value, strlen(value), &value) < 0) {
+				settings_parser_set_error(ctx,
+					"Value contains invalid Unicode code point");
+				return -1;
+			}
+			dup_value = TRUE;
+		}
 		if (dup_value)
 			value = p_strdup(ctx->set_pool, value);
 		*((const char **)ptr) = value;
@@ -1019,6 +1039,8 @@ unsigned int settings_hash(const struct setting_parser_info *info,
 		}
 		case SET_STR:
 		case SET_STR_NOVARS:
+		case SET_PATH_FILE:
+		case SET_PATH_DIR:
 		case SET_ENUM: {
 			const char *const *str = p;
 			crc = crc32_str_more(crc, *str);
@@ -1104,6 +1126,8 @@ bool settings_equal(const struct setting_parser_info *info,
 		}
 		case SET_STR:
 		case SET_STR_NOVARS:
+		case SET_PATH_FILE:
+		case SET_PATH_DIR:
 		case SET_ENUM:
 		case SET_FILE: {
 			const char *const *str1 = p1, *const *str2 = p2;

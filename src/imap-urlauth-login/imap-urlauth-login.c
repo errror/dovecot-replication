@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "str.h"
@@ -8,7 +8,7 @@
 #include "ioloop.h"
 #include "istream.h"
 #include "ostream.h"
-#include "master-service.h"
+#include "version.h"
 #include "auth-client.h"
 #include "client-common.h"
 
@@ -108,8 +108,8 @@ static void imap_urlauth_client_handle_input(struct client *client)
 		base64_encode(str_data(auth_data),
 			      str_len(auth_data), init_resp);
 
-		(void)client_auth_begin_private(client, "DOVECOT-TOKEN",
-						str_c(init_resp));
+		(void)client_auth_begin_private(client,
+			AUTH_SASL_MECH_NAME_DOVECOT_TOKEN, str_c(init_resp));
 	} T_END;
 }
 
@@ -187,6 +187,7 @@ static struct client_vfuncs imap_urlauth_vfuncs = {
 
 static struct login_binary imap_urlauth_login_binary = {
 	.protocol = "imap-urlauth",
+	.service_name = "imap-urlauth",
 	.process_name = "imap-urlauth-login",
 	.default_login_socket = LOGIN_TOKEN_DEFAULT_SOCKET,
 

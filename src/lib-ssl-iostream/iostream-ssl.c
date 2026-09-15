@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "module-dir.h"
@@ -53,6 +53,17 @@ int io_stream_ssl_global_init(const struct ssl_iostream_settings *set,
 			      const char **error_r)
 {
 	return ssl_vfuncs->global_init(set, error_r);
+}
+
+int ssl_iostream_get_default_ca_paths(const char **file_r, const char **dir_r,
+				      const char **error_r)
+{
+	*file_r = NULL;
+	*dir_r = NULL;
+	if (!ssl_module_loaded && ssl_module_load(error_r) < 0)
+		return -1;
+	ssl_vfuncs->get_default_ca_paths(file_r, dir_r);
+	return 0;
 }
 
 int ssl_iostream_context_init_client(const struct ssl_iostream_settings *set,
@@ -258,24 +269,25 @@ void ssl_iostream_change_context(struct ssl_iostream *ssl_io,
 	ssl_vfuncs->change_context(ssl_io, ctx);
 }
 
+enum ssl_iostream_state
+ssl_iostream_get_state(const struct ssl_iostream *ssl_io)
+{
+	return ssl_vfuncs->get_state(ssl_io);
+}
+
 bool ssl_iostream_is_handshaked(const struct ssl_iostream *ssl_io)
 {
-	return ssl_vfuncs->is_handshaked(ssl_io);
+	return ssl_iostream_get_state(ssl_io) == SSL_IOSTREAM_STATE_OK;
 }
 
-bool ssl_iostream_has_handshake_failed(const struct ssl_iostream *ssl_io)
+bool ssl_iostream_has_valid_cert(const struct ssl_iostream *ssl_io)
 {
-	return ssl_vfuncs->has_handshake_failed(ssl_io);
+	return ssl_vfuncs->get_cert_validity(ssl_io) == SSL_IOSTREAM_CERT_VALIDITY_OK;
 }
 
-bool ssl_iostream_has_valid_client_cert(const struct ssl_iostream *ssl_io)
+bool ssl_iostream_has_cert(struct ssl_iostream *ssl_io)
 {
-	return ssl_vfuncs->has_valid_client_cert(ssl_io);
-}
-
-bool ssl_iostream_has_client_cert(struct ssl_iostream *ssl_io)
-{
-	return ssl_vfuncs->has_client_cert(ssl_io);
+	return ssl_vfuncs->get_cert_validity(ssl_io) != SSL_IOSTREAM_CERT_VALIDITY_NO_CERT;
 }
 
 bool ssl_iostream_cert_match_name(struct ssl_iostream *ssl_io, const char *name,
@@ -284,27 +296,29 @@ bool ssl_iostream_cert_match_name(struct ssl_iostream *ssl_io, const char *name,
 	return ssl_vfuncs->cert_match_name(ssl_io, name, reason_r);
 }
 
-int ssl_iostream_check_cert_validity(struct ssl_iostream *ssl_io,
-				     const char *host, const char **error_r)
+enum ssl_iostream_cert_validity
+ssl_iostream_check_cert_validity(struct ssl_iostream *ssl_io,
+				 const char *host, const char **error_r)
 {
 	const char *reason;
 
-	if (!ssl_iostream_has_valid_client_cert(ssl_io)) {
-		if (!ssl_iostream_has_client_cert(ssl_io))
+	if (!ssl_iostream_has_valid_cert(ssl_io)) {
+		if (!ssl_iostream_has_cert(ssl_io)) {
 			*error_r = "SSL certificate not received";
-		else {
+			return SSL_IOSTREAM_CERT_VALIDITY_NO_CERT;
+		} else {
 			*error_r = t_strdup(ssl_iostream_get_last_error(ssl_io));
 			if (*error_r == NULL)
 				*error_r = "Received invalid SSL certificate";
+			return SSL_IOSTREAM_CERT_VALIDITY_INVALID;
 		}
-		return -1;
 	} else if (!ssl_iostream_cert_match_name(ssl_io, host, &reason)) {
 		*error_r = t_strdup_printf(
 			"SSL certificate doesn't match expected host name %s: %s",
 			host, reason);
-		return -1;
+		return SSL_IOSTREAM_CERT_VALIDITY_NAME_MISMATCH;
 	}
-	return 0;
+	return SSL_IOSTREAM_CERT_VALIDITY_OK;
 }
 
 bool ssl_iostream_get_allow_invalid_cert(struct ssl_iostream *ssl_io)

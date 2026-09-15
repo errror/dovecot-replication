@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -240,7 +240,8 @@ program_client_istream_create(struct program_client *program_client,
 	i_stream_seek(input, 0);
 
 	return i_stream_create(&scstream->istream, input,
-			       i_stream_get_fd(input), 0);
+			       i_stream_get_fd(input),
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }
 
 /*
@@ -527,7 +528,7 @@ static int program_client_net_connect_init(struct program_client *pclient)
 		if (pclient->params.dns_client_socket_path != NULL) {
 			e_debug(pclient->event,
 				"Performing asynchronous DNS lookup");
-			(void)dns_lookup(prclient->address, NULL,
+			dns_lookup(prclient->address, NULL,
 					 pclient->event,
 					 program_client_net_connect_resolved,
 					 prclient, &prclient->lookup);

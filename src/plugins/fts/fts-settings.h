@@ -1,6 +1,7 @@
 #ifndef FTS_SETTINGS_H
 #define FTS_SETTINGS_H
 
+#include "settings-consts.h"
 
 /* <settings checks> */
 #define FTS_FILTER		"fts"

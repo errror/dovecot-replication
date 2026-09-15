@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -90,6 +90,14 @@ virtual_storage_create(struct mail_storage *_storage,
 		       struct mail_namespace *ns ATTR_UNUSED,
 		       const char **error_r)
 {
+	const char *layout = ns->list->name;
+	if (strcasecmp(layout, "index") == 0) {
+		*error_r = t_strdup_printf(
+			"mailbox_list_layout: '%s' "
+			"cannot be used in virtual storages", layout);
+		return -1;
+	}
+
 	struct virtual_storage *storage =
 		container_of(_storage, struct virtual_storage, storage);
 	const struct virtual_settings *set;
@@ -662,6 +670,7 @@ virtual_mailbox_get_metadata(struct mailbox *box,
 static void
 virtual_notify_callback(struct mailbox *bbox ATTR_UNUSED, struct mailbox *box)
 {
+	i_assert(box->notify_callback != NULL);
 	box->notify_callback(box, box->notify_context);
 }
 
@@ -917,14 +926,10 @@ struct mail_storage virtual_storage = {
 		       MAIL_STORAGE_CLASS_FLAG_SECONDARY_INDEX,
 
 	.v = {
-		virtual_storage_alloc,
-		virtual_storage_create,
-		index_storage_destroy,
-		NULL,
-		NULL,
-		virtual_mailbox_alloc,
-		NULL,
-		NULL,
+		.alloc = virtual_storage_alloc,
+		.create = virtual_storage_create,
+		.destroy = index_storage_destroy,
+		.mailbox_alloc = virtual_mailbox_alloc,
 	}
 };
 

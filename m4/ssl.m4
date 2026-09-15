@@ -38,6 +38,9 @@ AC_DEFUN([DOVECOT_SSL], [
     ])
   ])
 
+  old_CFLAGS="$CFLAGS"
+  CFLAGS="$old_CFLAGS $SSL_CFLAGS"
+
   AC_MSG_CHECKING([if OpenSSL version is 1.1.1 or better])
 
   AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
@@ -70,7 +73,6 @@ AC_DEFUN([DOVECOT_SSL], [
     SSL_CFLAGS="$SSL_CFLAGS -DOPENSSL_NO_DEPRECATED -DOPENSSL_API_COMPAT=0x1000200L"
   ])
 
-  old_CFLAGS="$CFLAGS"
   CFLAGS="$old_CFLAGS $SSL_CFLAGS"
 
   dnl * New style mem functions? Should be in v1.1+
@@ -106,6 +108,7 @@ AC_DEFUN([DOVECOT_SSL], [
 
   dnl LibreSSL
   DOVECOT_CHECK_SSL_FUNC([EVP_PKEY_check])
+
   DOVECOT_CHECK_SSL_FUNC([OPENSSL_buf2hexstr])
   DOVECOT_CHECK_SSL_FUNC([SSL_get1_peer_certificate])
   DOVECOT_CHECK_SSL_FUNC([SSL_CTX_set_client_hello_cb])

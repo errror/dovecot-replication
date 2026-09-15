@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -81,10 +81,11 @@ usage_commands_write(FILE *out, const ARRAY_TYPE(doveadm_cmd_ver2_p) *cmds,
 			if (strcmp(prev_name, short_name) != 0) {
 				if (*prev_name != '\0')
 					fprintf(out, "\n");
+				sub_name = t_strcut(p + 1, ' ');
 				fprintf(out, USAGE_CMDNAME_FMT" %s",
-					short_name, t_strcut(p + 1, ' '));
+					short_name, sub_name);
 				prev_name = short_name;
-				prev_sub_name = "";
+				prev_sub_name = sub_name;
 			} else {
 				sub_name = t_strcut(p + 1, ' ');
 				if (strcmp(prev_sub_name, sub_name) != 0) {
@@ -252,6 +253,25 @@ static bool doveadm_has_subcommands(const char *cmd_name)
 	return FALSE;
 }
 
+static const char *
+find_longest_cmd_prefix(char *const argv[])
+{
+	string_t *prefix = t_str_new(128);
+	str_append(prefix, argv[0]);
+
+	size_t last_len = str_len(prefix);
+	unsigned int i = 1;
+	while (doveadm_has_subcommands(str_c(prefix))) {
+		last_len = str_len(prefix);
+		if (argv[i] == NULL)
+			break;
+		str_append_c(prefix, ' ');
+		str_append(prefix, argv[i++]);
+	}
+	str_truncate(prefix, last_len);
+	return str_c(prefix);
+}
+
 static struct doveadm_cmd_ver2 *doveadm_cmdline_commands_ver2[] = {
 	&doveadm_cmd_config,
 	&doveadm_cmd_dump,
@@ -377,10 +397,13 @@ int main(int argc, char *argv[])
 		i_set_debug_file("/dev/null");
 	}
 
+	struct event *event = event_create(NULL);
+	event_add_str(event, "origin", "cli");
 	struct doveadm_cmd_context *cctx = doveadm_cmd_context_create(
-		DOVEADM_CONNECTION_TYPE_CLI, doveadm_debug);
+		event, DOVEADM_CONNECTION_TYPE_CLI, doveadm_debug);
 	/* this has to be done here because proctitle hack can break
 	   the env pointer */
+	event_unref(&event);
 	cctx->username = getenv("USER");
 
 	if (!doveadm_cmdline_try_run(cmd_name, argc, (const char**)argv, cctx)) {
@@ -390,9 +413,12 @@ int main(int argc, char *argv[])
 		if (cctx->help_requested == DOVEADM_CMD_VER2_HELP_ARGUMENT &&
 		    cctx->cmd != NULL) {
 			print_usage_and_exit(stdout, cctx->cmd, EX_OK);
+		} else {
+			const char *cmd_prefix =
+				find_longest_cmd_prefix(argv);
+			if (doveadm_has_subcommands(cmd_prefix))
+				usage_prefix(out, cmd_prefix, exit_code);
 		}
-		if (doveadm_has_subcommands(cmd_name))
-			usage_prefix(out, cmd_name, exit_code);
 
 		if (doveadm_has_unloaded_plugin(cmd_name)) {
 			i_fatal("Unknown command '%s', but plugin %s exists. "

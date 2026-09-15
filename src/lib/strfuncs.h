@@ -13,6 +13,13 @@ extern const char *const empty_str_array[];
 int i_snprintf(char *dest, size_t max_chars, const char *format, ...)
 	ATTR_FORMAT(3, 4);
 
+/* The p_/t_/i_ strdup, strconcat and *printf helpers below preserve errno.
+   So this pattern is safe - errno still refers to the failed syscall when
+   "%m" is expanded:
+
+     if (syscall(...) < 0)
+             error = t_strdup_printf("syscall() failed: %m"); */
+
 char *p_strdup(pool_t pool, const char *str) ATTR_MALLOC;
 void *p_memdup(pool_t pool, const void *data, size_t size) ATTR_MALLOC;
 /* return NULL if str = "" */
@@ -31,11 +38,14 @@ char *p_strconcat(pool_t pool, const char *str1, ...)
 /* same with temporary memory allocations: */
 const char *t_strdup(const char *str) ATTR_MALLOC;
 char *t_strdup_noconst(const char *str) ATTR_MALLOC;
+const void *t_memdup(const void *data, size_t size) ATTR_MALLOC;
+void *t_memdup_noconst(const void *data, size_t size) ATTR_MALLOC;
 /* return NULL if str = "" */
 const char *t_strdup_empty(const char *str) ATTR_MALLOC;
 /* *end isn't included */
-const void *t_memdup(const void *data, size_t size) ATTR_MALLOC;
 const char *t_strdup_until(const void *start, const void *end)
+	ATTR_MALLOC ATTR_RETURNS_NONNULL;
+char *t_strdup_until_noconst(const void *start, const void *end)
 	ATTR_MALLOC ATTR_RETURNS_NONNULL;
 const char *t_strndup(const void *str, size_t max_chars) ATTR_MALLOC;
 const char *t_strdup_printf(const char *format, ...)
@@ -77,6 +87,9 @@ const char *p_str_rtrim(pool_t pool, const char *str, const char *chars);
 int null_strcmp(const char *s1, const char *s2) ATTR_PURE;
 int null_strcasecmp(const char *s1, const char *s2) ATTR_PURE;
 int i_memcasecmp(const void *p1, const void *p2, size_t size) ATTR_PURE;
+/* Like memrchr(): return a pointer to the last occurrence of c within the
+   first size bytes of data, or NULL if not found. */
+void *i_memrchr(const void *data, int c, size_t size) ATTR_PURE;
 int i_strcmp_p(const char *const *p1, const char *const *p2) ATTR_PURE;
 int i_strcasecmp_p(const char *const *p1, const char *const *p2) ATTR_PURE;
 /* Returns TRUE if the two memory areas are equal. This function is safe
@@ -87,6 +100,11 @@ bool mem_equals_timing_safe(const void *p1, const void *p2, size_t size);
    the string lengths are the same. If not, the length of the secret string may
    be leaked, but otherwise the contents won't be. */
 bool str_equals_timing_almost_safe(const char *s1, const char *s2);
+/* Returns TRUE if the two strings are equal. Safe against timing attacks:
+   neither the contents nor the length of either string is leaked.
+   Implemented by HMAC-SHA256ing both inputs under a random per-process key
+   and comparing the fixed-length digests. */
+bool str_equals_hash_timing_safe(const char *s1, const char *s2);
 
 size_t str_match(const char *p1, const char *p2) ATTR_PURE;
 size_t str_match_icase(const char *p1, const char *p2) ATTR_PURE;

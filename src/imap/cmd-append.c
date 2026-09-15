@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "ioloop.h"
@@ -27,9 +27,9 @@
 
 struct cmd_append_context {
 	struct client *client;
-        struct client_command_context *cmd;
+	struct client_command_context *cmd;
 	struct mailbox *box;
-        struct mailbox_transaction_context *t;
+	struct mailbox_transaction_context *t;
 	time_t started;
 
 	struct mailbox_transaction_context *rep_trans;
@@ -572,8 +572,6 @@ cmd_append_start_catenate(struct cmd_append_context *ctx,
 	if (!imap_arg_get_list(++(*args), &list_args))
 		return -1;
 
-	ctx->catenate = TRUE;
-
 	/* We'll do BINARY conversion only if the CATENATE's first
 	   part is a literal8. If it doesn't and a literal8 is seen
 	   later we'll abort the append with UNKNOWN-CTE. */
@@ -591,6 +589,8 @@ cmd_append_start_catenate(struct cmd_append_context *ctx,
 			imap_arg_atom_equals(&list_args[0], "TEXT") &&
 			list_args[1].literal8;
 	}
+
+	ctx->catenate = TRUE;
 	*cat_list_r = list_args;
 	return 1;
 }
@@ -775,7 +775,10 @@ cmd_append_handle_args(struct client_command_context *cmd,
 	if (!ctx->catenate) {
 		/* normal APPEND */
 		return 1;
-	} else if (cat_list->type == IMAP_ARG_EOL) {
+	}
+
+	i_assert(cat_list != NULL);
+	if (cat_list->type == IMAP_ARG_EOL) {
 		/* zero parts */
 		if (!ctx->failed)
 			client_send_command_error(cmd, "Empty CATENATE list.");
@@ -1070,17 +1073,19 @@ static bool cmd_append_continue_message(struct client_command_context *cmd)
 		if (ctx->failed) {
 			if (ctx->save_ctx != NULL)
 				mailbox_save_cancel(&ctx->save_ctx);
+		} else if (lit_offset != ctx->literal_size) {
+			/* client disconnected before it finished sending the
+			   whole message. Log the disconnection also when the
+			   saving failed because of it. */
+			ctx->failed = TRUE;
+			if (ctx->save_ctx != NULL)
+				mailbox_save_cancel(&ctx->save_ctx);
+			client_disconnect(client,
+				get_disconnect_reason(ctx, lit_offset));
 		} else if (ctx->save_ctx == NULL) {
 			/* failed above */
 			client_send_box_error(cmd, ctx->box);
 			ctx->failed = TRUE;
-		} else if (lit_offset != ctx->literal_size) {
-			/* client disconnected before it finished sending the
-			   whole message. */
-			ctx->failed = TRUE;
-			mailbox_save_cancel(&ctx->save_ctx);
-			client_disconnect(client,
-				get_disconnect_reason(ctx, lit_offset));
 		} else if (ctx->catenate) {
 			/* CATENATE isn't finished yet */
 		} else if (mailbox_save_finish(&ctx->save_ctx) < 0) {
@@ -1113,7 +1118,7 @@ static bool cmd_append_full(struct client_command_context *cmd, bool replace)
 {
 	struct client *client = cmd->client;
 	const struct imap_arg *args;
-        struct cmd_append_context *ctx;
+	struct cmd_append_context *ctx;
 	const char *mailbox;
 	uint32_t seqnum = 0;
 
@@ -1149,14 +1154,6 @@ static bool cmd_append_full(struct client_command_context *cmd, bool replace)
 		return TRUE;
 	}
 
-	if (replace) {
-		if (!cmd->uid && (seqnum > client->messages_count)) {
-			client_send_command_error(
-				cmd, "Invalid message sequence.");
-			return TRUE;
-		}
-	}
-
 	/* we keep the input locked all the time */
 	client->input_lock = cmd;
 
@@ -1167,9 +1164,14 @@ static bool cmd_append_full(struct client_command_context *cmd, bool replace)
 	ctx->started = ioloop_time;
 	ctx->utf8_accept = (client_enabled_mailbox_features(cmd->client) &
 			    MAILBOX_FEATURE_UTF8ACCEPT) != 0;
-	if (client_open_save_dest_box(cmd, mailbox, &ctx->box) < 0)
+	if (replace && !cmd->uid &&
+	    (seqnum == 0 || seqnum > client->messages_count)) {
+		client_send_tagline(cmd,
+			"BAD Invalid message sequence.");
 		ctx->failed = TRUE;
-	else {
+	} else if (client_open_save_dest_box(cmd, mailbox, &ctx->box) < 0) {
+		ctx->failed = TRUE;
+	} else {
 		event_add_str(cmd->global_event, "mailbox",
 			      mailbox_get_vname(ctx->box));
 		ctx->t = mailbox_transaction_begin(ctx->box,
@@ -1178,7 +1180,7 @@ static bool cmd_append_full(struct client_command_context *cmd, bool replace)
 					imap_client_command_get_reason(cmd));
 	}
 
-	if (replace) {
+	if (!ctx->failed && replace) {
 		ctx->rep_trans = mailbox_transaction_begin(
 			client->mailbox, 0,
 			imap_client_command_get_reason(cmd));
@@ -1202,7 +1204,8 @@ static bool cmd_append_full(struct client_command_context *cmd, bool replace)
 	o_stream_unset_flush_callback(client->output);
 
 	ctx->save_parser = imap_parser_create(client->input, client->output,
-					      client->set->imap_max_line_length);
+					      client->set->imap_max_line_length,
+					      NULL);
 	if (client->set->imap_literal_minus)
 		imap_parser_enable_literal_minus(ctx->save_parser);
 

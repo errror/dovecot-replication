@@ -425,6 +425,7 @@ void smtp_server_switch_ioloop(struct smtp_server *server);
 struct smtp_server_connection *
 smtp_server_connection_create(
 	struct smtp_server *server, int fd_in, int fd_out,
+	const struct ip_addr *local_ip, in_port_t local_port,
 	const struct ip_addr *remote_ip, in_port_t remote_port, bool ssl_start,
 	const struct smtp_server_settings *set,
 	const struct smtp_server_callbacks *callbacks, void *context)
@@ -433,6 +434,7 @@ struct smtp_server_connection *
 smtp_server_connection_create_from_streams(
 	struct smtp_server *server,
 	struct istream *input, struct ostream *output,
+	const struct ip_addr *local_ip, in_port_t local_port,
 	const struct ip_addr *remote_ip, in_port_t remote_port,
 	const struct smtp_server_settings *set,
 	const struct smtp_server_callbacks *callbacks, void *context)
@@ -476,6 +478,17 @@ void smtp_server_connection_set_ssl_streams(struct smtp_server_connection *conn,
 
 void smtp_server_connection_close(struct smtp_server_connection **_conn,
 				  const char *reason) ATTR_NULL(2);
+bool smtp_server_connection_is_closed(struct smtp_server_connection *conn);
+/* Send a reply line directly to the output stream, bypassing the per-command
+   reply queue. Useful when the caller is about to close the connection and
+   needs the reply on the wire before close/destroy aborts queued replies.
+   The formatted text must be a single line (no CR/LF); unlike
+   smtp_server_reply_add_text(), this function does not split on \n nor add
+   the SMTP continuation prefix to subsequent lines. */
+void smtp_server_connection_reply_immediate(struct smtp_server_connection *conn,
+					    unsigned int status,
+					    const char *fmt, ...)
+					    ATTR_FORMAT(3, 4);
 void smtp_server_connection_terminate(struct smtp_server_connection **_conn,
 				      const char *enh_code, const char *reason)
 				      ATTR_NULL(3);
@@ -620,6 +633,9 @@ void smtp_server_command_set_reply_count(struct smtp_server_command *cmd,
 					 unsigned int count);
 unsigned int
 smtp_server_command_get_reply_count(struct smtp_server_command *cmd);
+
+void smtp_server_command_ref(struct smtp_server_command *cmd);
+bool smtp_server_command_unref(struct smtp_server_command **_cmd);
 
 void smtp_server_command_fail(struct smtp_server_command *cmd,
 			      unsigned int status, const char *enh_code,
@@ -774,11 +790,6 @@ void smtp_server_reply_forward(struct smtp_server_cmd_ctx *cmd,
 void smtp_server_reply_all(struct smtp_server_cmd_ctx *_cmd,
 			   unsigned int status, const char *enh_code,
 			   const char *fmt, ...) ATTR_FORMAT(4, 5);
-/* Submit and send the same message for all expected replies for this command
-   early; i.e., no matter whether all command data is received completely. */
-void smtp_server_reply_early(struct smtp_server_cmd_ctx *_cmd,
-			     unsigned int status, const char *enh_code,
-			     const char *fmt, ...) ATTR_FORMAT(4, 5);
 
 /* Reply the command with a 221 bye message */
 void smtp_server_reply_quit(struct smtp_server_cmd_ctx *_cmd);

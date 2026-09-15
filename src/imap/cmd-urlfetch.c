@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "strfuncs.h"
@@ -33,8 +33,7 @@ struct cmd_urlfetch_url {
 
 static void cmd_urlfetch_finish(struct client_command_context *cmd)
 {
-	struct cmd_urlfetch_context *ctx =
-		(struct cmd_urlfetch_context *)cmd->context;
+	struct cmd_urlfetch_context *ctx = cmd->context;
 
 	if (ctx->finished)
 		return;
@@ -61,8 +60,7 @@ static void cmd_urlfetch_finish(struct client_command_context *cmd)
 
 static bool cmd_urlfetch_cancel(struct client_command_context *cmd)
 {
-	struct cmd_urlfetch_context *ctx =
-		(struct cmd_urlfetch_context *)cmd->context;
+	struct cmd_urlfetch_context *ctx = cmd->context;
 
 	if (!cmd->cancel)
 		return FALSE;
@@ -79,8 +77,7 @@ static bool cmd_urlfetch_cancel(struct client_command_context *cmd)
 static int cmd_urlfetch_transfer_literal(struct client_command_context *cmd)
 {
 	struct client *client = cmd->client;
-	struct cmd_urlfetch_context *ctx =
-		(struct cmd_urlfetch_context *)cmd->context;
+	struct cmd_urlfetch_context *ctx = cmd->context;
 	enum ostream_send_istream_result res;
 	int ret;
 
@@ -124,8 +121,7 @@ static int cmd_urlfetch_transfer_literal(struct client_command_context *cmd)
 static bool cmd_urlfetch_continue(struct client_command_context *cmd)
 {
 	struct client *client = cmd->client;
-	struct cmd_urlfetch_context *ctx =
-		(struct cmd_urlfetch_context *)cmd->context;
+	struct cmd_urlfetch_context *ctx = cmd->context;
 	bool urls_pending;
 	int ret = 1;
 
@@ -179,7 +175,7 @@ static int cmd_urlfetch_url_success(struct client_command_context *cmd,
 	int ret;
 
 	str_append(response, "* URLFETCH ");
-	imap_append_astring(response, reply->url);
+	imap_append_astring(response, reply->url, 0);
 
 	if ((reply->flags & IMAP_URLAUTH_FETCH_FLAG_EXTENDED) == 0) {
 		/* simple */
@@ -260,7 +256,7 @@ cmd_urlfetch_url_callback(struct imap_urlauth_fetch_reply *reply,
 		string_t *response = t_str_new(128);
 
 		str_append(response, "* URLFETCH ");
-		imap_append_astring(response, reply->url);
+		imap_append_astring(response, reply->url, 0);
 		str_append(response, " NIL");
 		client_send_line(client, str_c(response));
 		if (reply->error != NULL) {
@@ -290,6 +286,8 @@ cmd_urlfetch_parse_arg(struct client_command_context *cmd,
 	const struct imap_arg *params;
 	const char *url_text;
 
+	if (cmd->utf8)
+		url_flags |= IMAP_URLAUTH_FETCH_FLAG_UTF8;
 	if (imap_arg_get_list(arg, &params))
 		url_flags |= IMAP_URLAUTH_FETCH_FLAG_EXTENDED;
 	else

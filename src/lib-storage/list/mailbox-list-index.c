@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -43,6 +43,7 @@ void mailbox_list_index_reset(struct mailbox_list_index *ilist)
 {
 	hash_table_destroy(&ilist->mailbox_names);
 	hash_table_destroy(&ilist->mailbox_hash);
+	hash_table_destroy(&ilist->mailbox_storage_name_hash);
 	pool_unref(&ilist->mailbox_pool);
 
 	ilist->mailbox_tree = NULL;
@@ -117,16 +118,51 @@ int mailbox_list_index_index_open(struct mailbox_list *list)
 	return 0;
 }
 
+static void
+mailbox_list_index_vname_hash_create(struct mailbox_list_index *ilist,
+				     struct mail_index_view *view)
+{
+	uint32_t count = mail_index_view_get_messages_count(view);
+	hash_table_create(&ilist->mailbox_storage_name_hash,
+			  ilist->mailbox_pool, count,
+			  str_hash, strcmp);
+	string_t *name = t_str_new(128);
+	for (uint32_t seq = 1; seq <= count; seq++) {
+		uint32_t uid;
+		mail_index_lookup_uid(view, seq, &uid);
+		struct mailbox_list_index_node *node =
+			mailbox_list_index_lookup_uid(ilist, uid);
+		i_assert(node != NULL);
+
+		str_truncate(name, 0);
+		mailbox_list_index_node_get_path(ilist->list, node, name);
+		const char *key = p_strdup(ilist->mailbox_pool, str_c(name));
+		hash_table_insert(ilist->mailbox_storage_name_hash, key, node);
+	}
+}
+
 struct mailbox_list_index_node *
-mailbox_list_index_node_find_sibling(const struct mailbox_list *list,
+mailbox_list_index_node_find_sibling(struct mailbox_list *list,
 				     struct mailbox_list_index_node *node,
 				     const char *name)
 {
+	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT_REQUIRE(list);
+
+	if (ilist->inbox_inbox_storage_name != NULL &&
+	    strcmp(name, ilist->inbox_inbox_storage_name) == 0) {
+		for (; node != NULL; node = node->next) {
+			if (node->name_id == ilist->inbox_inbox_name_id)
+				return node;
+		}
+		return NULL;
+	}
+
 	mailbox_list_name_unescape(&name,
 		list->mail_set->mailbox_list_storage_escape_char[0]);
 
 	while (node != NULL) {
-		if (strcmp(node->raw_name, name) == 0)
+		if (node->raw_name != ilist->raw_inbox_inbox_name_ptr &&
+		    strcmp(node->raw_name, name) == 0)
 			return node;
 		node = node->next;
 	}
@@ -137,11 +173,14 @@ static struct mailbox_list_index_node *
 mailbox_list_index_lookup_real(struct mailbox_list *list, const char *name)
 {
 	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT_REQUIRE(list);
-	struct mailbox_list_index_node *node = ilist->mailbox_tree;
 	const char *const *path;
 	unsigned int i;
 	char sep[2];
 
+	if (hash_table_is_created(ilist->mailbox_storage_name_hash))
+		return hash_table_lookup(ilist->mailbox_storage_name_hash, name);
+
+	struct mailbox_list_index_node *node = ilist->mailbox_tree;
 	if (*name == '\0')
 		return mailbox_list_index_node_find_sibling(list, node, "");
 
@@ -173,20 +212,102 @@ mailbox_list_index_lookup_uid(struct mailbox_list_index *ilist, uint32_t uid)
 	return hash_table_lookup(ilist->mailbox_hash, POINTER_CAST(uid));
 }
 
-void mailbox_list_index_node_get_path(const struct mailbox_list_index_node *node,
-				      char sep, string_t *str)
+void mailbox_list_get_escaped_mailbox_name(struct mailbox_list *list,
+					   const struct mailbox_list_index_node *node,
+					   string_t *escaped_name)
+{
+	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT_REQUIRE(list);
+	char escape_char =
+		list->mail_set->mailbox_list_storage_escape_char[0];
+
+	if (node->raw_name == ilist->raw_inbox_inbox_name_ptr) {
+		str_append(escaped_name, ilist->inbox_inbox_storage_name);
+		return;
+	}
+	if (escape_char == '\0') {
+		str_append(escaped_name, node->raw_name);
+		return;
+	}
+	mailbox_list_escape_name_params_to_str(escaped_name, node->raw_name,
+		mailbox_list_get_hierarchy_sep(list),
+		escape_char,
+		list->mail_set->mailbox_directory_name,
+		node->parent == NULL);
+}
+
+void mailbox_list_index_node_get_path(struct mailbox_list *list,
+				      const struct mailbox_list_index_node *node,
+				      string_t *storage_name)
 {
 	if (node->parent != NULL) {
-		mailbox_list_index_node_get_path(node->parent, sep, str);
-		str_append_c(str, sep);
+		mailbox_list_index_node_get_path(list, node->parent,
+						 storage_name);
+		str_append_c(storage_name,
+			     mailbox_list_get_hierarchy_sep(list));
 	}
-	str_append(str, node->raw_name);
+	mailbox_list_get_escaped_mailbox_name(list, node, storage_name);
+}
+
+void mailbox_list_index_node_hash_insert(struct mailbox_list_index *ilist,
+					 struct mailbox_list_index_node *node)
+{
+	if (!hash_table_is_created(ilist->mailbox_storage_name_hash))
+		return;
+	T_BEGIN {
+		string_t *storage_name = t_str_new(128);
+		mailbox_list_index_node_get_path(ilist->list, node,
+						 storage_name);
+		const char *key = p_strdup(ilist->mailbox_pool,
+					   str_c(storage_name));
+		hash_table_insert(ilist->mailbox_storage_name_hash, key, node);
+	} T_END;
+}
+
+static void
+mailbox_list_index_node_hash_remove(struct mailbox_list_index *ilist,
+				    struct mailbox_list_index_node *node)
+{
+	if (!hash_table_is_created(ilist->mailbox_storage_name_hash))
+		return;
+	T_BEGIN {
+		string_t *storage_name = t_str_new(128);
+		mailbox_list_index_node_get_path(ilist->list, node,
+						 storage_name);
+		hash_table_remove(ilist->mailbox_storage_name_hash,
+				  str_c(storage_name));
+	} T_END;
+}
+
+void mailbox_list_index_subtree_hash_remove(struct mailbox_list_index *ilist,
+					    struct mailbox_list_index_node *node)
+{
+	struct mailbox_list_index_node *child;
+
+	for (child = node->children; child != NULL; child = child->next)
+		mailbox_list_index_subtree_hash_remove(ilist, child);
+	mailbox_list_index_node_hash_remove(ilist, node);
+}
+
+void mailbox_list_index_subtree_hash_insert(struct mailbox_list_index *ilist,
+					    struct mailbox_list_index_node *node)
+{
+	struct mailbox_list_index_node *child;
+
+	mailbox_list_index_node_hash_insert(ilist, node);
+	for (child = node->children; child != NULL; child = child->next)
+		mailbox_list_index_subtree_hash_insert(ilist, child);
 }
 
 void mailbox_list_index_node_unlink(struct mailbox_list_index *ilist,
 				    struct mailbox_list_index_node *node)
 {
 	struct mailbox_list_index_node **prev;
+
+	if (hash_table_is_created(ilist->mailbox_storage_name_hash)) T_BEGIN {
+		string_t *name = t_str_new(128);
+		mailbox_list_index_node_get_path(ilist->list, node, name);
+		hash_table_remove(ilist->mailbox_storage_name_hash, str_c(name));
+	} T_END;
 
 	prev = node->parent == NULL ?
 		&ilist->mailbox_tree : &node->parent->children;
@@ -196,58 +317,99 @@ void mailbox_list_index_node_unlink(struct mailbox_list_index *ilist,
 	*prev = node->next;
 }
 
+void mailbox_list_index_name_iter_init(
+	struct mailbox_list_index_name_iter *iter,
+	const void *data, size_t size)
+{
+	i_zero(iter);
+	iter->data = data;
+	iter->size = size;
+	iter->offset = sizeof(struct mailbox_list_index_header);
+	iter->str = t_str_new(128);
+}
+
+int mailbox_list_index_name_iter_next(struct mailbox_list_index_name_iter *iter,
+				      uint32_t *id_r, const char **name_r,
+				      bool *fixed_r)
+{
+	const unsigned char *name_start, *p;
+	size_t len;
+	uint32_t id;
+
+	*fixed_r = FALSE;
+	if (iter->offset >= iter->size)
+		return 0;
+
+	/* get id */
+	if (iter->offset + sizeof(id) > iter->size)
+		return -1;
+	memcpy(&id, iter->data + iter->offset, sizeof(id));
+	iter->offset += sizeof(id);
+
+	if (id <= iter->prev_id) {
+		/* allow extra space in the end as long as last id=0 */
+		return id == 0 ? 0 : -1;
+	}
+	iter->prev_id = id;
+
+	/* get name. It's NUL-terminated within the header, so it can be
+	   returned as-is when it doesn't need fixing. */
+	name_start = iter->data + iter->offset;
+	p = memchr(name_start, '\0', iter->size - iter->offset);
+	if (p == NULL)
+		return -1;
+	len = p - name_start;
+	iter->offset += len + 1;
+
+	str_truncate(iter->str, 0);
+	if (uni_utf8_get_valid_data(name_start, len, iter->str))
+		*name_r = (const char *)name_start;
+	else {
+		/* corrupted index. fix the name. */
+		*name_r = str_c(iter->str);
+		*fixed_r = TRUE;
+	}
+	*id_r = id;
+	return 1;
+}
+
 static int mailbox_list_index_parse_header(struct mailbox_list_index *ilist,
 					   struct mail_index_view *view)
 {
-	const void *data, *name_start, *p;
-	size_t i, len, size;
-	uint32_t id, prev_id = 0;
-	string_t *str;
-	char *name;
-	int ret = 0;
+	struct mailbox_list_index_name_iter iter;
+	const void *data;
+	const char *name;
+	size_t size;
+	uint32_t id;
+	bool fixed;
+	int ret = 0, iter_ret;
+
+	mail_index_map_get_header_ext(view, view->map, ilist->ext2_id, &data, &size);
+	if (size >= sizeof(struct mailbox_list_index_header2)) {
+		const struct mailbox_list_index_header2 *hdr2 = data;
+		ilist->inbox_inbox_name_id = hdr2->inbox_inbox_name_id;
+	} else {
+		ilist->inbox_inbox_name_id = 0;
+	}
 
 	mail_index_map_get_header_ext(view, view->map, ilist->ext_id, &data, &size);
 	if (size == 0)
 		return 0;
 
-	str = t_str_new(128);
-	for (i = sizeof(struct mailbox_list_index_header); i < size; ) {
-		/* get id */
-		if (i + sizeof(id) > size)
-			return -1;
-		memcpy(&id, CONST_PTR_OFFSET(data, i), sizeof(id));
-		i += sizeof(id);
-
-		if (id <= prev_id) {
-			/* allow extra space in the end as long as last id=0 */
-			return id == 0 ? 0 : -1;
-		}
-		prev_id = id;
-
-		/* get name */
-		p = memchr(CONST_PTR_OFFSET(data, i), '\0', size-i);
-		if (p == NULL)
-			return -1;
-		name_start = CONST_PTR_OFFSET(data, i);
-		len = (const char *)p - (const char *)name_start;
-
-		if (uni_utf8_get_valid_data(name_start, len, str)) {
-			name = p_strndup(ilist->mailbox_pool, name_start, len);
-		} else {
-			/* corrupted index. fix the name. */
-			name = p_strdup(ilist->mailbox_pool, str_c(str));
-			str_truncate(str, 0);
+	mailbox_list_index_name_iter_init(&iter, data, size);
+	while ((iter_ret = mailbox_list_index_name_iter_next(&iter, &id, &name,
+							     &fixed)) > 0) {
+		if (fixed)
 			ret = -1;
-		}
-
-		i += len + 1;
-
 		/* add id => name to hash table */
-		hash_table_insert(ilist->mailbox_names, POINTER_CAST(id), name);
+		if (id != ilist->inbox_inbox_name_id) {
+			hash_table_insert(ilist->mailbox_names,
+					  POINTER_CAST(id),
+					  p_strdup(ilist->mailbox_pool, name));
+		}
 		ilist->highest_name_id = id;
 	}
-	i_assert(i == size);
-	return ret;
+	return iter_ret < 0 ? -1 : ret;
 }
 
 static void
@@ -275,6 +437,8 @@ mailbox_list_index_generate_name(struct mailbox_list_index *ilist,
 static int mailbox_list_index_node_cmp(const struct mailbox_list_index_node *n1,
 				       const struct mailbox_list_index_node *n2)
 {
+	/* Used only for duplicate checking, which skips raw_inbox_inbox_name_ptr
+	   mailbox, so we don't need to check for that. */
 	return  n1->parent == n2->parent &&
 		strcmp(n1->raw_name, n2->raw_name) == 0 ? 0 : -1;
 }
@@ -347,9 +511,12 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 			/* invalid name_id - assign a new one */
 			node->name_id = ++ilist->highest_name_id;
 			node->corrupted_ext = TRUE;
-		}
-		node->raw_name = hash_table_lookup(ilist->mailbox_names,
+		} else if (irec->name_id != ilist->inbox_inbox_name_id) {
+			node->raw_name = hash_table_lookup(ilist->mailbox_names,
 					       POINTER_CAST(irec->name_id));
+		} else {
+			node->raw_name = ilist->raw_inbox_inbox_name_ptr;
+		}
 		if (node->raw_name == NULL) {
 			*error_r = t_strdup_printf(
 				"name_id=%u not in index header", irec->name_id);
@@ -444,7 +611,12 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 		} else if (strcasecmp(node->raw_name, "INBOX") == 0) {
 			ilist->rebuild_on_missing_inbox = FALSE;
 		}
-		if (hash_table_lookup(duplicate_hash, node) == NULL)
+
+		if (node->raw_name == ilist->raw_inbox_inbox_name_ptr) {
+			/* The raw_name's value may exist here for another
+			   mailbox, but it's not a duplicate of this
+			   <prefix>/INBOX, since it's unique. */
+		} else if (hash_table_lookup(duplicate_hash, node) == NULL)
 			hash_table_insert(duplicate_hash, node, node);
 		else {
 			const char *old_name = node->raw_name;
@@ -471,6 +643,11 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 			ilist->mailbox_tree = node;
 		}
 	}
+
+	if (*error_r == NULL) T_BEGIN {
+		mailbox_list_index_vname_hash_create(ilist, view);
+	} T_END;
+
 	hash_table_destroy(&duplicate_hash);
 	if (!ilist->has_backing_store)
 		hash_table_destroy(&duplicate_guid);
@@ -478,8 +655,30 @@ static int mailbox_list_index_parse_records(struct mailbox_list_index *ilist,
 	return *error_r == NULL ? 0 : -1;
 }
 
-int mailbox_list_index_parse(struct mailbox_list *list,
-			     struct mail_index_view *view, bool force)
+static void
+mailbox_list_index_add_extra_names(struct mailbox_list_index *ilist,
+	const ARRAY_TYPE(mailbox_list_index_name) *extra_names)
+{
+	const struct mailbox_list_index_name *extra_name;
+
+	array_foreach(extra_names, extra_name) {
+		if (hash_table_lookup(ilist->mailbox_names,
+				      POINTER_CAST(extra_name->id)) != NULL)
+			continue;
+		hash_table_insert(ilist->mailbox_names,
+				  POINTER_CAST(extra_name->id),
+				  p_strdup(ilist->mailbox_pool,
+					   extra_name->name));
+		if (ilist->highest_name_id < extra_name->id)
+			ilist->highest_name_id = extra_name->id;
+	}
+}
+
+static int
+mailbox_list_index_parse_full(struct mailbox_list *list,
+			      struct mail_index_view *view, bool force,
+			      bool handle_corruption,
+			      const ARRAY_TYPE(mailbox_list_index_name) *names)
 {
 	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT_REQUIRE(list);
 	const struct mail_index_header *hdr;
@@ -492,7 +691,8 @@ int mailbox_list_index_parse(struct mailbox_list *list,
 		/* nothing changed */
 		return 0;
 	}
-	if ((hdr->flags & MAIL_INDEX_HDR_FLAG_FSCKD) != 0) {
+	if ((hdr->flags & MAIL_INDEX_HDR_FLAG_FSCKD) != 0 &&
+	    handle_corruption) {
 		mailbox_list_set_critical(list,
 			"Mailbox list index was marked as fsck'd %s", ilist->path);
 		ilist->call_corruption_callback = TRUE;
@@ -503,6 +703,8 @@ int mailbox_list_index_parse(struct mailbox_list *list,
 	ilist->sync_log_file_offset = hdr->log_file_head_offset;
 
 	if (mailbox_list_index_parse_header(ilist, view) < 0) {
+		if (!handle_corruption)
+			return -1;
 		mailbox_list_set_critical(list,
 			"Corrupted mailbox list index header %s", ilist->path);
 		if (ilist->has_backing_store) {
@@ -512,7 +714,11 @@ int mailbox_list_index_parse(struct mailbox_list *list,
 		ilist->call_corruption_callback = TRUE;
 		ilist->corrupted_names_or_parents = TRUE;
 	}
+	if (names != NULL)
+		mailbox_list_index_add_extra_names(ilist, names);
 	if (mailbox_list_index_parse_records(ilist, view, &error) < 0) {
+		if (!handle_corruption)
+			return -1;
 		mailbox_list_set_critical(list,
 			"Corrupted mailbox list index %s: %s",
 			ilist->path, error);
@@ -526,14 +732,40 @@ int mailbox_list_index_parse(struct mailbox_list *list,
 	return 0;
 }
 
+int mailbox_list_index_parse(struct mailbox_list *list,
+			     struct mail_index_view *view, bool force)
+{
+	return mailbox_list_index_parse_full(list, view, force, TRUE, NULL);
+}
+
+int mailbox_list_index_parse_try(struct mailbox_list *list,
+				 struct mail_index_view *view,
+				 const ARRAY_TYPE(mailbox_list_index_name) *names)
+{
+	return mailbox_list_index_parse_full(list, view, FALSE, FALSE, names);
+}
+
 const unsigned char *
 mailbox_name_hdr_encode(struct mailbox_list *list, const char *storage_name,
 			size_t *name_len_r)
 {
+	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT(list);
 	const char sep[] = {
 		mailbox_list_get_hierarchy_sep(list),
 		'\0'
 	};
+	uint8_t flags = 0;
+
+	/* The on-disk name loses the <escape>49NBOX -> "INBOX" distinction
+	   after per-part unescape below, so detect <ns prefix>/INBOX from the
+	   storage_name before splitting and remember it as a flag bit. */
+	if (ilist != NULL && ilist->inbox_inbox_storage_name != NULL &&
+	    strcmp(storage_name, ilist->inbox_inbox_storage_name) == 0)
+		flags |= MAILBOX_NAME_HDR_FLAG_INBOX_INBOX;
+
+	/* NOTE: The stored mailbox name may be UTF-8 or mUTF-7 depending on
+	   mailbox_list_utf8 setting. Ideally it would be UTF-8 always.
+	   However, the name is stored unescaped. */
 	const char **name_parts =
 		(const char **)p_strsplit(unsafe_data_stack_pool, storage_name, sep);
 	if (list->mail_set->mailbox_list_storage_escape_char[0] != '\0') {
@@ -550,6 +782,21 @@ mailbox_name_hdr_encode(struct mailbox_list *list, const char *storage_name,
 		str_append_c(str, '\0');
 		str_append(str, name_parts[i]);
 	}
+	if (flags != 0) {
+		/* Backwards compatible extension: append two NUL bytes after
+		   the last name part and one byte of flags. The double NUL
+		   distinguishes the new format unambiguously - old format
+		   never produces two consecutive trailing NULs, since real
+		   mailbox storage names contain no empty hierarchy parts. Old
+		   Dovecot versions don't know about the flag byte and will
+		   parse it as an extra trailing single-byte hierarchy
+		   component, so the decoded name on old code paths becomes
+		   slightly wrong. This is acceptable because old code never
+		   wrote <ns prefix>/INBOX in the first place. */
+		str_append_c(str, '\0');
+		str_append_c(str, '\0');
+		str_append_c(str, flags);
+	}
 	*name_len_r = str_len(str);
 	return str_data(str);
 }
@@ -557,11 +804,40 @@ mailbox_name_hdr_encode(struct mailbox_list *list, const char *storage_name,
 const char *
 mailbox_name_hdr_decode_storage_name(struct mailbox_list *list,
 				     const unsigned char *name_hdr,
-				     size_t name_hdr_size)
+				     size_t name_hdr_size,
+				     uint8_t *flags_r)
 {
-	const char list_sep = mailbox_list_get_hierarchy_sep(list);
-	const char escape_char = list->mail_set->mailbox_list_storage_escape_char[0];
+	ARRAY_TYPE(const_string) raw_parts;
+	const char *raw_part;
+	uint8_t flags = 0;
+
+	/* lib-index may grow the header with trailing zero padding, so strip
+	   any trailing NULs first. The flag byte (if present) is non-zero by
+	   construction, so it survives the strip. */
+	while (name_hdr_size > 0 && name_hdr[name_hdr_size-1] == '\0')
+		name_hdr_size--;
+
+	/* New-format header ends with "<name parts>\0\0<nonzero flag byte>".
+	   Old-format headers never produce two consecutive trailing NULs
+	   because the encoder splits storage names on the hierarchy
+	   separator and real storage names contain no empty parts. So
+	   data[size-3]=='\0' && data[size-2]=='\0' unambiguously marks the
+	   new format - treat the trailing byte as flags even if some bits
+	   are unknown to this Dovecot version, so unknown future flag bits
+	   don't get misparsed as a trailing hierarchy component. */
+	if (name_hdr_size >= 3 && name_hdr[name_hdr_size-3] == '\0' &&
+	    name_hdr[name_hdr_size-2] == '\0') {
+		flags = name_hdr[name_hdr_size-1];
+		name_hdr_size -= 3;
+	}
+	if (flags_r != NULL)
+		*flags_r = flags;
+
+	/* NOTE: The stored mailbox name may be UTF-8 or mUTF-7 depending on
+	   mailbox_list_utf8 setting. Ideally it would be UTF-8 always.
+	   However, the name is stored unescaped. */
 	string_t *storage_name = t_str_new(name_hdr_size);
+	t_array_init(&raw_parts, 8);
 	while (name_hdr_size > 0) {
 		const unsigned char *p = memchr(name_hdr, '\0', name_hdr_size);
 		size_t name_part_len;
@@ -574,21 +850,29 @@ mailbox_name_hdr_decode_storage_name(struct mailbox_list *list,
 			name_hdr_size -= name_part_len + 1;
 		}
 
-		if (escape_char == '\0')
-			str_append_data(storage_name, name_hdr, name_part_len);
-		else {
-			const char *name_part =
-				t_strndup(name_hdr, name_part_len);
-			str_append(storage_name,
-				   mailbox_list_escape_name_params(name_part,
-					"", '\0', list_sep, escape_char,
-					list->mail_set->mailbox_directory_name));
-		}
+		raw_part = t_strndup(name_hdr, name_part_len);
+		array_push_back(&raw_parts, &raw_part);
 
-		if (p != NULL) {
+		if (p != NULL)
 			name_hdr += name_part_len + 1;
+	}
+
+	const char list_sep = mailbox_list_get_hierarchy_sep(list);
+	const char escape_char = list->mail_set->mailbox_list_storage_escape_char[0];
+	bool first_part = TRUE;
+	array_foreach_elem(&raw_parts, raw_part) {
+		if (str_len(storage_name) > 0)
 			str_append_c(storage_name, list_sep);
+		if (escape_char == '\0')
+			str_append(storage_name, raw_part);
+		else {
+			str_append(storage_name,
+				   mailbox_list_escape_name_params(raw_part,
+					list_sep, escape_char,
+					list->mail_set->mailbox_directory_name,
+					first_part));
 		}
+		first_part = FALSE;
 	}
 	return str_c(storage_name);
 }
@@ -614,7 +898,8 @@ int mailbox_list_index_refresh(struct mailbox_list *list)
 
 	if (ilist->syncing)
 		return 0;
-	if (ilist->last_refresh_timeval.tv_usec == ioloop_timeval.tv_usec &&
+	if (ilist->opened &&
+	    ilist->last_refresh_timeval.tv_usec == ioloop_timeval.tv_usec &&
 	    ilist->last_refresh_timeval.tv_sec == ioloop_timeval.tv_sec) {
 		/* we haven't been to ioloop since last refresh, skip checking
 		   it. when we're accessing many mailboxes at once (e.g.
@@ -894,6 +1179,7 @@ static void mailbox_list_index_deinit(struct mailbox_list *list)
 	if (ilist->index != NULL) {
 		hash_table_destroy(&ilist->mailbox_hash);
 		hash_table_destroy(&ilist->mailbox_names);
+		hash_table_destroy(&ilist->mailbox_storage_name_hash);
 		pool_unref(&ilist->mailbox_pool);
 		if (ilist->opened)
 			mail_index_close(ilist->index);
@@ -1104,9 +1390,16 @@ static void mailbox_list_index_created(struct mailbox_list *list)
 
 	ilist = p_new(list->pool, struct mailbox_list_index, 1);
 	ilist->module_ctx.super = *v;
+	ilist->list = list;
 	list->vlast = &ilist->module_ctx.super;
 	ilist->has_backing_store = has_backing_store;
 	ilist->pending_init = TRUE;
+	/* Make sure this gets a unique pointer, and the value is not "INBOX" */
+	ilist->raw_inbox_inbox_name_ptr = p_strdup(list->pool, "INBOXINBOX");
+
+	const char escape_char = list->mail_set->mailbox_list_storage_escape_char[0];
+	ilist->inbox_inbox_storage_name = escape_char == '\0' ? NULL :
+		p_strdup_printf(list->pool, "%c49NBOX", escape_char);
 
 	v->deinit = mailbox_list_index_deinit;
 	v->iter_init = mailbox_list_index_iter_init;
@@ -1163,6 +1456,9 @@ static void mailbox_list_index_init_finish(struct mailbox_list *list)
 				sizeof(struct mailbox_list_index_header),
 				sizeof(struct mailbox_list_index_record),
 				sizeof(uint32_t));
+	ilist->ext2_id = mail_index_ext_register(ilist->index, "list2",
+				sizeof(struct mailbox_list_index_header2),
+				0, 0);
 	ilist->subs_hdr_ext_id = mail_index_ext_register(ilist->index, "subs",
 							 sizeof(uint32_t), 0,
 							 sizeof(uint32_t));
@@ -1186,7 +1482,8 @@ mailbox_list_index_sync_init(struct mailbox *box,
 {
 	struct index_list_mailbox *ibox = INDEX_LIST_STORAGE_CONTEXT(box);
 
-	mailbox_list_index_status_sync_init(box);
+	if (mailbox_list_index_has_cache(box))
+		mailbox_list_index_status_sync_init(box);
 	if (!ibox->have_backend)
 		mailbox_list_index_backend_sync_init(box, flags);
 	return ibox->module_ctx.super.sync_init(box, flags);
@@ -1203,7 +1500,8 @@ mailbox_list_index_sync_deinit(struct mailbox_sync_context *ctx,
 		return -1;
 	ctx = NULL;
 
-	mailbox_list_index_status_sync_deinit(box);
+	if (mailbox_list_index_has_cache(box))
+		mailbox_list_index_status_sync_deinit(box);
 	if (ibox->have_backend)
 		return mailbox_list_index_backend_sync_deinit(box);
 	else
@@ -1235,7 +1533,12 @@ static void mailbox_list_index_mailbox_allocated(struct mailbox *box)
 	v->sync_init = mailbox_list_index_sync_init;
 	v->sync_deinit = mailbox_list_index_sync_deinit;
 
-	mailbox_list_index_status_init_mailbox(v);
+	/* Some storages have no mailbox list index records of their own. Only
+	   the backend part is still needed by them, because with
+	   mailbox_list_layout=index the mailbox names exist only in the
+	   mailbox list index. */
+	if (mailbox_list_index_has_cache(box))
+		mailbox_list_index_status_init_mailbox(v);
 	ibox->have_backend = mailbox_list_index_backend_init_mailbox(box, v);
 }
 

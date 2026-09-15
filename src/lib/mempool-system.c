@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /* @UNSAFE: whole file */
 
@@ -97,36 +97,28 @@ static void pool_system_unref(pool_t *pool ATTR_UNUSED)
 
 static void *pool_system_malloc(pool_t pool ATTR_UNUSED, size_t size)
 {
-	void *mem;
-#ifdef DEBUG
 	int old_errno = errno;
-#endif
+	void *mem;
 
 	mem = calloc(size, 1);
 	if (unlikely(mem == NULL)) {
 		i_fatal_status(FATAL_OUTOFMEM, "pool_system_malloc(%zu): "
 			       "Out of memory", size);
 	}
-#ifdef DEBUG
-	/* we rely on errno not changing. it shouldn't. */
-	i_assert(errno == old_errno);
-#endif
+	errno = old_errno;
 	return mem;
 }
 
-void pool_system_free(pool_t pool ATTR_UNUSED, void *mem ATTR_UNUSED)
+void pool_system_free(pool_t pool ATTR_UNUSED, void *mem)
 {
-#ifdef DEBUG
 	int old_errno = errno;
-#endif
+
 #if defined(HAVE_MALLOC_USABLE_SIZE) && defined(DEBUG)
-	safe_memset(mem, CLEAR_CHR, malloc_usable_size(mem));
+	if (mem != NULL)
+		safe_memset(mem, CLEAR_CHR, malloc_usable_size(mem));
 #endif
 	free(mem);
-#ifdef DEBUG
-	/* we rely on errno not changing. it shouldn't. */
-	i_assert(errno == old_errno);
-#endif
+	errno = old_errno;
 }
 
 static void *pool_system_realloc(pool_t pool ATTR_UNUSED, void *mem,
@@ -137,11 +129,13 @@ static void *pool_system_realloc(pool_t pool ATTR_UNUSED, void *mem,
 		 old_size <= malloc_usable_size(mem));
 #endif
 
+	int old_errno = errno;
 	mem = realloc(mem, new_size);
 	if (unlikely(mem == NULL)) {
 		i_fatal_status(FATAL_OUTOFMEM, "pool_system_realloc(%zu): "
 			       "Out of memory", new_size);
 	}
+	errno = old_errno;
 
 	if (old_size < new_size) {
 		/* clear new data */

@@ -1,6 +1,39 @@
 #ifndef VAR_EXPAND_NEW_H
 #define VAR_EXPAND_NEW_H
 
+/** Variable expansion programs **
+
+  A variable expansion program is a set of filters delineated with %{},
+  or a literal-only program which expands to the string it contains.
+  See https://doc.dovecot.org/latest/core/settings/syntax.html#variable-expansion.
+
+  The normal usage is to call t_var_expand() to get rendition of a program from
+  data stack memory, or var_expand() if you want to provide the string yourself.
+  The string is appended to, or truncated to where it was on starting on failure.
+
+  If you need to expand the program multiple times, you should use
+  var_expand_program_create() to create a reusable program chain and then call
+  var_expand_program_execute() to expand it. Since parameters are given to execute
+  you can get the same program executed with different parameters, so you don't
+  have to rebuild the program if your variables are changed.
+
+  The function var_expand_program_create() parses a string that can contain
+  one or more programs, and chains them together. This is usually what is wanted.
+
+  There are some cases though when you need to deal with programs one by one,
+  and this is handled by 'var-expand-split.h', and there are a few functions here
+  that do not seem to make much sense alone:
+
+  The var_expand_program_execute_one() and var_expand_program_has_variable() are
+  such ones. The execute_one() only makes sense to use with individual programs
+  that can be extracted with var_expand_program_template() or
+  var_expand_program_split(), which are in their own header as they have
+  array.h dependency.
+
+  The var_expand_program_has_variable() can be used for generic purposes too
+  by leaving the first_program_only as FALSE.
+*/
+
 /* Used for getting either prefix:key values, or dynamic values for keys
    in value tables.
 
@@ -11,9 +44,10 @@
 */
 typedef int value_provider_func_t(const char *key, const char **value_r,
 				  void *context, const char **error_r);
-/* Used for escaping values, gets given string to escape and context,
-   must return escaped string. */
-typedef const char *var_expand_escape_func_t(const char *str, void *context);
+/* Used for escaping values. On success sets output_r and returns 0.
+   On failure sets error_r and returns -1. */
+typedef int var_expand_escape_func_t(const char *input, const char **output_r,
+				     void *context, const char **error_r);
 
 struct var_expand_parser_state;
 struct var_expand_program;
@@ -73,6 +107,14 @@ int var_expand_program_create(const char *str, struct var_expand_program **progr
 			      const char **error_r);
 /* Lists all seen variables in a program */
 const char *const *var_expand_program_variables(const struct var_expand_program *program);
+/* Checks if the program has a variable, if first_program_only is set, checks the
+  first program only, otherwise it checks the variables using var_expand_program_variables().
+
+  The check is done to all filters and parameters on the first program, so it can detect
+  if the variable is used anywhere in the program.
+*/
+bool var_expand_program_has_variable(const struct var_expand_program *program,
+				     const char *variable, bool first_program_only);
 /* Dumps the program into a dest for debugging */
 void var_expand_program_dump(const struct var_expand_program *program, string_t *dest);
 /* Executes the program with given params. Params can be left NULL, in which case
@@ -80,6 +122,10 @@ void var_expand_program_dump(const struct var_expand_program *program, string_t 
 int var_expand_program_execute(string_t *dest, const struct var_expand_program *program,
 			       const struct var_expand_params *params,
 			       const char **error_r) ATTR_NULL(3);
+/* Execute the first program only */
+int var_expand_program_execute_one(string_t *dest, const struct var_expand_program *program,
+				   const struct var_expand_params *params,
+				   const char **error_r);
 /* Free up program */
 void var_expand_program_free(struct var_expand_program **_program);
 
@@ -192,6 +238,14 @@ static inline void var_expand_table_copy(struct var_expand_table *table,
 const char *var_expand_program_export(const struct var_expand_program *program);
 void var_expand_program_export_append(string_t *dest,
 				      const struct var_expand_program *program);
+
+/* Reconstruct var_expand program */
+const char *var_expand_program_to_string_one(const struct var_expand_program *program);
+const char *var_expand_program_to_string(const struct var_expand_program *program);
+void var_expand_program_to_string_append_one(string_t *dest,
+					 const struct var_expand_program *program);
+void var_expand_program_to_string_append(string_t *dest,
+					 const struct var_expand_program *program);
 
 /* Imports a variable expansion program exported by var_expand_program_export(). */
 

@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libdriver_test.la libsql.la
 
 SQL_DRIVER_PLUGINS =
@@ -58,6 +60,12 @@ libsql_la_SOURCES = \
 	$(driver_sources) \
 	driver-sqlpool.c
 libsql_la_LIBADD = $(SQL_LIBS)
+if !SQL_PLUGINS
+if BUILD_CASSANDRA
+libsql_la_LIBADD += $(SSL_LIBS)
+endif
+endif
+
 
 nodist_libsql_la_SOURCES = sql-drivers-register.c
 
@@ -78,8 +86,8 @@ libdriver_sqlite_la_CPPFLAGS = $(AM_CPPFLAGS) $(SQLITE_CFLAGS)
 libdriver_sqlite_la_SOURCES = driver-sqlite.c
 
 libdriver_cassandra_la_LDFLAGS = -module -avoid-version
-libdriver_cassandra_la_LIBADD = $(CASSANDRA_LIBS)
-libdriver_cassandra_la_CPPFLAGS = $(AM_CPPFLAGS) $(CASSANDRA_CFLAGS)
+libdriver_cassandra_la_LIBADD = $(CASSANDRA_LIBS) $(SSL_LIBS)
+libdriver_cassandra_la_CPPFLAGS = $(AM_CPPFLAGS) $(CASSANDRA_CFLAGS) $(SSL_CFLAGS)
 libdriver_cassandra_la_SOURCES = driver-cassandra.c
 else
 endif
@@ -146,22 +154,15 @@ test_libs = \
 	$(noinst_LTLIBRARIES) \
 	../lib-dovecot/libdovecot.la
 
-check_PROGRAMS = test-sql
+test_programs = test-sql
 
 test_sql_SOURCES = test-sql.c
 test_sql_LDADD =  $(test_libs) $(DLLIB)
 test_sql_DEPENDENCIES = $(test_libs)
 
 if BUILD_SQLITE
-check_PROGRAMS += test-sql-sqlite
+test_programs += test-sql-sqlite
 test_sql_sqlite_SOURCES = test-sql-sqlite.c
 test_sql_sqlite_LDADD = $(SQLITE_LIB) $(pkglib_LTLIBRARIES) $(test_libs) $(DLLIB)
 test_sql_sqlite_DEPENDENCIES = $(SQLITE_LIB) $(pkglib_LTLIBRARIES) $(test_libs)
 endif
-
-noinst_PROGRAMS = $(check_PROGRAMS)
-
-check-local:
-	for bin in $(check_PROGRAMS); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done

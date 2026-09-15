@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "ostream.h"
@@ -227,9 +227,19 @@ static bool cmd_fetch_finish(struct imap_fetch_context *ctx,
 			return cmd->cancel;
 		}
 
-		if (ctx->error == MAIL_ERROR_NONE)
+		if (ctx->error == MAIL_ERROR_NONE) {
+			if (cmd->client->output->stream_errno != 0) {
+				/* Output stream failed without going through
+				   fetch_stream_continue(). */
+				client_disconnect(cmd->client, t_strconcat(
+					"FETCH failed: ",
+					o_stream_get_error(cmd->client->output),
+					NULL));
+				imap_fetch_free(&ctx);
+				return TRUE;
+			}
 			client_error = mailbox_get_last_error(cmd->client->mailbox, &error);
-		else {
+		} else {
 			client_error = ctx->errstr;
 			error = ctx->error;
 		}
@@ -355,7 +365,7 @@ bool cmd_fetch(struct client_command_context *cmd)
 		return ret < 0;
 
 	ctx = imap_fetch_alloc(client, cmd->pool,
-			       imap_client_command_get_reason(cmd));
+			       imap_client_command_get_reason(cmd), cmd->utf8);
 
 	if (!fetch_parse_args(ctx, cmd, &args[1], &next_arg) ||
 	    (imap_arg_get_list(next_arg, &list_arg) &&

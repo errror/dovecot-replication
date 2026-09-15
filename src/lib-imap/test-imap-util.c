@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -73,7 +73,7 @@ static void test_imap_write_capabilities(void)
 	ARRAY_TYPE(const_string) capabilities;
 	t_array_init(&capabilities, 5);
 	const char *const unsorted_capabilities[] = {
-		"foo", "bar", "IMAP4rev1", "baz", "IMAP4rev2"
+		"foo", "bar", "IMAP4rev1", "baz", "IMAP4rev2", NULL
 	};
 	array_append(&capabilities, unsorted_capabilities, N_ELEMENTS(unsorted_capabilities));
 	string_t *cap_str = t_str_new(256);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -18,6 +18,7 @@
 struct auth_penalty_request {
 	struct auth_request *auth_request;
 	struct anvil_client *client;
+	struct event *event;
 	auth_penalty_callback_t *callback;
 };
 
@@ -71,15 +72,17 @@ auth_penalty_anvil_callback(const struct anvil_reply *reply,
 
 	if (reply->error != NULL) {
 		/* internal failure. */
-		e_error(request->auth_request->event,
+		e_error(request->event,
 			"Auth penalty lookup failed: %s", reply->error);
 		if (!anvil_client_is_connected(request->client)) {
 			/* we probably didn't have permissions to reconnect
 			   back to anvil. need to restart ourself. */
+			e_warning(request->event,
+				"Anvil not connected - restarting auth process");
 			master_service_stop(master_service);
 		}
 	} else if (sscanf(reply->reply, "%u %lu", &penalty, &last_penalty) != 2) {
-		e_error(request->auth_request->event,
+		e_error(request->event,
 			"Invalid PENALTY-GET reply: %s", reply->reply);
 	} else {
 		if ((time_t)last_penalty > ioloop_time) {
@@ -96,10 +99,13 @@ auth_penalty_anvil_callback(const struct anvil_reply *reply,
 			drop_penalty--;
 			penalty--;
 		}
+		secs = penalty == 0 ? 0 : auth_penalty_to_secs(penalty);
+		e_debug(request->event, "Delaying response for %u seconds", secs);
 	}
 
 	request->callback(penalty, request->auth_request);
 	auth_request_unref(&request->auth_request);
+	event_unref(&request->event);
 	i_free(request);
 }
 
@@ -133,6 +139,9 @@ void auth_penalty_lookup(struct auth_penalty *penalty,
 
 	request = i_new(struct auth_penalty_request, 1);
 	request->auth_request = auth_request;
+	request->event = event_create(auth_request->event);
+	event_set_append_log_prefix(request->event,
+		t_strdup_printf("penalty(%s): ", ident));
 	request->client = penalty->client;
 	request->callback = callback;
 	auth_request_ref(auth_request);

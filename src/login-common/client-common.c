@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "hex-binary.h"
@@ -30,6 +30,8 @@
 #include "login-proxy.h"
 #include "settings-parser.h"
 #include "client-common.h"
+#include "var-expand-split.h"
+#include "login-log.h"
 
 struct client *clients = NULL;
 struct client *destroyed_clients = NULL;
@@ -56,6 +58,7 @@ static const char *client_auth_fail_code_reasons[] = {
 	"tried to use unsupported auth mechanism",
 	"tried to use disallowed cleartext auth",
 	"anonymous logins disabled",
+	"credentials contain control characters",
 };
 static_assert_array_size(client_auth_fail_code_reasons,
 			 CLIENT_AUTH_FAIL_CODE_COUNT);
@@ -71,6 +74,7 @@ static const char *client_auth_fail_code_event_reasons[] = {
 	"invalid_mech",
 	"cleartext_auth_disabled",
 	"anonymous_auth_disabled",
+	"invalid_credentials",
 };
 static_assert_array_size(client_auth_fail_code_event_reasons,
 			 CLIENT_AUTH_FAIL_CODE_COUNT);
@@ -163,7 +167,8 @@ void client_rawlog_init(struct client *client)
 
 	client->pre_rawlog_input = client->input;
 	client->pre_rawlog_output = client->output;
-	if (iostream_rawlog_create(login_rawlog_dir, &client->input,
+	if (iostream_rawlog_create(client->event, "login rawlog",
+				   login_rawlog_dir, &client->input,
 				   &client->output) < 0) {
 		login_rawlog_dir = NULL;
 		return;
@@ -288,7 +293,7 @@ int client_alloc(int fd, const struct master_service_connection *conn,
 	client->real_remote_port = conn->real_remote_port;
 	client->listener_name = p_strdup(client->pool, conn->name);
 	/* This event must exist before client_is_trusted() is called */
-	client->event = event_create(NULL);
+	client->event = event_create(master_service_get_event(master_service));
 	event_add_category(client->event, &login_binary->event_category);
 	event_add_ip(client->event, "local_ip", &conn->local_ip);
 	event_add_int(client->event, "local_port", conn->local_port);
@@ -335,6 +340,7 @@ int client_alloc(int fd, const struct master_service_connection *conn,
 		   TLS secured anyway. */
 		client->connection_tls_secured = conn->haproxy.ssl;
 		client->haproxy_terminated_tls = conn->haproxy.ssl;
+		client->haproxy_ssl_client_cert = conn->haproxy.ssl_client_cert;
 		/* Start by assuming this is the end client connection.
 		   Later on this can be overwritten. */
 		client->end_client_tls_secured = conn->haproxy.ssl;
@@ -460,6 +466,8 @@ void client_disconnect(struct client *client, const char *reason)
 	if (!client->login_success) {
 		bool unref = FALSE;
 
+		if (client->v.disconnect != NULL)
+			client->v.disconnect(client, reason);
 		io_remove(&client->io);
 		ssl_iostream_destroy(&client->ssl_iostream);
 		if (client->iostream_fd_proxy != NULL) {
@@ -525,7 +533,8 @@ void client_destroy(struct client *client, const char *reason)
 	} else if (client->auth_request != NULL ||
 		   client->anvil_query != NULL) {
 		i_assert(client->authenticating);
-		sasl_server_auth_abort(client);
+		sasl_proxy_auth_abort(client,
+				      reason != NULL ? reason : "Aborted");
 	}
 	i_assert(!client->authenticating);
 	i_assert(client->auth_request == NULL);
@@ -534,7 +543,8 @@ void client_destroy(struct client *client, const char *reason)
 	if (client->reauth_request != NULL) {
 		struct auth_client_request *reauth_request =
 			client->reauth_request;
-		auth_client_request_abort(&reauth_request, "Aborted");
+		auth_client_request_abort(&reauth_request,
+					  reason != NULL ? reason : "Aborted");
 		/* callback sets this to NULL */
 		i_assert(client->reauth_request == NULL);
 	}
@@ -639,6 +649,8 @@ bool client_unref(struct client **_client)
 	i_free(client->virtual_user_orig);
 	i_free(client->virtual_auth_user);
 	i_free(client->auth_mech_name);
+	i_free(client->last_proxy_auth_failure_reason);
+	i_free(client->proxy_last_host);
 	i_free(client->master_data_prefix);
 	pool_unref(&client->pool);
 
@@ -656,23 +668,25 @@ void client_common_default_free(struct client *client ATTR_UNUSED)
 
 bool client_destroy_oldest(bool kill, struct timeval *created_r)
 {
-	struct client *client;
-
-	if (last_client == NULL) {
-		/* we have no clients */
-		return FALSE;
-	}
+	struct client *client, *last_refcount_non1 = NULL;
 
 	/* destroy the last client that hasn't successfully authenticated yet.
 	   this is usually the last client, but don't kill it if it's just
 	   waiting for master to finish its job. Also prefer to kill clients
 	   that can immediately be killed (i.e. refcount=1) */
 	for (client = last_client; client != NULL; client = client->prev) {
-		if (client->master_tag == 0 && client->refcount == 1)
+		if (client->master_tag != 0) {
+			/* never kill clients that are just waiting */
+		} else if (client->refcount > 1)
+			last_refcount_non1 = client;
+		else
 			break;
 	}
-	if (client == NULL)
-		client = last_client;
+	if (client == NULL) {
+		client = last_refcount_non1;
+		if (client == NULL)
+			return FALSE;
+	}
 
 	*created_r = client->created;
 	if (!kill)
@@ -704,18 +718,26 @@ void clients_destroy_all(void)
 	clients_destroy_all_reason(MASTER_SERVICE_SHUTTING_DOWN_MSG);
 }
 
-int client_sni_callback(const char *name, const char **error_r,
-			void *context)
+int client_addresses_changed(struct client *client, const char **error_r)
 {
-	struct client *client = context;
-	struct ssl_iostream_context *ssl_ctx;
-	const struct ssl_iostream_settings *ssl_set;
-	int ret;
+	const char *error;
 
-	if (client->ssl_servername_settings_read)
-		return 0;
-	client->ssl_servername_settings_read = TRUE;
+	event_add_ip(client->event, "local_ip", &client->local_ip);
+	event_add_int(client->event, "local_port", client->local_port);
+	event_add_ip(client->event, "remote_ip", &client->ip);
+	event_add_int(client->event, "remote_port", client->remote_port);
+	event_add_str(client->event, "local_name", client->local_name);
 
+	if (client_settings_reload(client, &error) < 0) {
+		e_error(client->event, "%s", error);
+		*error_r = error;
+		return -1;
+	}
+	return 0;
+}
+
+int client_settings_reload(struct client *client, const char **error_r)
+{
 	const struct login_settings *old_set = client->set;
 	const struct ssl_settings *old_ssl_set = client->ssl_set;
 	const struct ssl_server_settings *old_ssl_server_set =
@@ -724,11 +746,6 @@ int client_sni_callback(const char *name, const char **error_r,
 	client->ssl_set = NULL;
 	client->ssl_server_set = NULL;
 
-	/* Add local_name also to event. This is especially important to get
-	   local_name { .. } config filters to work when looking up the settings
-	   again. */
-	event_add_str(client->event, "local_name", name);
-	client->local_name = p_strdup(client->pool, name);
 	if (client_settings_get(client, error_r) < 0 ||
 	    (client->v.reload_config != NULL &&
 	     client->v.reload_config(client, error_r) < 0)) {
@@ -743,6 +760,28 @@ int client_sni_callback(const char *name, const char **error_r,
 	settings_free(old_set);
 	settings_free(old_ssl_set);
 	settings_free(old_ssl_server_set);
+	return 0;
+}
+
+int client_sni_callback(const char *name, const char **error_r,
+			void *context)
+{
+	struct client *client = context;
+	struct ssl_iostream_context *ssl_ctx;
+	const struct ssl_iostream_settings *ssl_set;
+	int ret;
+
+	if (client->ssl_servername_settings_read)
+		return 0;
+	client->ssl_servername_settings_read = TRUE;
+
+	/* Add local_name also to event. This is especially important to get
+	   local_name { .. } config filters to work when looking up the settings
+	   again. */
+	event_add_str(client->event, "local_name", name);
+	client->local_name = p_strdup(client->pool, name);
+	if (client_settings_reload(client, error_r) < 0)
+		return -1;
 
 	ssl_server_settings_to_iostream_set(client->ssl_set,
 		client->ssl_server_set, &ssl_set);
@@ -1016,6 +1055,11 @@ bool client_forward_decode_base64(struct client *client, const char *value)
 	string_t *str = t_str_new(MAX_BASE64_DECODED_SIZE(value_len));
 	if (base64_decode(value, value_len, str) < 0)
 		return FALSE;
+	/* Embedded NUL would yield a created-but-empty array, panicking later
+	   in array_front() during sasl_server_auth_begin(). */
+	if (str_len(str) == 0 ||
+	    memchr(str_data(str), '\0', str_len(str)) != NULL)
+		return FALSE;
 
 	char **_fields = p_strsplit_tabescaped(client->preproxy_pool,
 					       str_c(str));
@@ -1219,7 +1263,7 @@ get_var_expand_params(struct client *client)
 	var_expand_table_set_value(tab, "real_local_ip",
 			net_ip2addr(&client->real_local_ip));
 	var_expand_table_set_value(tab, "real_remote_ip",
-			net_ip2addr(&client->real_local_ip));
+			net_ip2addr(&client->real_remote_ip));
 	var_expand_table_set_value(tab, "real_local_port",
 			dec2str(client->real_local_port));
 	var_expand_table_set_value(tab, "real_remote_port",
@@ -1256,6 +1300,42 @@ client_var_expand_callback(void *context, struct var_expand_params *params_r)
 	*params_r = *params;
 }
 
+static int expand_element(string_t *dest, const char *elem,
+			  const struct login_log_settings *log_set, unsigned int *i,
+			  const struct var_expand_params *params,
+			  bool *has_user_r, const char **errelem_r,
+			  const char **error_r)
+{
+	if (strchr(elem, *LOG_ELEMENT_PLACEHOLDER) == NULL) {
+		str_append(dest, elem);
+		return 0;
+	}
+
+	const char *ptr = elem;
+	const char *pptr = ptr;
+	int ret = 0;
+
+	/* Find all placeholders in this element, and try expand corresponding
+	   program. If it fails, reconstruct the original program for error
+	   logging. */
+	while ((ptr = strchr(pptr, *LOG_ELEMENT_PLACEHOLDER)) != NULL) {
+		str_append_data(dest, pptr, ptr - pptr);
+		const struct var_expand_program *prog =
+			array_idx_elem(&log_set->elements, *i);
+		*has_user_r = var_expand_program_has_variable(prog, "user", TRUE);
+		(*i)++;
+		if (var_expand_program_execute_one(dest, prog, params, error_r) < 0) {
+			/* write the failed program here */
+			if (errelem_r != NULL)
+				*errelem_r = var_expand_program_to_string_one(prog);
+			ret = -1;
+		}
+		pptr = ptr + 1;
+	}
+	str_append(dest, pptr);
+	return ret;
+}
+
 static const char *
 client_get_log_str(struct client *client, const char *msg)
 {
@@ -1269,43 +1349,60 @@ client_get_log_str(struct client *client, const char *msg)
 		.event = client->event,
 	};
 	static bool expand_error_logged = FALSE;
-	char *const *e;
-	const char *error;
+	const char *const *e;
+	const char *errelem, *error;
 	string_t *str, *str2;
 
 	str = t_str_new(256);
 	str2 = t_str_new(256);
+
 	size_t pos = 0;
-	for (e = client->set->log_format_elements_split; *e != NULL; e++) {
-		pos = str->used;
-		struct var_expand_program *prog;
-		if (var_expand_program_create(*e, &prog, &error) < 0 ||
-		    var_expand_program_execute(str, prog, params, &error) < 0) {
+	unsigned int i = 0, i2;
+
+	for (e = client->set->log_set->template; *e != NULL; e++) {
+		pos = str_len(str);
+		bool has_user = FALSE;
+		str_truncate(str2, 0);
+		/* Keep track which program we were at, as expand_element
+		   is called twice, so we can rewind back to where we were. */
+		i2 = i;
+		int ret = expand_element(str2, *e, client->set->log_set, &i,
+					 params, &has_user, &errelem, &error);
+		if (ret < 0) {
 			if (!expand_error_logged) {
 				/* NOTE: Don't log via client->event -
 				   it would cause recursion. */
 				i_error("Failed to expand log_format_elements=%s: %s",
-					*e, error);
+					errelem, error);
 				expand_error_logged = TRUE;
 			}
 		}
-		const char *const *vars = var_expand_program_variables(prog);
-		if (str_array_find(vars, "user")) {
-			/* username is added even if it's empty */
-			var_expand_program_free(&prog);
-		} else {
+		str_append(str, str_c(str2));
+		if (has_user) {
+			/* if the element contained username somehow, we will
+			   print it even if it would expand to empty. */
+		} else if (strchr(*e, *LOG_ELEMENT_PLACEHOLDER) != NULL) {
+			/* render the element again against empty client
+			   so we can drop any elements that would've actually
+			   rendered as empty. */
+			i = i2;
 			str_truncate(str2, 0);
-			int ret = var_expand_program_execute(str2, prog,
-							     &empty_params, &error);
-			var_expand_program_free(&prog);
+			ret = expand_element(str2, *e, client->set->log_set, &i,
+					     &empty_params, &has_user, NULL,
+					     &error);
 			if (ret < 0 || strcmp(str_c(str)+pos, str_c(str2)) == 0) {
-				/* we just logged this error above. no need
-				   to do it again. */
+				/* so either it still errored or, the element
+				  was rendered without any acttual value.
+
+				  any errors were already logged in the previous
+				  expansion, so we can ignore it here.
+
+				  drop the element from output. */
 				str_truncate(str, pos);
 				continue;
 			}
 		}
-		pos = str->used;
+		pos = str_len(str);
 		if (str_len(str) > 0)
 			str_append(str, ", ");
 	}
@@ -1385,13 +1482,13 @@ bool client_get_extra_disconnect_reason(struct client *client,
 			*human_reason_r = "cert required, client didn't start TLS";
 			return TRUE;
 		}
-		if (!ssl_iostream_has_client_cert(client->ssl_iostream)) {
+		if (!ssl_iostream_has_cert(client->ssl_iostream)) {
 			*event_reason_r = "client_ssl_cert_missing";
 			*human_reason_r = "client didn't send a cert";
 			return TRUE;
 		}
 		if (client->ssl_server_set->parsed_opts.verify_client_cert &&
-		    !ssl_iostream_has_valid_client_cert(client->ssl_iostream)) {
+		    !ssl_iostream_has_valid_cert(client->ssl_iostream)) {
 			*event_reason_r = "client_ssl_cert_untrusted";
 			*human_reason_r = "client sent an untrusted cert";
 			return TRUE;
@@ -1446,7 +1543,8 @@ bool client_get_extra_disconnect_reason(struct client *client,
 			event_reason = "protocol_failure";
 			last_reason = "protocol failure";
 			break;
-		case LOGIN_PROXY_FAILURE_TYPE_AUTH:
+		case LOGIN_PROXY_FAILURE_TYPE_AUTH_REPLIED:
+		case LOGIN_PROXY_FAILURE_TYPE_AUTH_NOT_REPLIED:
 			event_reason = "auth_failed";
 			last_reason = "authentication failure";
 			break;
@@ -1455,15 +1553,22 @@ bool client_get_extra_disconnect_reason(struct client *client,
 			last_reason = "temporary authentication failure";
 			break;
 		case LOGIN_PROXY_FAILURE_TYPE_AUTH_REDIRECT:
-			event_reason = "redirected";
-			last_reason = "redirected";
+			/* Redirects fire proxy_session_finished directly with
+			   error_code=proxy_dest_redirected, so this is
+			   unreachable. */
+			i_unreached();
+		case LOGIN_PROXY_FAILURE_TYPE_AUTH_LIMIT_REACHED_REPLIED:
+			event_reason = "connection_limit";
+			last_reason = "connection limit reached";
 			break;
 		default:
 			i_unreached();
 		}
 		/* Authentication to the next hop failed. */
 		*event_reason_r = t_strdup_printf("proxy_dest_%s", event_reason);
-		last_reason = t_strdup_printf("proxy dest %s", last_reason);
+		last_reason = t_strdup_printf("proxy dest %s to %s",
+					      last_reason,
+					      client->proxy_last_host == NULL ? "(unknown)" : client->proxy_last_host);
 	} else if (client->auth_login_limit_reached) {
 		*event_reason_r = "connection_limit";
 		last_reason = "connection limit reached";
@@ -1493,6 +1598,10 @@ bool client_get_extra_disconnect_reason(struct client *client,
 	}
 
 	str_printfa(str, "in %u secs", auth_secs);
+	if (client->last_proxy_auth_failure_reason != NULL) {
+		str_printfa(str, ", last failure: %s",
+			    str_sanitize(client->last_proxy_auth_failure_reason, 160));
+	}
 	*human_reason_r = str_c(str);
 	i_assert(*event_reason_r != NULL);
 	return TRUE;
@@ -1540,10 +1649,21 @@ void client_notify_auth_ready(struct client *client)
 	}
 }
 
+void client_notify_auth_connected(struct client *client)
+{
+	if (client->v.notify_auth_connected != NULL)
+		client->v.notify_auth_connected(client);
+}
+
 void client_notify_status(struct client *client, bool bad, const char *text)
 {
 	if (client->v.notify_status != NULL)
 		client->v.notify_status(client, bad, text);
+}
+
+static void client_send_raw_data_destroy(struct client *client)
+{
+	client_destroy(client, "Disconnected: Output error");
 }
 
 void client_common_send_raw_data(struct client *client,
@@ -1556,8 +1676,18 @@ void client_common_send_raw_data(struct client *client,
 		/* either disconnection or buffer full. in either case we want
 		   this connection destroyed. however destroying it here might
 		   break things if client is still tried to be accessed without
-		   being referenced.. */
+		   being referenced, so do it lazily from a timeout. */
+		io_remove(&client->io);
 		i_stream_close(client->input);
+		/* If the client is already being destroyed, don't schedule
+		   another destroy. Its to_disconnect was already removed and
+		   wouldn't be cleaned up again, leaking the timeout. */
+		if (!client->destroyed) {
+			timeout_remove(&client->to_disconnect);
+			client->to_disconnect =
+				timeout_add_short(0,
+					client_send_raw_data_destroy, client);
+		}
 	}
 }
 

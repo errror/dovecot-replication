@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "randgen.h"
@@ -951,7 +951,7 @@ static void test_json_io(void)
 					(pos > margin ? pos - margin : 0));
 				if (wret > 0 && pret == 0) {
 					pret = json_parse_more(tproc.parser,
-							       &error);
+							       NULL, &error);
 					if (pret < 0)
 						break;
 				}
@@ -962,8 +962,10 @@ static void test_json_io(void)
 					break;
 			}
 
-			if (pret == 0)
-				pret = json_parse_more(tproc.parser, &error);
+			if (pret == 0) {
+				pret = json_parse_more(tproc.parser, NULL,
+						       &error);
+			}
 
 			o_stream_set_max_buffer_size(output, SIZE_MAX);
 			wret = json_generator_flush(tproc.generator);
@@ -1002,7 +1004,7 @@ static void test_json_async_io_input_callback(struct test_io_processor *tproc)
 	const char *error;
 	int ret;
 
-	ret = json_parse_more(tproc->parser, &error);
+	ret = json_parse_more(tproc->parser, NULL, &error);
 	if (ret == 0) {
 		ret = test_write(tproc);
 		if (ret == 0) {
@@ -1751,6 +1753,56 @@ static void test_json_text_io(void)
 	buffer_free(&outbuf_compact);
 }
 
+/* json_text_format_cstr()/json_text_format_buffer()/json_text_format_data()
+   drive the same json_istream_walk_stream() path json-format's
+   file-processing loop uses. That path turns a long string value into a
+   one-shot, non-seekable stream once it crosses
+   json_parser_enable_string_stream()'s internal threshold (clamped to
+   IO_BLOCK_SIZE, 8192 bytes here) - a size none of the strings in the
+   `tests' table above reach. Exercise a string well past that threshold
+   so a regression in that stream path (e.g. rewinding or asserting on a
+   non-seekable stream) is caught here rather than only by callers that
+   happen to process large input. */
+static void test_json_text_io_large_string(void)
+{
+	string_t *text, *outbuf, *outbuf2;
+	const char *error;
+	unsigned int i;
+	int ret;
+
+	test_begin("json text io large string");
+
+	text = str_new(default_pool, 20002);
+	str_append_c(text, '"');
+	for (i = 0; i < 20000; i++)
+		str_append_c(text, 'A' + (i % 26));
+	str_append_c(text, '"');
+
+	outbuf = str_new(default_pool, 20002);
+	outbuf2 = str_new(default_pool, 20002);
+
+	ret = json_text_format_cstr(str_c(text), 0, NULL, NULL,
+				    outbuf, &error);
+	test_out_reason_quiet("format cstr success", ret > 0, error);
+	test_assert_strcmp(str_c(text), str_c(outbuf));
+
+	ret = json_text_format_buffer(outbuf, 0, NULL, NULL, outbuf2, &error);
+	test_out_reason_quiet("format buffer success", ret > 0, error);
+	test_assert_strcmp(str_c(text), str_c(outbuf2));
+
+	str_truncate(outbuf, 0);
+	ret = json_text_format_data(str_data(text), str_len(text), 0, NULL,
+				    NULL, outbuf, &error);
+	test_out_reason_quiet("format data success", ret > 0, error);
+	test_assert_strcmp(str_c(text), str_c(outbuf));
+
+	str_free(&text);
+	str_free(&outbuf);
+	str_free(&outbuf2);
+
+	test_end();
+}
+
 /*
  * File I/O
  */
@@ -1901,6 +1953,7 @@ int main(int argc, char *argv[])
 		test_json_stream_io,
 		test_json_stream_io_async,
 		test_json_text_io,
+		test_json_text_io_large_string,
 		NULL
 	};
 

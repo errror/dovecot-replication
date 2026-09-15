@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -82,17 +82,14 @@ static int mail_index_mmap(struct mail_index_map *map, uoff_t file_size)
 	if (!mail_index_hdr_check_indexid(index, hdr))
 		return -1;
 
-	rec_map->mmap_used_size = hdr->header_size +
-		hdr->messages_count * hdr->record_size;
+	/* header_size was checked by mail_index_check_header_compat() */
+	i_assert(hdr->header_size <= rec_map->mmap_size);
+	rec_map->records_count = (rec_map->mmap_size - hdr->header_size) /
+		hdr->record_size;
 
-	if (rec_map->mmap_used_size <= rec_map->mmap_size)
+	if (hdr->messages_count <= rec_map->records_count)
 		rec_map->records_count = hdr->messages_count;
 	else {
-		rec_map->records_count =
-			(rec_map->mmap_size - hdr->header_size) /
-			hdr->record_size;
-		rec_map->mmap_used_size = hdr->header_size +
-			rec_map->records_count * hdr->record_size;
 		mail_index_set_error(index, "Corrupted index file %s: "
 				     "messages_count too large (%u > %u)",
 				     index->filepath, hdr->messages_count,
@@ -191,6 +188,9 @@ mail_index_try_read_map(struct mail_index_map *map,
 		records_size = (size_t)hdr->messages_count * hdr->record_size;
 		records_count = hdr->messages_count;
 
+		/* the whole header_size was just successfully read into
+		   hdr_copy_buf. */
+		i_assert(hdr->header_size <= file_size);
 		if (file_size - hdr->header_size < records_size ||
 		    (hdr->record_size != 0 &&
 		     records_size / hdr->record_size != hdr->messages_count)) {
@@ -386,6 +386,7 @@ mail_index_map_latest_file(struct mail_index *index, const char **reason_r)
 		old_map = index->map;
 		index->map = new_map;
 		if (mail_index_fsck(index) < 0) {
+			index->map = old_map;
 			ret = -1;
 			break;
 		}

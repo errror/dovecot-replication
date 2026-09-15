@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "base64.h"
@@ -39,7 +39,7 @@ static bool cmd_quit(struct pop3_client *client)
 static bool cmd_xclient(struct pop3_client *client, const char *args)
 {
 	const char *const *tmp, *value;
-	in_port_t remote_port;
+	in_port_t remote_port, local_port;
 	bool args_ok = TRUE;
 
 	if (!client->common.connection_trusted) {
@@ -56,6 +56,14 @@ static bool cmd_xclient(struct pop3_client *client, const char *args)
 				args_ok = FALSE;
 			else
 				client->common.remote_port = remote_port;
+		} else if (str_begins_icase(*tmp, "DESTADDR=", &value)) {
+			if (net_addr2ip(value, &client->common.local_ip) < 0)
+				args_ok = FALSE;
+		} else if (str_begins_icase(*tmp, "DESTPORT=", &value)) {
+			if (net_str2port(value, &local_port) < 0)
+				args_ok = FALSE;
+			else
+				client->common.local_port = local_port;
 		} else if (str_begins_icase(*tmp, "SESSION=", &value)) {
 			if (strlen(value) <= LOGIN_MAX_SESSION_ID_LEN) {
 				client->common.session_id =
@@ -87,6 +95,15 @@ static bool cmd_xclient(struct pop3_client *client, const char *args)
 	}
 
 	/* args ok, set them and reset the state */
+	const char *error;
+	if (client_addresses_changed(&client->common, &error) < 0) {
+		client_send_reply(&client->common,
+				  POP3_CMD_REPLY_ERROR,
+				  "Failed to reload configuration");
+		client_destroy(&client->common, error);
+		return TRUE;
+	}
+
 	client_send_reply(&client->common, POP3_CMD_REPLY_OK, "Updated");
 	return TRUE;
 }
@@ -232,7 +249,8 @@ static char *get_apop_challenge(struct pop3_client *client)
 	unsigned char buffer_base64[MAX_BASE64_ENCODED_SIZE(sizeof(buffer)) + 1];
 	buffer_t buf;
 
-	if (sasl_server_find_available_mech(&client->common, "APOP") == NULL) {
+	if (sasl_proxy_find_available_mech(
+		&client->common, AUTH_SASL_MECH_NAME_APOP) == NULL) {
 		/* disabled, no need to present the challenge */
 		return NULL;
 	}
@@ -300,6 +318,9 @@ void client_send_reply(struct client *client, enum pop3_cmd_reply reply,
 		break;
 	case POP3_CMD_REPLY_TEMPFAIL:
 		prefix = "-ERR [SYS/TEMP]";
+		break;
+	case POP3_CMD_REPLY_LIMIT:
+		prefix = "-ERR [IN-USE]";
 		break;
 	case POP3_CMD_REPLY_AUTH_ERROR:
 		if (text[0] == '[')
@@ -375,6 +396,7 @@ static struct client_vfuncs pop3_client_vfuncs = {
 
 static struct login_binary pop3_login_binary = {
 	.protocol = "pop3",
+	.service_name = "pop3",
 	.process_name = "pop3-login",
 	.default_port = POP3_DEFAULT_PORT,
 	.default_ssl_port = POP3S_DEFAULT_PORT,

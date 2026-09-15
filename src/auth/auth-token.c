@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 /* Auth process maintains a random secret. Once a user authenticates the
    response to the REQUEST command from a master service is augmented with an
@@ -105,7 +105,7 @@ auth_token_write_secret(const char *path,
 	temp_path = t_strconcat(path, ".tmp", NULL);
 
 	old_mask = umask(0);
-	fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
 	umask(old_mask);
 
 	if (fd == -1) {

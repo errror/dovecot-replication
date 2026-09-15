@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -62,6 +62,8 @@ static void doveadm_print_formatted_print(const char *value)
 	entry->value = value;
 
 	if (ctx.idx >= array_count(&ctx.headers)) {
+		array_append_zero(&ctx.headers);
+		array_pop_back(&ctx.headers);
 		const struct var_expand_params params = {
 			.table = array_front(&ctx.headers),
 		};
@@ -81,13 +83,12 @@ static void doveadm_print_formatted_deinit(void)
 }
 
 struct doveadm_print_vfuncs doveadm_print_formatted_vfuncs = {
-	"formatted",
+	.name = "formatted",
 
-	doveadm_print_formatted_init,
-	doveadm_print_formatted_deinit,
-	doveadm_print_formatted_header,
-	doveadm_print_formatted_print,
-	NULL,
-	doveadm_print_formatted_flush
+	.init = doveadm_print_formatted_init,
+	.deinit = doveadm_print_formatted_deinit,
+	.header = doveadm_print_formatted_header,
+	.print = doveadm_print_formatted_print,
+	.flush = doveadm_print_formatted_flush,
 };
 

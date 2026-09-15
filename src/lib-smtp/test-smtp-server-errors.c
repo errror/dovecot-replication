@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -1291,8 +1291,8 @@ test_server_big_data_data_continue(void *conn_ctx ATTR_UNUSED,
 	}
 
 	if (ctx->payload_input->v_offset >= max_size) {
-		smtp_server_reply_early(cmd, 552, "5.3.4",
-					"Message too big for system");
+		smtp_server_reply(cmd, 552, "5.3.4",
+				  "Message too big for system");
 		return -1;
 	}
 
@@ -3879,6 +3879,7 @@ static void test_server_defaults(struct smtp_server_settings *smtp_set)
 	smtp_set->max_pipelined_commands = 1;
 	smtp_set->auth_optional = TRUE;
 	smtp_set->debug = debug;
+	smtp_set->max_recipients = SET_UINT_UNLIMITED;
 }
 
 static void
@@ -3914,10 +3915,10 @@ static void server_connection_accept(void *context ATTR_UNUSED)
 
 	/* accept new client */
 	fd = net_accept(fd_listen, NULL, NULL);
-	if (fd == -1)
+	if (fd == -1) {
+		if (!NET_ACCEPT_ENOCONN(errno))
+			i_fatal("test server: accept() failed: %m");
 		return;
-	if (fd == -2) {
-		i_fatal("test server: accept() failed: %m");
 	}
 
 	if (debug)
@@ -3931,7 +3932,8 @@ static void server_connection_accept(void *context ATTR_UNUSED)
 
 	if (server_io_buffer_size == 0) {
 		conn = smtp_server_connection_create(
-			smtp_server, fd, fd, NULL, 0, (test_ssl_host != NULL),
+			smtp_server, fd, fd, NULL, 0, NULL, 0,
+			(test_ssl_host != NULL),
 			NULL, &server_callbacks, sconn);
 	} else {
 		struct istream *input;
@@ -3942,7 +3944,7 @@ static void server_connection_accept(void *context ATTR_UNUSED)
 		o_stream_set_no_error_handling(output, TRUE);
 
 		conn = smtp_server_connection_create_from_streams(
-			smtp_server, input, output, NULL, 0, NULL,
+			smtp_server, input, output, NULL, 0, NULL, 0, NULL,
 			&server_callbacks, sconn);
 
 		i_stream_unref(&input);
@@ -4167,7 +4169,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	test_subprocesses_init(debug);
+	test_init();
+	event_set_forced_debug(test_event, debug);
+	test_subprocesses_init();
 
 	/* listen on localhost */
 	i_zero(&bind_ip);
@@ -4176,7 +4180,6 @@ int main(int argc, char *argv[])
 
 	ret = test_run(test_functions);
 
-	test_subprocesses_deinit();
 	main_deinit();
 	lib_deinit();
 

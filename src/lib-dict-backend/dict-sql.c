@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -889,6 +889,7 @@ static bool sql_dict_iterate(struct dict_iterate_context *_ctx,
 				return FALSE;
 			}
 		}
+		i_assert(ctx->result != NULL);
 		ret = sql_dict_result_next_row(ctx->map, ctx->result);
 	}
 	if (ret == 0) {

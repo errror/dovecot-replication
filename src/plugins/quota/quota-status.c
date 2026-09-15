@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -316,7 +316,7 @@ static void client_destroy(struct connection *conn)
 }
 
 static struct connection_settings client_set = {
-	.input_max_size = SIZE_MAX,
+	.input_max_size = 1024,
 	.output_max_size = SIZE_MAX,
 	.client = FALSE
 };
@@ -343,7 +343,6 @@ static void main_init(void)
 
 	clients = connection_list_init(&client_set, &client_vfuncs);
 	storage_service = mail_storage_service_init(master_service,
-		MAIL_STORAGE_SERVICE_FLAG_ALLOW_ROOT |
 		MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP |
 		MAIL_STORAGE_SERVICE_FLAG_TEMP_PRIV_DROP |
 		MAIL_STORAGE_SERVICE_FLAG_ENABLE_CORE_DUMPS |

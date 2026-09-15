@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 
@@ -23,6 +23,7 @@ static void
 static_credentials_callback(enum passdb_result result,
 			    const unsigned char *credentials ATTR_UNUSED,
 			    size_t size ATTR_UNUSED,
+			    const char *scheme ATTR_UNUSED,
 			    struct auth_request *auth_request)
 {
 	struct static_context *ctx = auth_request->context;
@@ -94,7 +95,7 @@ static void static_lookup(struct auth_request *auth_request,
 		} else {
 			static_credentials_callback(
 				PASSDB_RESULT_SCHEME_NOT_AVAILABLE,
-				uchar_empty_ptr, 0, auth_request);
+				uchar_empty_ptr, 0, NULL, auth_request);
 		}
 	} else {
 		if (auth_request_set_userdb_fields(auth_request, NULL) < 0)
@@ -104,8 +105,10 @@ static void static_lookup(struct auth_request *auth_request,
 	}
 }
 
-static int static_preinit(pool_t pool, struct event *event,
-			  struct userdb_module **module_r, const char **error_r)
+static int
+static_preinit(pool_t pool, struct event *event,
+	       const struct userdb_parameters *userdb_params ATTR_UNUSED,
+	       struct userdb_module **module_r, const char **error_r)
 
 {
 	struct auth_static_settings *set;

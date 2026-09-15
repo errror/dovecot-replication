@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -102,12 +102,12 @@ static void doveadm_print_pager_deinit(void)
 }
 
 struct doveadm_print_vfuncs doveadm_print_pager_vfuncs = {
-	DOVEADM_PRINT_TYPE_PAGER,
+	.name = DOVEADM_PRINT_TYPE_PAGER,
 
-	doveadm_print_pager_init,
-	doveadm_print_pager_deinit,
-	doveadm_print_pager_header,
-	doveadm_print_pager_print,
-	doveadm_print_pager_print_stream,
-	doveadm_print_pager_flush
+	.init = doveadm_print_pager_init,
+	.deinit = doveadm_print_pager_deinit,
+	.header = doveadm_print_pager_header,
+	.print = doveadm_print_pager_print,
+	.print_stream = doveadm_print_pager_print_stream,
+	.flush = doveadm_print_pager_flush,
 };

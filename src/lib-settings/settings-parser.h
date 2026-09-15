@@ -2,6 +2,7 @@
 #define SETTINGS_PARSER_H
 
 #include "str-parse.h"
+#include "settings-consts.h"
 
 struct stat;
 struct var_expand_table;
@@ -11,16 +12,6 @@ struct var_expand_provider;
 #define SETTINGS_SEPARATOR_S "/"
 
 #define SETTINGS_FILTER_ARRAY_SEPARATORS ",\t "
-
-/* These values are shown as "unlimited" */
-#define SET_VALUE_UNLIMITED "unlimited"
-#define SET_UINT_UNLIMITED UINT_MAX
-#define SET_SIZE_UNLIMITED UOFF_T_MAX
-
-/* These values are shown as "infinite" */
-#define SET_VALUE_INFINITE "infinite"
-#define SET_TIME_INFINITE UINT_MAX
-#define SET_TIME_MSECS_INFINITE UINT_MAX
 
 #define SET_LIST_APPEND "+"
 #define SET_LIST_REPLACE "$"
@@ -39,6 +30,8 @@ enum setting_type {
 	SET_IN_PORT, /* internet port */
 	SET_STR, /* string with %variables */
 	SET_STR_NOVARS, /* string explicitly without %variables */
+	SET_PATH_FILE, /* file path: %variables and a leading ~/ are expanded */
+	SET_PATH_DIR, /* directory path: like SET_PATH_FILE, but a trailing / is also dropped */
 	SET_ENUM,
 	SET_FILE, /* string: <path> [<LF> file contents] */
 	SET_STRLIST, /* of type ARRAY_TYPE(const_string) */
@@ -51,6 +44,8 @@ enum setting_flags {
 	SET_FLAG_HIDDEN = BIT(0),
 	/* Used only for SETTING_DEFINE_LIST_END */
 	SET_FLAG_EOL = BIT(1),
+	/* Setting is normalized as Unicode Normalization Form C (NFC) */
+	SET_FLAG_UNICODE_NFC = BIT(2),
 };
 
 enum setting_apply_flags {
@@ -59,6 +54,14 @@ enum setting_apply_flags {
 	/* SETTINGS_GET_FLAG_NO_EXPAND is being used. */
 	SETTING_APPLY_FLAG_NO_EXPAND = BIT(1),
 };
+
+/* Returns TRUE if the setting type behaves like SET_STR, i.e. it is a string
+   with %variables. */
+static inline bool setting_type_is_str_vars(enum setting_type type)
+{
+	return type == SET_STR || type == SET_PATH_FILE ||
+		type == SET_PATH_DIR;
+}
 
 #define SETTING_DEFINE_LIST_END { 0, SET_FLAG_EOL, NULL, 0, NULL, NULL, NULL }
 
@@ -105,6 +108,10 @@ struct setting_define {
 	SETTING_DEFINE_STRUCT_TYPE(SET_STR, 0, const char *, key, name, struct_name)
 #define SETTING_DEFINE_STRUCT_STR_NOVARS(key, name, struct_name) \
 	SETTING_DEFINE_STRUCT_TYPE(SET_STR_NOVARS, 0, const char *, key, name, struct_name)
+#define SETTING_DEFINE_STRUCT_PATH_FILE(key, name, struct_name) \
+	SETTING_DEFINE_STRUCT_TYPE(SET_PATH_FILE, 0, const char *, key, name, struct_name)
+#define SETTING_DEFINE_STRUCT_PATH_DIR(key, name, struct_name) \
+	SETTING_DEFINE_STRUCT_TYPE(SET_PATH_DIR, 0, const char *, key, name, struct_name)
 #define SETTING_DEFINE_STRUCT_ENUM(key, name, struct_name) \
 	SETTING_DEFINE_STRUCT_TYPE(SET_ENUM, 0, const char *, key, name, struct_name)
 #define SETTING_DEFINE_STRUCT_FILE(key, name, struct_name) \
@@ -134,6 +141,10 @@ struct setting_define {
 	SETTING_DEFINE_STRUCT_TYPE(SET_STR, SET_FLAG_HIDDEN, const char *, key, name, struct_name)
 #define SETTING_DEFINE_STRUCT_STR_NOVARS_HIDDEN(key, name, struct_name) \
 	SETTING_DEFINE_STRUCT_TYPE(SET_STR_NOVARS, SET_FLAG_HIDDEN, const char *, key, name, struct_name)
+#define SETTING_DEFINE_STRUCT_PATH_FILE_HIDDEN(key, name, struct_name) \
+	SETTING_DEFINE_STRUCT_TYPE(SET_PATH_FILE, SET_FLAG_HIDDEN, const char *, key, name, struct_name)
+#define SETTING_DEFINE_STRUCT_PATH_DIR_HIDDEN(key, name, struct_name) \
+	SETTING_DEFINE_STRUCT_TYPE(SET_PATH_DIR, SET_FLAG_HIDDEN, const char *, key, name, struct_name)
 #define SETTING_DEFINE_STRUCT_ENUM_HIDDEN(key, name, struct_name) \
 	SETTING_DEFINE_STRUCT_TYPE(SET_ENUM, SET_FLAG_HIDDEN, const char *, key, name, struct_name)
 #define SETTING_DEFINE_STRUCT_FILE_HIDDEN(key, name, struct_name) \
@@ -142,6 +153,11 @@ struct setting_define {
 	SETTING_DEFINE_STRUCT_TYPE(SET_BOOLLIST, SET_FLAG_HIDDEN, ARRAY_TYPE(const_string), key, name, struct_name)
 #define SETTING_DEFINE_STRUCT_STRLIST_HIDDEN(key, name, struct_name) \
 	SETTING_DEFINE_STRUCT_TYPE(SET_STRLIST, SET_FLAG_HIDDEN, ARRAY_TYPE(const_string), key, name, struct_name)
+
+#define SETTING_DEFINE_STRUCT_STR_NFC(key, name, struct_name) \
+	SETTING_DEFINE_STRUCT_TYPE(SET_STR, SET_FLAG_UNICODE_NFC, const char *, key, name, struct_name)
+#define SETTING_DEFINE_STRUCT_STR_NFC_NOVARS(key, name, struct_name) \
+	SETTING_DEFINE_STRUCT_TYPE(SET_STR_NOVARS, SET_FLAG_UNICODE_NFC, const char *, key, name, struct_name)
 
 struct settings_file {
 	/* Path to the file. May be "" if the content is inlined. */
@@ -272,11 +288,13 @@ bool settings_parser_check(struct setting_parser_context *ctx, pool_t pool,
 bool settings_check(struct event *event, const struct setting_parser_info *info,
 		    pool_t pool, void *set, const char **error_r);
 
-/* Read a SET_FILE from the given path and write "value_path\ncontents" to
-   output_r. Returns 0 on success, -1 on error. */
+/* Read a SET_FILE from the given path and write
+   "<prefix><value_path>\n<contents>" to output_r. Returns 0 on success,
+   -1 on error. */
 int settings_parse_read_file(const char *path, const char *value_path,
 			     pool_t pool, struct stat *st_r,
-			     const char **output_r, const char **error_r);
+			     const char *prefix, const char **output_r,
+			     const char **error_r);
 int settings_parse_boollist_string(const char *value, pool_t pool,
 				   ARRAY_TYPE(const_string) *dest,
 				   const char **error_r);

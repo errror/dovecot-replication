@@ -1,4 +1,4 @@
-/* Copyright (c) 2024 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,11 +8,18 @@
 #include "str.h"
 #include "strescape.h"
 #include "str-sanitize.h"
+#include "dregex.h"
+#include "time-util.h"
+#include "iso8601-date.h"
+#include "utc-offset.h"
 #include "var-expand-private.h"
 #include "expansion.h"
 
 #include <ctype.h>
-#include <regex.h>
+#include <time.h>
+#include <limits.h>
+
+#define MAX_PADDING 256
 
 ARRAY_DEFINE_TYPE(var_expand_filter, struct var_expand_filter);
 static ARRAY_TYPE(var_expand_filter) dyn_filters = ARRAY_INIT;
@@ -151,7 +158,7 @@ static int fn_calculate(const struct var_expand_statement *stmt,
 	   binary input can be treated as 64 bit unsigned integer
 	   for modulo operations only. */
 	if (state->transfer_binary && oper == VAR_EXPAND_STATEMENT_OPER_MODULO) {
-		if (right < 0) {
+		if (right <= 0) {
 			*error_r = "Binary modulo must be positive integer";
 			return -1;
 		}
@@ -184,15 +191,15 @@ static int fn_calculate(const struct var_expand_statement *stmt,
 		value *= right;
 		break;
 	case VAR_EXPAND_STATEMENT_OPER_SLASH:
-		if (right == 0) {
-			*error_r = "Division by zero";
+		if (right <= 0) {
+			*error_r = "Division must be by positive integer";
 			return -1;
 		}
 		value /= right;
 		break;
 	case VAR_EXPAND_STATEMENT_OPER_MODULO:
-		if (right == 0) {
-			*error_r = "Modulo by zero";
+		if (right <= 0) {
+			*error_r = "Modulo must be by positive integer";
 			return -1;
 		}
 		value %= right;
@@ -473,6 +480,11 @@ static int fn_hex(const struct var_expand_statement *stmt,
 	str_truncate(state->transfer, 0);
 	str_printfa(state->transfer, "%jx", number);
 
+	if (width < -MAX_PADDING || width > MAX_PADDING) {
+		*error_r = "Excessive padding";
+		return -1;
+	}
+
 	if (width < 0) {
 		width = -width;
 		while (str_len(state->transfer) < (size_t)width)
@@ -532,6 +544,11 @@ static int fn_hexlify(const struct var_expand_statement *stmt,
 	if (width == 0) {
 		/* pass */
 	} else if (rlen < (uintmax_t)width) {
+		/* Limit to 256 bytes of padding */
+		if ((uintmax_t)width - rlen > MAX_PADDING) {
+			*error_r = "Excessive padding";
+			return -1;
+		}
 		string_t *tmp = t_str_new(width);
 		width -= strlen(result);
 		for (; width > 0; width--)
@@ -634,7 +651,7 @@ static int fn_truncate(const struct var_expand_statement *stmt,
 
 	if (bits)
 		buffer_truncate_rshift_bits(new_value, len);
-	else
+	else if (len < state->transfer->used)
 		buffer_set_used_size(new_value, len);
 
 	var_expand_state_set_transfer_data(state, new_value->data, new_value->used);
@@ -750,6 +767,32 @@ static int fn_ldap_dn(const struct var_expand_statement *stmt,
 	return 0;
 }
 
+static const char *fix_replacement_pattern(const char *pattern)
+{
+	const char *p1, *p0 = pattern;
+	string_t *dest = t_str_new(strlen(pattern));
+
+	while ((p1 = strchr(p0, '\\')) != NULL) {
+		str_append_data(dest, p0, p1 - p0);
+		if (i_isdigit(p1[1])) {
+			str_append_c(dest, '$');
+			str_append_c(dest, p1[1]);
+			p1 += 2;
+		} else if (p1[1] == '\\') {
+			str_append_c(dest, '\\');
+			p1 += 2;
+		} else {
+			str_append_c(dest, *p1);
+			p1++;
+		}
+		p0 = p1;
+	}
+
+	str_append(dest, p0);
+
+	return str_c(dest);
+}
+
 static int fn_regexp(const struct var_expand_statement *stmt,
 		     struct var_expand_state *state, const char **error_r)
 {
@@ -795,66 +838,20 @@ static int fn_regexp(const struct var_expand_statement *stmt,
 
 	ERROR_IF_NO_TRANSFER_TO("regexp");
 
-	int ret;
-	regex_t reg;
-	regmatch_t matches[10];
-	const char *input = str_c(state->transfer);
-	i_zero(&reg);
-	i_zero(&matches);
-	if ((ret = regcomp(&reg, pat, REG_EXTENDED)) != 0) {
-		char errbuf[1024] = {0};
-		(void)regerror(ret, &reg, errbuf, sizeof(errbuf));
-		regfree(&reg);
-		*error_r = t_strdup(errbuf);
-		return -1;
-	}
-
-	ret = regexec(&reg, input, N_ELEMENTS(matches), matches, 0);
-	if (ret == REG_NOMATCH) {
-		/* no match, do not modify */
-		regfree(&reg);
-		return 0;
-	}
-
-	/* perform replacement */
+	const char *input ATTR_UNUSED = str_c(state->transfer);
 	string_t *dest = t_str_new(strlen(rep));
-	const char *p0 = rep;
-	const char *p1;
-	ret = 0;
 
-	/* Supports up to 9 capture groups,
-	 * if we need more, then this code should
-	 * be refactored to see how many we really need
-	 * and create a proper template from this. */
-	while ((p1 = strchr(p0, '\\')) != NULL) {
-		if (i_isdigit(p1[1])) {
-			/* looks like a placeholder */
-			str_append_data(dest, p0, p1 - p0);
-			unsigned int g = p1[1] - '0';
-			if (g >= N_ELEMENTS(matches) ||
-			    matches[g].rm_so == -1) {
-				*error_r = "Invalid capture group";
-				ret = -1;
-				break;
-			}
-			i_assert(matches[g].rm_eo >= matches[g].rm_so);
-			str_append_data(dest, input + matches[g].rm_so,
-				        matches[g].rm_eo - matches[g].rm_so);
-			p0 = p1 + 2;
-		} else {
-			str_append_c(dest, *p1);
-			p1++;
-		}
+	if (strchr(rep, '\\') != NULL) {
+		/* fix replacement pattern */
+		rep = fix_replacement_pattern(rep);
 	}
 
-	regfree(&reg);
+	int ret = dregex_replace(pat, input, rep, dest, 0, error_r);
 
-	if (ret == 0) {
-		str_append(dest, p0);
+	if (ret > 0)
 		var_expand_state_set_transfer_data(state, dest->data, dest->used);
-	}
 
-	return ret == 0 ? 0 : -1;
+	return ret < 0 ? -1 : 0;
 }
 
 static int fn_number(const struct var_expand_statement *stmt, bool be,
@@ -912,6 +909,11 @@ static int fn_le_number(const struct var_expand_statement *stmt,
 static int fn_index_common(struct var_expand_state *state, int index,
 			   const char *separator, const char **error_r)
 {
+	if (*separator == '\0') {
+		*error_r = "Empty separator";
+		return -1;
+	}
+
 	const char *p;
 	const char *token;
 	const char *input = str_c(state->transfer);
@@ -1130,6 +1132,334 @@ static int fn_text(const struct var_expand_statement *stmt,
 	return 0;
 }
 
+static int fn_escape(const struct var_expand_statement *stmt,
+		     struct var_expand_state *state, const char **error_r)
+{
+	ERROR_IF_ANY_PARAMETERS;
+	ERROR_IF_NO_TRANSFER_TO("escape");
+
+	if (state->params->escape_func == NULL) {
+		*error_r = "No escape function available";
+		return -1;
+	}
+
+	const char *escaped;
+	if (state->params->escape_func(str_c(state->transfer), &escaped,
+				       state->params->escape_context,
+				       error_r) < 0)
+		return -1;
+	var_expand_state_set_transfer(state, escaped);
+	return 0;
+}
+
+static int fn_safe(const struct var_expand_statement *stmt,
+		   struct var_expand_state *state,
+		   const char **error_r)
+{
+	if (stmt->next != NULL) {
+		*error_r = "safe filter must be last in the filter chain";
+		return -1;
+	}
+	state->transfer_safe = TRUE;
+	return 0;
+}
+
+/* Parse a UNIX timestamp string into whole seconds and nanoseconds. The input
+   may be a plain integer ("1749379200") or have a fractional part
+   ("1749379200.123456789"). The fraction is padded or truncated to nanosecond
+   precision. */
+static int parse_unixtime(const char *str, intmax_t *sec_r,
+			  unsigned int *nsec_r, const char **error_r)
+{
+	const char *p;
+
+	if (str_parse_intmax(str, sec_r, &p) < 0) {
+		*error_r = t_strdup_printf("Invalid timestamp '%s'", str);
+		return -1;
+	}
+
+	unsigned int nsec = 0;
+	if (*p == '.') {
+		/* Fractional seconds: pad or truncate to nanosecond
+		   precision. scale drops to 0 after 9 digits, which bounds
+		   nsec below 1e9 (so it cannot overflow); any further digits
+		   are only validated and then ignored (truncated). */
+		unsigned int scale = 100000000;
+
+		for (p++; *p != '\0'; p++) {
+			if (*p < '0' || *p > '9') {
+				*error_r = t_strdup_printf(
+					"Invalid timestamp '%s'", str);
+				return -1;
+			}
+			if (scale > 0) {
+				nsec += (unsigned int)(*p - '0') * scale;
+				scale /= 10;
+			}
+		}
+	} else if (*p != '\0') {
+		*error_r = t_strdup_printf("Invalid timestamp '%s'", str);
+		return -1;
+	}
+	*nsec_r = nsec;
+	return 0;
+}
+
+/* Compute sec*mul + add with overflow detection. mul must be > 0 and add must
+   be in the range [0, mul). Returns FALSE if the result does not fit intmax_t. */
+static bool epoch_scale(intmax_t sec, intmax_t mul, intmax_t add,
+			intmax_t *result_r)
+{
+	if (sec > INTMAX_MAX / mul || sec < INTMAX_MIN / mul)
+		return FALSE;
+	intmax_t scaled = sec * mul;
+	if (scaled > INTMAX_MAX - add)
+		return FALSE;
+	*result_r = scaled + add;
+	return TRUE;
+}
+
+static int fn_epoch(const struct var_expand_statement *stmt,
+		    struct var_expand_state *state, const char **error_r)
+{
+	const char *unit = "s";
+
+	struct var_expand_parameter_iter_context *ctx =
+		var_expand_parameter_iter_init(stmt);
+	while (var_expand_parameter_iter_more(ctx)) {
+		const struct var_expand_parameter *par =
+			var_expand_parameter_iter_next(ctx);
+		const char *key = var_expand_parameter_key(par);
+		if (null_strcmp(key, "unit") == 0 ||
+		    (key == NULL && var_expand_parameter_idx(par) == 0)) {
+			if (var_expand_parameter_string_or_var(state, par,
+							       &unit, error_r) < 0)
+				return -1;
+		} else if (key != NULL)
+			ERROR_UNSUPPORTED_KEY(key);
+		else
+			ERROR_TOO_MANY_UNNAMED_PARAMETERS;
+	}
+
+	ERROR_IF_NO_TRANSFER_TO("convert to epoch");
+
+	intmax_t sec;
+	unsigned int nsec;
+	if (parse_unixtime(str_c(state->transfer), &sec, &nsec, error_r) < 0)
+		return -1;
+
+	intmax_t result, mul, add;
+	if (strcmp(unit, "s") == 0) {
+		result = sec;
+	} else {
+		if (strcmp(unit, "ms") == 0) {
+			mul = 1000;
+			add = nsec / 1000000;
+		} else if (strcmp(unit, "us") == 0) {
+			mul = 1000000;
+			add = nsec / 1000;
+		} else if (strcmp(unit, "ns") == 0) {
+			mul = 1000000000;
+			add = nsec;
+		} else {
+			*error_r = t_strdup_printf(
+				"Unsupported unit '%s' for 'epoch'", unit);
+			return -1;
+		}
+		if (!epoch_scale(sec, mul, add, &result)) {
+			*error_r = t_strdup_printf(
+				"Timestamp '%s' out of range for unit '%s'",
+				str_c(state->transfer), unit);
+			return -1;
+		}
+	}
+
+	var_expand_state_set_transfer(state, t_strdup_printf("%jd", result));
+	return 0;
+}
+
+/* Inverse of 'epoch': convert an integer UNIX timestamp given in s/ms/us/ns
+   into the canonical "<seconds>.<nanoseconds>" form. */
+static int fn_from_epoch(const struct var_expand_statement *stmt,
+			 struct var_expand_state *state, const char **error_r)
+{
+	const char *unit = "s";
+
+	struct var_expand_parameter_iter_context *ctx =
+		var_expand_parameter_iter_init(stmt);
+	while (var_expand_parameter_iter_more(ctx)) {
+		const struct var_expand_parameter *par =
+			var_expand_parameter_iter_next(ctx);
+		const char *key = var_expand_parameter_key(par);
+		if (null_strcmp(key, "unit") == 0 ||
+		    (key == NULL && var_expand_parameter_idx(par) == 0)) {
+			if (var_expand_parameter_string_or_var(state, par,
+							       &unit, error_r) < 0)
+				return -1;
+		} else if (key != NULL)
+			ERROR_UNSUPPORTED_KEY(key);
+		else
+			ERROR_TOO_MANY_UNNAMED_PARAMETERS;
+	}
+
+	ERROR_IF_NO_TRANSFER_TO("convert from epoch");
+
+	intmax_t value;
+	if (str_to_intmax(str_c(state->transfer), &value) < 0) {
+		*error_r = t_strdup_printf("Invalid timestamp '%s'",
+					   str_c(state->transfer));
+		return -1;
+	}
+
+	uintmax_t divisor;
+	if (strcmp(unit, "s") == 0)
+		divisor = 1;
+	else if (strcmp(unit, "ms") == 0)
+		divisor = 1000;
+	else if (strcmp(unit, "us") == 0)
+		divisor = 1000000;
+	else if (strcmp(unit, "ns") == 0)
+		divisor = 1000000000;
+	else {
+		*error_r = t_strdup_printf(
+			"Unsupported unit '%s' for 'from_epoch'", unit);
+		return -1;
+	}
+
+	bool neg = value < 0;
+	uintmax_t v = neg ? -(uintmax_t)value : (uintmax_t)value;
+	uintmax_t sec = v / divisor;
+	uintmax_t nsec = (v % divisor) * (1000000000 / divisor);
+
+	var_expand_state_set_transfer(state,
+		t_strdup_printf("%s%ju.%09ju", neg ? "-" : "", sec, nsec));
+	return 0;
+}
+
+/* Pass the configured strftime format through, trusting it for
+   -Wformat-nonliteral (the format comes from the configuration). The
+   format_arg attribute only silences the warning when its checked argument
+   is a literal, so pass a literal as the checked argument and return the
+   real runtime format separately. */
+static const char *date_strftime_format(const char *dummy, const char *format)
+	ATTR_FORMAT_ARG(1);
+static const char *date_strftime_format(const char *dummy ATTR_UNUSED,
+					const char *format)
+{
+	return format;
+}
+
+static int fn_date(const struct var_expand_statement *stmt,
+		   struct var_expand_state *state, const char **error_r)
+{
+	const char *format = NULL;
+	const char *tz = "utc";
+
+	struct var_expand_parameter_iter_context *ctx =
+		var_expand_parameter_iter_init(stmt);
+	while (var_expand_parameter_iter_more(ctx)) {
+		const struct var_expand_parameter *par =
+			var_expand_parameter_iter_next(ctx);
+		const char *key = var_expand_parameter_key(par);
+		if (null_strcmp(key, "format") == 0 ||
+		    (key == NULL && var_expand_parameter_idx(par) == 0)) {
+			if (var_expand_parameter_string_or_var(state, par,
+							       &format, error_r) < 0)
+				return -1;
+		} else if (null_strcmp(key, "tz") == 0 ||
+			   (key == NULL && var_expand_parameter_idx(par) == 1)) {
+			if (var_expand_parameter_string_or_var(state, par,
+							       &tz, error_r) < 0)
+				return -1;
+		} else if (key != NULL)
+			ERROR_UNSUPPORTED_KEY(key);
+		else
+			ERROR_TOO_MANY_UNNAMED_PARAMETERS;
+	}
+
+	if (format == NULL) {
+		*error_r = "Missing date format";
+		return -1;
+	}
+
+	ERROR_IF_NO_TRANSFER_TO("format as date");
+
+	intmax_t sec;
+	unsigned int nsec;
+	if (parse_unixtime(str_c(state->transfer), &sec, &nsec, error_r) < 0)
+		return -1;
+
+	time_t t = (time_t)sec;
+	struct tm tm;
+	if (strcmp(tz, "local") == 0) {
+		if (localtime_r(&t, &tm) == NULL)
+			i_panic("localtime_r() failed: %m");
+	} else if (strcmp(tz, "utc") == 0 || strcmp(tz, "gmt") == 0) {
+		if (gmtime_r(&t, &tm) == NULL)
+			i_panic("gmtime_r() failed: %m");
+	} else {
+		*error_r = t_strdup_printf("Unsupported timezone '%s' for 'date'",
+					   tz);
+		return -1;
+	}
+
+	var_expand_state_set_transfer(state,
+				      t_strftime(date_strftime_format("unused", format), &tm));
+	return 0;
+}
+
+static int fn_iso8601(const struct var_expand_statement *stmt,
+		      struct var_expand_state *state, const char **error_r)
+{
+	const char *tz = "utc";
+
+	struct var_expand_parameter_iter_context *ctx =
+		var_expand_parameter_iter_init(stmt);
+	while (var_expand_parameter_iter_more(ctx)) {
+		const struct var_expand_parameter *par =
+			var_expand_parameter_iter_next(ctx);
+		const char *key = var_expand_parameter_key(par);
+		if (null_strcmp(key, "tz") == 0 ||
+		    (key == NULL && var_expand_parameter_idx(par) == 0)) {
+			if (var_expand_parameter_string_or_var(state, par,
+							       &tz, error_r) < 0)
+				return -1;
+		} else if (key != NULL)
+			ERROR_UNSUPPORTED_KEY(key);
+		else
+			ERROR_TOO_MANY_UNNAMED_PARAMETERS;
+	}
+
+	ERROR_IF_NO_TRANSFER_TO("format as ISO 8601");
+
+	intmax_t sec;
+	unsigned int nsec;
+	if (parse_unixtime(str_c(state->transfer), &sec, &nsec, error_r) < 0)
+		return -1;
+
+	time_t t = (time_t)sec;
+	struct tm tm;
+	int zone_offset;
+	if (strcmp(tz, "local") == 0) {
+		if (localtime_r(&t, &tm) == NULL)
+			i_panic("localtime_r() failed: %m");
+		zone_offset = utc_offset(&tm, t);
+	} else if (strcmp(tz, "utc") == 0 || strcmp(tz, "gmt") == 0) {
+		if (gmtime_r(&t, &tm) == NULL)
+			i_panic("gmtime_r() failed: %m");
+		/* INT_MAX makes iso8601_date_create_tm() use the 'Z' suffix */
+		zone_offset = INT_MAX;
+	} else {
+		*error_r = t_strdup_printf(
+			"Unsupported timezone '%s' for 'iso8601'", tz);
+		return -1;
+	}
+
+	var_expand_state_set_transfer(state,
+				      iso8601_date_create_tm(&tm, zone_offset));
+	return 0;
+}
+
 static const struct var_expand_filter var_expand_builtin_filters[] = {
 	{ .name = "lookup", .filter = fn_lookup },
 	{ .name = "literal", .filter = fn_literal },
@@ -1167,6 +1497,13 @@ static const struct var_expand_filter var_expand_builtin_filters[] = {
 	{ .name = "text", .filter = fn_text },
 	{ .name = "encrypt", .filter = expansion_filter_encrypt },
 	{ .name = "decrypt", .filter = expansion_filter_decrypt },
+	{ .name = "switch", .filter = expansion_filter_switch },
+	{ .name = "escape", .filter = fn_escape },
+	{ .name = "safe", .filter = fn_safe },
+	{ .name = "epoch", .filter = fn_epoch },
+	{ .name = "from_epoch", .filter = fn_from_epoch },
+	{ .name = "date", .filter = fn_date },
+	{ .name = "iso8601", .filter = fn_iso8601 },
 	{ .name = NULL }
 };
 

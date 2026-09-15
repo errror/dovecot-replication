@@ -1,6 +1,7 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
+#include "array.h"
 #include "str.h"
 #include "event-filter.h"
 #include "lib-event-private.h"
@@ -8,8 +9,8 @@
 unsigned int event_filter_replace_counter = 1;
 
 static struct event_filter *global_debug_log_filter = NULL;
-static struct event_filter *global_debug_send_filter = NULL;
 static struct event_filter *global_core_log_filter = NULL;
+static ARRAY(struct event_filter *) global_debug_send_filters;
 
 #undef e_error
 void e_error(struct event *event,
@@ -192,26 +193,25 @@ event_get_log_message(struct event *event,
 
 		/* construct the log message composed by children and arguments
 		 */
-		const char *log_prefix = str_c(glmctx->log_prefix);
 		if (glmctx->message == NULL) {
 			str_vprintfa(glmctx->log_prefix, fmt, args);
-			in_message = log_prefix;
+			in_message = str_c(glmctx->log_prefix);
 		} else if (str_len(glmctx->log_prefix) == 0) {
 			in_message = glmctx->message;
 		} else {
 			str_append(glmctx->log_prefix, glmctx->message);
-			in_message = log_prefix;
+			in_message = str_c(glmctx->log_prefix);
 		}
 
 		/* reformat the log message */
 		glmctx->message = event->log_message_callback(
 			event->log_message_callback_context,
 			glmctx->params->log_type, in_message);
-		if (glmctx->message == log_prefix) {
+		if (glmctx->message == str_c(glmctx->log_prefix)) {
 			/* The log message returned the input log_prefix
 			   pointer. However, it's going to become modified, so
 			   it needs to be duplicated. */
-			glmctx->message = t_strdup(log_prefix);
+			glmctx->message = t_strdup(str_c(glmctx->log_prefix));
 		}
 
 		/* continue with a cleared prefix buffer (as prefix is now part
@@ -319,10 +319,12 @@ bool event_want_level(struct event *event, enum log_type level,
 		return TRUE;
 
 	/* see if debug send filtering matches */
-	if (global_debug_send_filter != NULL) {
+	struct event_filter *filter;
+	array_foreach_elem(&global_debug_send_filters, filter) {
 		struct failure_context ctx = { .type = LOG_TYPE_DEBUG };
 
-		if (event_filter_match_source(global_debug_send_filter, event,
+		if (filter != NULL &&
+		    event_filter_match_source(filter, event,
 					      source_filename, source_linenum,
 					      &ctx))
 			return TRUE;
@@ -449,22 +451,13 @@ void event_unset_global_debug_log_filter(void)
 	event_filter_replace_counter++;
 }
 
-void event_set_global_debug_send_filter(struct event_filter *filter)
+struct event_filter **event_global_debug_send_filter_register(void)
 {
-	event_unset_global_debug_send_filter();
-	global_debug_send_filter = filter;
-	event_filter_ref(global_debug_send_filter);
-	event_filter_replace_counter++;
+	return array_append_space(&global_debug_send_filters);
 }
 
-struct event_filter *event_get_global_debug_send_filter(void)
+void event_global_debug_send_filter_updated(void)
 {
-	return global_debug_send_filter;
-}
-
-void event_unset_global_debug_send_filter(void)
-{
-	event_filter_unref(&global_debug_send_filter);
 	event_filter_replace_counter++;
 }
 
@@ -485,4 +478,17 @@ void event_unset_global_core_log_filter(void)
 {
 	event_filter_unref(&global_core_log_filter);
 	event_filter_replace_counter++;
+}
+
+void event_log_init(void)
+{
+	i_array_init(&global_debug_send_filters, 2);
+}
+
+void event_log_deinit(void)
+{
+	struct event_filter *filter;
+	array_foreach_elem(&global_debug_send_filters, filter)
+		event_filter_unref(&filter);
+	array_free(&global_debug_send_filters);
 }

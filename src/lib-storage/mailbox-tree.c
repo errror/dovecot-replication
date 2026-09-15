@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -52,6 +52,8 @@ void mailbox_tree_deinit(struct mailbox_tree_context **_tree)
 	struct mailbox_tree_context *tree = *_tree;
 
 	*_tree = NULL;
+	if (tree == NULL)
+		return;
 	pool_unref(&tree->pool);
 	i_free(tree);
 }
@@ -76,6 +78,11 @@ void mailbox_tree_clear(struct mailbox_tree_context *tree)
 pool_t mailbox_tree_get_pool(struct mailbox_tree_context *tree)
 {
 	return tree->pool;
+}
+
+struct mailbox_node *mailbox_tree_get_root(struct mailbox_tree_context *tree)
+{
+	return tree->nodes;
 }
 
 static struct mailbox_node * ATTR_NULL(2)
@@ -260,6 +267,8 @@ void mailbox_tree_iterate_deinit(struct mailbox_tree_iterate_context **_ctx)
 	struct mailbox_tree_iterate_context *ctx = *_ctx;
 
 	*_ctx = NULL;
+	if (ctx == NULL)
+		return;
 	str_free(&ctx->path_str);
 	array_free(&ctx->node_path);
 	i_free(ctx);

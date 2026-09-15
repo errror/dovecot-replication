@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "settings-parser.h"
@@ -32,7 +32,7 @@ static const struct setting_define imapc_setting_defines[] = {
 	DEF(ENUM, imapc_ssl),
 
 	DEF(BOOLLIST, imapc_features),
-	DEF(STR, imapc_rawlog_dir),
+	DEF(PATH_DIR, imapc_rawlog_dir),
 	DEF(STR, imapc_list_prefix),
 	DEF_SECS(TIME, imapc_cmd_timeout),
 	DEF_SECS(TIME, imapc_max_idle_time),
@@ -93,6 +93,44 @@ const struct setting_parser_info imapc_setting_parser_info = {
 };
 
 /* <settings checks> */
+const struct imapc_capability_name imapc_capability_names[] = {
+	{ "SASL-IR", IMAPC_CAPABILITY_SASL_IR },
+	{ "LITERAL+", IMAPC_CAPABILITY_LITERALPLUS },
+	{ "QRESYNC", IMAPC_CAPABILITY_QRESYNC },
+	{ "IDLE", IMAPC_CAPABILITY_IDLE },
+	{ "UIDPLUS", IMAPC_CAPABILITY_UIDPLUS },
+	{ "AUTH=PLAIN", IMAPC_CAPABILITY_AUTH_PLAIN },
+	{ "STARTTLS", IMAPC_CAPABILITY_STARTTLS },
+	{ "X-GM-EXT-1", IMAPC_CAPABILITY_X_GM_EXT_1 },
+	{ "CONDSTORE", IMAPC_CAPABILITY_CONDSTORE },
+	{ "NAMESPACE", IMAPC_CAPABILITY_NAMESPACE },
+	{ "UNSELECT", IMAPC_CAPABILITY_UNSELECT },
+	{ "ESEARCH", IMAPC_CAPABILITY_ESEARCH },
+	{ "WITHIN", IMAPC_CAPABILITY_WITHIN },
+	{ "QUOTA", IMAPC_CAPABILITY_QUOTA },
+	{ "ID", IMAPC_CAPABILITY_ID },
+	{ "SAVEDATE", IMAPC_CAPABILITY_SAVEDATE },
+	{ "METADATA", IMAPC_CAPABILITY_METADATA },
+	{ "SORT", IMAPC_CAPABILITY_SORT },
+	{ "ESORT", IMAPC_CAPABILITY_ESORT },
+	{ "SORT=DISPLAY", IMAPC_CAPABILITY_SORT_DISPLAY },
+	{ "SEARCH=MIMEPART", IMAPC_CAPABILITY_SEARCH_MIMEPART },
+	{ "SEARCH=X-MIMEPART", IMAPC_CAPABILITY_SEARCH_MIMEPART },
+
+	{ "IMAP4REV1", IMAPC_CAPABILITY_IMAP4REV1 },
+	{ "IMAP4REV2", IMAPC_CAPABILITY_IMAP4REV2 },
+	{ NULL, 0 }
+};
+
+enum imapc_capability imapc_capability_lookup(const char *str)
+{
+	for (unsigned int i = 0; imapc_capability_names[i].name != NULL; i++) {
+		if (strcasecmp(imapc_capability_names[i].name, str) == 0)
+			return imapc_capability_names[i].capability;
+	}
+	return 0;
+}
+
 struct imapc_feature_list {
 	const char *name;
 	enum imapc_features num;
@@ -116,9 +154,6 @@ static const struct imapc_feature_list imapc_feature_list[] = {
 	{ "fetch-empty-is-expunged", IMAPC_FEATURE_FETCH_EMPTY_IS_EXPUNGED },
 	{ "no-msn-updates", IMAPC_FEATURE_NO_MSN_UPDATES },
 	{ "no-acl", IMAPC_FEATURE_NO_ACL },
-	{ "no-metadata", IMAPC_FEATURE_NO_METADATA },
-	{ "no-qresync", IMAPC_FEATURE_NO_QRESYNC },
-	{ "no-imap4rev2", IMAPC_FEATURE_NO_IMAP4REV2 },
 	{ NULL, 0 }
 };
 
@@ -151,15 +186,23 @@ imapc_settings_parse_features(struct imapc_settings *set,
 	for (; *str != NULL; str++) {
 		list = imapc_feature_list;
 		for (; list->name != NULL; list++) {
-			if (strcasecmp(*str, list->name) == 0) {
+			if (strcmp(*str, list->name) == 0) {
 				features |= list->num;
 				break;
 			}
 		}
-		if (str_begins_icase(*str, "throttle:", &value)) {
+		if (str_begins(*str, "throttle:", &value)) {
 			if (imapc_settings_parse_throttle(set, value, error_r) < 0)
 				return -1;
 			continue;
+		}
+		if (str_begins(*str, "no-", &value)) {
+			enum imapc_capability capa =
+				imapc_capability_lookup(value);
+			if (capa != 0) {
+				set->parsed_disabled_capabilities |= capa;
+				continue;
+			}
 		}
 		if (list->name == NULL) {
 			*error_r = t_strdup_printf("imapc_features: "

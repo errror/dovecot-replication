@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -17,12 +17,17 @@ node_lookup_guid(struct mailbox_list_index_sync_context *ctx,
 	struct mailbox_metadata metadata;
 	const char *vname;
 	string_t *str = t_str_new(128);
-	char ns_sep = mailbox_list_get_hierarchy_sep(ctx->list);
 
-	mailbox_list_index_node_get_path(node, ns_sep, str);
+	mailbox_list_index_node_get_path(ctx->list, node, str);
 
 	vname = mailbox_list_get_vname(ctx->list, str_c(str));
-	box = mailbox_alloc(ctx->list, vname, 0);
+	/* Never autocreate the mailbox here. Its GUID would be a newly
+	   generated one, which isn't what the caller is looking for. It would
+	   also deadlock: the mailbox list index transaction log is locked
+	   while syncing, while mailbox_create() locks the mailbox list first
+	   and the transaction log only afterwards. */
+	box = mailbox_alloc(ctx->list, vname, MAILBOX_FLAG_RAW_NAME |
+			    MAILBOX_FLAG_NO_AUTOCREATE);
 	if (mailbox_get_metadata(box, MAILBOX_METADATA_GUID, &metadata) == 0)
 		memcpy(guid_r, metadata.guid, GUID_128_SIZE);
 	mailbox_free(&box);
@@ -55,22 +60,15 @@ node_add_to_index(struct mailbox_list_index_sync_context *ctx,
 }
 
 static struct mailbox_list_index_node *
-mailbox_list_index_node_add(struct mailbox_list_index_sync_context *ctx,
-			    struct mailbox_list_index_node *parent,
-			    const char *name, uint32_t *seq_r)
+mailbox_list_index_node_add_common(struct mailbox_list_index_sync_context *ctx,
+				   struct mailbox_list_index_node *parent)
 {
 	struct mailbox_list_index_node *node;
-	char *dup_name;
-	mailbox_list_name_unescape(&name,
-		ctx->list->mail_set->mailbox_list_storage_escape_char[0]);
 
 	node = p_new(ctx->ilist->mailbox_pool,
 		     struct mailbox_list_index_node, 1);
 	node->flags = MAILBOX_LIST_INDEX_FLAG_NONEXISTENT |
 		MAILBOX_LIST_INDEX_FLAG_SYNC_EXISTS;
-	/* we don't bother doing name deduplication here, even though it would
-	   be possible. */
-	node->raw_name = dup_name = p_strdup(ctx->ilist->mailbox_pool, name);
 	node->name_id = ++ctx->ilist->highest_name_id;
 	node->uid = ctx->next_uid++;
 
@@ -84,8 +82,43 @@ mailbox_list_index_node_add(struct mailbox_list_index_sync_context *ctx,
 	}
 	hash_table_insert(ctx->ilist->mailbox_hash,
 			  POINTER_CAST(node->uid), node);
+	return node;
+}
+
+static struct mailbox_list_index_node *
+mailbox_list_index_node_add(struct mailbox_list_index_sync_context *ctx,
+			    struct mailbox_list_index_node *parent,
+			    const char *name, uint32_t *seq_r)
+{
+	struct mailbox_list_index_node *node =
+		mailbox_list_index_node_add_common(ctx, parent);
+
+	char *dup_name;
+	mailbox_list_name_unescape(&name,
+		ctx->list->mail_set->mailbox_list_storage_escape_char[0]);
+
+	/* we don't bother doing name deduplication here, even though it would
+	   be possible. */
+	node->raw_name = dup_name = p_strdup(ctx->ilist->mailbox_pool, name);
 	hash_table_insert(ctx->ilist->mailbox_names,
 			  POINTER_CAST(node->name_id), dup_name);
+
+	mailbox_list_index_node_hash_insert(ctx->ilist, node);
+
+	node_add_to_index(ctx, node, seq_r);
+	return node;
+}
+
+static struct mailbox_list_index_node *
+mailbox_list_index_node_add_inbox_inbox(struct mailbox_list_index_sync_context *ctx,
+					uint32_t *seq_r)
+{
+	struct mailbox_list_index_node *node =
+		mailbox_list_index_node_add_common(ctx, NULL);
+	node->raw_name = ctx->ilist->raw_inbox_inbox_name_ptr;
+	ctx->ilist->inbox_inbox_name_id = node->name_id;
+
+	mailbox_list_index_node_hash_insert(ctx->ilist, node);
 
 	node_add_to_index(ctx, node, seq_r);
 	return node;
@@ -100,6 +133,8 @@ uint32_t mailbox_list_index_sync_name(struct mailbox_list_index_sync_context *ct
 	struct mailbox_list_index_node *node, *parent;
 	unsigned int i;
 	uint32_t seq = 0;
+
+	*created_r = FALSE;
 
 	path = *name == '\0' ? empty_path :
 		t_strsplit(name, ctx->sep);
@@ -121,9 +156,13 @@ uint32_t mailbox_list_index_sync_name(struct mailbox_list_index_sync_context *ct
 		i_assert(node != NULL);
 		if (!mail_index_lookup_seq(ctx->view, node->uid, &seq))
 			i_panic("mailbox list index: lost uid=%u", node->uid);
-		*created_r = FALSE;
 	} else {
 		/* create missing parts of the path */
+		if (i == 0 && ctx->ilist->inbox_inbox_storage_name != NULL &&
+		    strcmp(path[0], ctx->ilist->inbox_inbox_storage_name) == 0) {
+			node = mailbox_list_index_node_add_inbox_inbox(ctx, &seq);
+			i++;
+		}
 		for (; path[i] != NULL; i++) {
 			node = mailbox_list_index_node_add(ctx, node, path[i],
 							   &seq);
@@ -166,11 +205,17 @@ mailbox_list_index_sync_names(struct mailbox_list_index_sync_context *ctx)
 	buffer_append_zero(hdr_buf, sizeof(struct mailbox_list_index_header));
 
 	/* add existing names to header (with deduplication) */
+	struct mailbox_list_index_header2 hdr2 = { 0, };
 	array_foreach_elem(&existing_name_ids, id) {
 		if (id != prev_id) {
 			buffer_append(hdr_buf, &id, sizeof(id));
-			name = hash_table_lookup(ilist->mailbox_names,
-						 POINTER_CAST(id));
+			if (id != ilist->inbox_inbox_name_id) {
+				name = hash_table_lookup(ilist->mailbox_names,
+							 POINTER_CAST(id));
+			} else {
+				name = ilist->raw_inbox_inbox_name_ptr;
+				hdr2.inbox_inbox_name_id = id;
+			}
 			i_assert(name != NULL);
 			buffer_append(hdr_buf, name, strlen(name) + 1);
 			prev_id = id;
@@ -189,6 +234,12 @@ mailbox_list_index_sync_names(struct mailbox_list_index_sync_context *ctx)
 	}
 	mail_index_update_header_ext(ctx->trans, ilist->ext_id,
 				     0, hdr_buf->data, hdr_buf->used);
+	/* Update ext2 header if it has changed. Note that lib-index doesn't
+	   currently support dropping the header entirely. */
+	if (hdr2.inbox_inbox_name_id != 0 || ilist->inbox_inbox_name_id != 0) {
+		mail_index_update_header_ext(ctx->trans, ilist->ext2_id,
+					     0, &hdr2, sizeof(hdr2));
+	}
 	buffer_free(&hdr_buf);
 	array_free(&existing_name_ids);
 }
@@ -299,6 +350,8 @@ mailbox_list_index_sync_list(struct mailbox_list_index_sync_context *sync_ctx)
 	enum mailbox_list_iter_flags iter_flags;
 	const char *patterns[2];
 	struct mailbox_list_index_node *node;
+	pool_t info_pool;
+	int ret;
 	uint32_t seq;
 	bool created;
 
@@ -317,6 +370,8 @@ mailbox_list_index_sync_list(struct mailbox_list_index_sync_context *sync_ctx)
 	iter = sync_ctx->ilist->module_ctx.super.
 		iter_init(sync_ctx->list, patterns,
 			  iter_flags);
+	info_pool = pool_alloconly_create("mailbox list iter info", 128);
+	iter->info_pool = info_pool;
 
 	sync_ctx->syncing_list = TRUE;
 	while ((info = sync_ctx->ilist->module_ctx.super.iter_next(iter)) != NULL) T_BEGIN {
@@ -345,7 +400,9 @@ mailbox_list_index_sync_list(struct mailbox_list_index_sync_context *sync_ctx)
 	} T_END;
 	sync_ctx->syncing_list = FALSE;
 
-	if (sync_ctx->ilist->module_ctx.super.iter_deinit(iter) < 0)
+	ret = sync_ctx->ilist->module_ctx.super.iter_deinit(iter);
+	pool_unref(&info_pool);
+	if (ret < 0)
 		return -1;
 
 	/* successfully listed everything, expunge any unseen mailboxes */

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -337,6 +337,27 @@ maildir_fill_readdir_entry(struct maildir_list_iterate_context *ctx,
 	if (ret <= 0)
 		return ret;
 
+	/* If the on-disk fname's storage_name does not re-escape back from
+	   vname under the current rules, the entry was written with legacy
+	   escape rules (e.g. an older version that escaped leading '~' on
+	   every hierarchy part). Rename it so subsequent lookups find it.
+	   Deferred until after get_mailbox_flags() and the alias-symlink
+	   lstat() so those operations see the original on-disk path. */
+	if (list->mail_set->mailbox_list_storage_escape_char[0] != '\0') T_BEGIN {
+		const char *expected_storage_name =
+			mailbox_list_get_storage_name(list, vname);
+		const char *expected_fname = ctx->prefix_char != '\0' ?
+			t_strdup_printf("%c%s", ctx->prefix_char,
+					expected_storage_name) :
+			expected_storage_name;
+		ret = mailbox_list_try_migrate_legacy_escape(
+			list, ctx->dir, fname, expected_fname);
+		if (ret > 0)
+			fname = expected_fname;
+	} T_END_PASS_STR_IF(ret > 0, &fname);
+	if (ret < 0)
+		return -1;
+
 	/* we know the children flags ourself, so ignore if any of
 	   them were set. */
 	flags &= ENUM_NEGATE(MAILBOX_NOINFERIORS | MAILBOX_CHILDREN | MAILBOX_NOCHILDREN);
@@ -448,30 +469,14 @@ maildir_list_iter_init(struct mailbox_list *_list, const char *const *patterns,
 	else
 		ctx->dir = _list->mail_set->mail_path;
 
-	if ((flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0) {
-		/* Listing only subscribed mailboxes.
-		   Flags are set later if needed. */
-		bool default_nonexistent =
-			(flags & MAILBOX_LIST_ITER_RETURN_NO_FLAGS) == 0;
-
-		mailbox_list_subscriptions_fill(&ctx->ctx, ctx->tree_ctx,
-						default_nonexistent);
-	}
-
-	if ((flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) == 0 ||
-	    (flags & MAILBOX_LIST_ITER_RETURN_NO_FLAGS) == 0) {
+	T_BEGIN {
 		/* Add/update mailbox list with flags */
-		bool update_only =
-			(flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0;
+		ret = maildir_fill_readdir(ctx, ctx->ctx.glob, FALSE);
+	} T_END;
 
-		T_BEGIN {
-			ret = maildir_fill_readdir(ctx, ctx->ctx.glob,
-						   update_only);
-		} T_END;
-		if (ret < 0) {
-			ctx->ctx.failed = TRUE;
-			return &ctx->ctx;
-		}
+	if (ret < 0) {
+		ctx->ctx.failed = TRUE;
+		return &ctx->ctx;
 	}
 
 	ctx->tree_iter = mailbox_tree_iterate_init(ctx->tree_ctx, NULL,
@@ -512,13 +517,6 @@ maildir_list_iter_next(struct mailbox_list_iterate_context *_ctx)
 		i_assert((ctx->info.flags & MAILBOX_NOCHILDREN) != 0);
 		ctx->info.flags &= ENUM_NEGATE(MAILBOX_NOCHILDREN);
 		ctx->info.flags |= MAILBOX_NOINFERIORS;
-	}
-	if ((_ctx->flags & MAILBOX_LIST_ITER_RETURN_SUBSCRIBED) != 0 &&
-	    (_ctx->flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) == 0) {
-		/* we're listing all mailboxes but we want to know
-		   \Subscribed flags */
-		mailbox_list_set_subscription_flags(_ctx->list, ctx->info.vname,
-						    &ctx->info.flags);
 	}
 	return &ctx->info;
 }

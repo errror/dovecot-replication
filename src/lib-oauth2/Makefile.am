@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
@@ -30,8 +32,6 @@ test_programs = \
 	test-oauth2-json \
 	test-oauth2-jwt
 
-noinst_PROGRAMS = $(test_programs)
-
 test_libs = \
 	$(noinst_LTLIBRARIES) \
 	../lib-dcrypt/libdcrypt_openssl_static.la \
@@ -47,9 +47,9 @@ test_libs = \
 	../lib-settings/libsettings.la \
 	../lib-dns/libdns.la \
 	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
-	../lib/liblib.la \
-	$(MODULE_LIBS)
+	../lib/liblib.la
 test_deps = \
 	$(noinst_LTLIBRARIES) \
 	../lib-dcrypt/libdcrypt_openssl_static.la \
@@ -65,22 +65,18 @@ test_deps = \
 	../lib-settings/libsettings.la \
 	../lib-dns/libdns.la \
 	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 
 test_oauth2_json_SOURCES = test-oauth2-json.c
-test_oauth2_json_LDADD = $(test_libs)
+test_oauth2_json_LDADD = $(test_libs) $(SSL_LIBS) $(LIBDOVECOT_TEST_LIBS)
 test_oauth2_json_DEPENDENCIES = $(test_deps)
 
 test_oauth2_jwt_SOURCES = test-oauth2-jwt.c
-test_oauth2_jwt_LDADD = $(test_libs)
+test_oauth2_jwt_LDADD = $(test_libs) $(SSL_LIBS) $(LIBDOVECOT_TEST_LIBS)
 if HAVE_WHOLE_ARCHIVE
 test_oauth2_jwt_LDFLAGS = \
 	-Wl,$(LD_WHOLE_ARCHIVE),../lib-json/.libs/libjson.a,../lib-ssl-iostream/.libs/libssl_iostream.a,$(LD_NO_WHOLE_ARCHIVE)
 endif
 test_oauth2_jwt_DEPENDENCIES = $(test_deps)
-
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done

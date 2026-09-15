@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "array.h"
@@ -138,12 +138,29 @@ static int submission_client_create(struct client *client)
 	smtp_set.command_limits.max_auth_size = LOGIN_MAX_AUTH_BUF_SIZE;
 	smtp_set.debug = event_want_debug(client->event);
 	smtp_set.event_parent = client->event;
+	smtp_set.max_recipients = SET_UINT_UNLIMITED;
 
 	subm_client->conn = smtp_server_connection_create_from_streams(
 		smtp_server, client->input, client->output,
+		&client->real_local_ip, client->real_local_port,
 		&client->real_remote_ip, client->real_remote_port,
 		&smtp_set, &smtp_callbacks, subm_client);
 	return 0;
+}
+
+static void
+submission_client_disconnect(struct client *client, const char *reason)
+{
+	struct submission_client *subm_client =
+		container_of(client, struct submission_client, common);
+
+	/* If the smtp-server connection is already in its close cascade (i.e.
+	   we're being called via its conn_disconnect callback), skip closing
+	   it again. Doing so would null subm_client->conn and prevent the
+	   conn_free callback from invoking client_destroy(). */
+	if (subm_client->conn != NULL &&
+	    !smtp_server_connection_is_closed(subm_client->conn))
+		smtp_server_connection_close(&subm_client->conn, reason);
 }
 
 static void submission_client_destroy(struct client *client)
@@ -166,6 +183,15 @@ static void submission_client_notify_auth_ready(struct client *client)
 	client->banner_sent = TRUE;
 	if (!smtp_server_connection_is_started(subm_client->conn))
 		smtp_server_connection_start(subm_client->conn);
+}
+
+static void submission_client_notify_auth_connected(struct client *client)
+{
+	struct submission_client *subm_client =
+		container_of(client, struct submission_client, common);
+
+	if (subm_client->auth_cmd_deferred)
+		cmd_auth_begin(subm_client);
 }
 
 static void
@@ -208,6 +234,10 @@ client_connection_cmd_xclient(void *context,
 		client->common.ip = data->source_ip;
 	if (data->source_port != 0)
 		client->common.remote_port = data->source_port;
+	if (data->dest_ip.family != 0)
+		client->common.local_ip = data->dest_ip;
+	if (data->dest_port != 0)
+		client->common.local_port = data->dest_port;
 	if (data->ttl_plus_1 > 0)
 		client->common.proxy_ttl = data->ttl_plus_1 - 1;
 	if (data->session != NULL) {
@@ -236,13 +266,22 @@ client_connection_cmd_xclient(void *context,
 			}
 		}
 	}
+
+	const char *error;
+	if (client_addresses_changed(&client->common, &error) < 0) {
+		client_notify_disconnect(&client->common,
+			CLIENT_DISCONNECT_INTERNAL_ERROR,
+			"Failed to reload configuration");
+		client_disconnect(&client->common, error);
+	}
 }
 
 static void client_connection_disconnect(void *context, const char *reason)
 {
 	struct submission_client *client = context;
 
-	client->pending_auth = NULL;
+	client->auth_cmd = NULL;
+	client->auth_cmd_data = NULL;
 	client_disconnect(&client->common, reason);
 }
 
@@ -289,6 +328,7 @@ static void submission_login_init(void)
 	/* Pre-auth state is always logged either as GREETING or READY.
 	   It's not very useful. */
 	smtp_server_set.no_state_in_reason = TRUE;
+	smtp_server_set.max_recipients = SET_UINT_UNLIMITED;
 	smtp_server = smtp_server_init(&smtp_server_set);
 	smtp_server_command_override(smtp_server, "MAIL", cmd_mail,
 				     SMTP_SERVER_CMD_FLAG_PREAUTH);
@@ -320,9 +360,11 @@ static const struct smtp_server_callbacks smtp_callbacks = {
 static struct client_vfuncs submission_client_vfuncs = {
 	.alloc = submission_client_alloc,
 	.create = submission_client_create,
+	.disconnect = submission_client_disconnect,
 	.destroy = submission_client_destroy,
 	.reload_config = submission_client_reload_config,
 	.notify_auth_ready = submission_client_notify_auth_ready,
+	.notify_auth_connected = submission_client_notify_auth_connected,
 	.notify_disconnect = submission_client_notify_disconnect,
 	.auth_send_challenge = submission_client_auth_send_challenge,
 	.auth_result = submission_client_auth_result,
@@ -334,6 +376,7 @@ static struct client_vfuncs submission_client_vfuncs = {
 
 static struct login_binary submission_login_binary = {
 	.protocol = "submission",
+	.service_name = "submission",
 	.process_name = "submission-login",
 	.default_port = 587,
 

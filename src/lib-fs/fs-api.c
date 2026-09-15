@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -75,6 +75,20 @@ void fs_class_register(const struct fs *fs_class)
 	array_push_back(&fs_classes, &fs_class);
 }
 
+void fs_class_unregister(const struct fs *fs_class)
+{
+	const struct fs *const *p;
+
+	array_foreach(&fs_classes, p) {
+		if (*p == fs_class) {
+			array_delete(&fs_classes,
+				     array_foreach_idx(&fs_classes, p), 1);
+			return;
+		}
+	}
+	i_panic("fs_class_unregister(): Class %s not found", fs_class->name);
+}
+
 static void fs_classes_deinit(void)
 {
 	array_free(&fs_classes);
@@ -90,7 +104,7 @@ static void fs_classes_init(void)
 	fs_class_register(&fs_class_sis);
 	fs_class_register(&fs_class_sis_queue);
 	fs_class_register(&fs_class_test);
-	lib_atexit(fs_classes_deinit);
+	lib_atexit_priority(fs_classes_deinit, LIB_ATEXIT_PRIORITY_LOW);
 }
 
 static const struct fs *fs_class_find(const char *driver)
@@ -451,6 +465,21 @@ void fs_file_deinit(struct fs_file **_file)
 	T_BEGIN {
 		file->fs->v.file_deinit(file);
 	} T_END;
+}
+
+bool fs_file_equals(struct fs_file *file1, struct fs_file *file2)
+{
+	while (file1->parent != NULL)
+		file1 = file1->parent;
+	while (file2->parent != NULL)
+		file2 = file2->parent;
+
+	if (strcmp(file1->fs->name, file2->fs->name) != 0)
+		return FALSE;
+	if (file1->fs->v.file_equals == NULL)
+		return FALSE;
+	i_assert(file1->fs->v.file_equals == file2->fs->v.file_equals);
+	return file1->fs->v.file_equals(file1, file2);
 }
 
 void fs_file_free(struct fs_file *file)
@@ -1058,18 +1087,26 @@ int fs_write_stream_finish_async(struct fs_file *file)
 	return fs_write_stream_finish_int(file, TRUE);
 }
 
+/* Accepts both a caller-owned pointer (e.g. &output where output is a local
+ * variable) and &file->output itself. */
 static void fs_write_stream_abort(struct fs_file *file, struct ostream **output)
 {
 	int ret;
+	bool is_file_output = (output == &file->output);
 
 	i_assert(*output == file->output);
 	i_assert(file->output != NULL);
-	i_assert(output != &file->output);
 
-	*output = NULL;
+	if (!is_file_output)
+		*output = NULL;
+
 	o_stream_abort(file->output);
 	/* make sure we don't have an old error lying around */
 	ret = fs_write_stream_finish_int(file, FALSE);
+
+	if (is_file_output)
+		*output = NULL;
+
 	i_assert(ret != 0);
 }
 

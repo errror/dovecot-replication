@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -23,7 +23,7 @@
 struct dbox_save_mail {
 	struct dbox_file_append_context *file_append;
 	uint32_t seq;
-	uint32_t append_offset;
+	uoff_t append_offset;
 	time_t save_date;
 	bool written_to_disk;
 };
@@ -147,7 +147,6 @@ int mdbox_save_begin(struct mail_save_context *_ctx, struct istream *input)
 		ctx->ctx.failed = TRUE;
 		return -1;
 	}
-	i_assert(ctx->ctx.dbox_output->offset <= (uint32_t)-1);
 	append_offset = ctx->ctx.dbox_output->offset;
 
 	ctx->cur_file = ctx->cur_file_append->file;

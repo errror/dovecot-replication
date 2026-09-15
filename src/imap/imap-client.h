@@ -65,8 +65,15 @@ struct client_command_stats {
 	/* time when command handling was last finished. this is before
 	   mailbox syncing is done. */
 	struct timeval last_run_timeval;
+	/* time when the command's own handling was finished: when it called
+	   cmd_sync(), or when it was freed if it never did. Mailbox syncing
+	   isn't included, because it can also be flushing changes made by
+	   other commands. */
+	struct timeval finish_timeval;
 	/* io_loop_get_wait_usecs()'s value when the command was started */
 	uint64_t start_ioloop_wait_usecs;
+	/* io_loop_get_wait_usecs()'s value at finish_timeval */
+	uint64_t finish_ioloop_wait_usecs;
 	/* how many usecs this command itself has spent running */
 	uint64_t running_usecs;
 	/* how many usecs this command itself has spent waiting for locks */
@@ -127,6 +134,7 @@ struct client_command_context {
 	bool tagline_sent:1;
 	bool executing:1;
 	bool internal:1;
+	bool utf8:1; /* status of UTF8=ACCEPT feature at command alloc */
 };
 
 struct imap_client_vfuncs {
@@ -289,6 +297,11 @@ int client_create_finish(struct client *client, const char **error_r);
 void client_add_istream_prefix(struct client *client,
 			       const unsigned char *data, size_t size);
 void client_destroy(struct client *client, const char *reason) ATTR_NULL(2);
+
+/* Add the side-channel ostream used to send commands (e.g. dict_reset) back
+   to the imap-login proxy. Must only be called when multiplex_output is set
+   and the channel hasn't been created yet. */
+void client_create_side_channel_output(struct client *client);
 
 /* Disconnect client connection */
 void client_disconnect(struct client *client, const char *reason);

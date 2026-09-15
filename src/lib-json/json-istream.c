@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -38,6 +38,7 @@ struct json_istream {
 };
 
 static void json_istream_dereference_value(struct json_istream *stream);
+static void json_istream_detach_value_stream(struct json_istream *stream);
 static int json_istream_consume_value_stream(struct json_istream *stream);
 
 /*
@@ -107,6 +108,10 @@ void json_istream_unref(struct json_istream **_stream)
 		return;
 
 	json_istream_dereference_value(stream);
+	/* Must happen before json_parser_deinit(): dereferencing the value can
+	   itself fire json_istream_drop_seekable_stream(), which uses the
+	   parser. */
+	json_istream_detach_value_stream(stream);
 
 	json_parser_deinit(&stream->parser);
 	i_free(stream->error);
@@ -442,6 +447,16 @@ json_istream_parse_value(void *context, void *parent_context, const char *name,
 	stream->node.value = *value;
 	stream->node_parsed = TRUE;
 	if (value->content_type == JSON_CONTENT_TYPE_STREAM) {
+		/* json_istream_consumed_value_stream() closes this stream
+		   directly, with close_parents=TRUE. That is only safe
+		   because a json_string_istream has no real istream parent
+		   (json-parser.c: json_string_stream_create() creates it with
+		   parent==NULL) and its close() vfunc ignores close_parents.
+		   A stream with a real parent - e.g. one built with
+		   i_stream_create_range() - must never be assigned here: its
+		   default close() propagates to the parent, which would be
+		   parser->input, taking the caller's entire JSON body down
+		   with it. */
 		stream->value_stream = value->content.stream;
 		i_stream_ref(stream->value_stream);
 	}
@@ -494,7 +509,7 @@ int json_istream_read(struct json_istream *stream, struct json_node *node_r)
 		ret = json_istream_consume_value_stream(stream);
 		if (ret <= 0)
 			return ret;
-		ret = json_parse_more(stream->parser, &error);
+		ret = json_parse_more(stream->parser, NULL, &error);
 		if (ret < 0) {
 			json_istream_set_error(stream, error);
 			return ret;
@@ -590,7 +605,7 @@ int json_istream_read_object_member(struct json_istream *stream,
 		if (ret <= 0)
 			return ret;
 		stream->read_member = TRUE;
-		ret = json_parse_more(stream->parser, &error);
+		ret = json_parse_more(stream->parser, NULL, &error);
 		stream->read_member = FALSE;
 		if (ret < 0) {
 			json_istream_set_error(stream, error);
@@ -701,34 +716,59 @@ static void json_istream_drop_seekable_stream(struct json_istream *stream)
 
 static void json_istream_drop_value_stream(struct json_istream *stream)
 {
-	if (stream->deref_value) {
-		stream->deref_value = FALSE;
-		if (stream->seekable_stream != NULL) {
-			i_stream_remove_destroy_callback(
-				stream->seekable_stream,
-				json_istream_drop_seekable_stream);
+	if (stream->seekable_stream != NULL) {
+		/* The seekable stream outlives its wrapped value stream
+		   whenever the caller holds a reference of its own, so drop its
+		   destroy callback here as well: the pointer to it is cleared
+		   below either way. */
+		i_stream_remove_destroy_callback(
+			stream->seekable_stream,
+			json_istream_drop_seekable_stream);
+		if (stream->deref_value)
 			i_stream_unref(&stream->seekable_stream);
-		}
 	}
+	stream->deref_value = FALSE;
+	stream->value_stream = NULL;
+	stream->seekable_stream = NULL;
+}
+
+/* Removes the destroy callbacks registered by json_istream_handle_stream().
+   The value streams can outlive the JSON istream, so the callbacks must be
+   gone before their context is freed. Both callbacks are registered together
+   and every path that removes or fires one clears both stream pointers, so a
+   NULL seekable_stream means there is nothing to remove. */
+static void json_istream_detach_value_stream(struct json_istream *stream)
+{
+	if (stream->seekable_stream == NULL)
+		return;
+
+	i_assert(stream->value_stream != NULL);
+	i_stream_remove_destroy_callback(stream->seekable_stream,
+					 json_istream_drop_seekable_stream);
+	i_stream_remove_destroy_callback(stream->value_stream,
+					 json_istream_drop_value_stream);
 	stream->value_stream = NULL;
 	stream->seekable_stream = NULL;
 }
 
 static void json_istream_consumed_value_stream(struct json_istream *stream)
 {
+	/* On genuine completion the seekable wrapper's own unref_streams()
+	   has already destroyed stream->value_stream, running
+	   json_string_istream_close() and clearing parser->str_stream, so
+	   this is a no-op. On a truncated or errored source it has not:
+	   close it explicitly here so parser->str_stream is always cleared
+	   once a value is treated as consumed, whatever state the wrapper
+	   is in. This must run before json_istream_dereference_value(),
+	   which can drop the last reference and NULL stream->value_stream
+	   itself (via json_istream_drop_seekable_stream()); the NULL check
+	   above would then skip the close entirely. Every in-tree caller
+	   holds its own reference across this point, so nothing currently
+	   exercises that order - it guards a caller that does not. */
+	if (stream->value_stream != NULL)
+		i_stream_close(stream->value_stream);
 	json_istream_dereference_value(stream);
-	if (stream->seekable_stream != NULL) {
-		i_stream_remove_destroy_callback(
-			stream->seekable_stream,
-			json_istream_drop_seekable_stream);
-	}
-	if (stream->value_stream != NULL) {
-		i_stream_remove_destroy_callback(
-			stream->value_stream,
-			json_istream_drop_value_stream);
-	}
-	stream->value_stream = NULL;
-	stream->seekable_stream = NULL;
+	json_istream_detach_value_stream(stream);
 	json_parser_disable_string_stream(stream->parser);
 }
 
@@ -742,7 +782,9 @@ static int json_istream_consume_value_stream(struct json_istream *stream)
 
 	if (input == NULL)
 		return 1;
-	if (!i_stream_have_bytes_left(stream->seekable_stream)) {
+	i_assert(stream->value_stream != NULL);
+
+	if (!i_stream_have_bytes_left(input)) {
 		json_istream_consumed_value_stream(stream);
 		return 1;
 	}
@@ -897,7 +939,7 @@ static int json_istream_read_tree_common(struct json_istream *stream)
 	ret = json_istream_consume_value_stream(stream);
 	if (ret <= 0)
 		return ret;
-	ret = json_parse_more(stream->parser, &error);
+	ret = json_parse_more(stream->parser, NULL, &error);
 	if (ret < 0) {
 		json_istream_set_error(stream, error);
 		return ret;
@@ -1047,4 +1089,20 @@ int json_istream_read_into_tree(struct json_istream *stream,
 {
 	return json_istream_read_into_tree_node(
 		stream, json_tree_get_root(tree));
+}
+
+int json_istream_read_tree_lazy_strings(struct json_istream *stream,
+					size_t threshold,
+					size_t max_buffer_size,
+					struct json_tree **tree_r)
+{
+	int ret;
+
+	i_assert(stream->input->seekable);
+
+	json_parser_enable_lazy_string_stream(stream->parser, threshold,
+					       max_buffer_size);
+	ret = json_istream_read_tree(stream, tree_r);
+	json_parser_disable_string_stream(stream->parser);
+	return ret;
 }

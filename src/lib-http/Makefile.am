@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libhttp.la
 
 AM_CPPFLAGS = \
@@ -77,15 +79,15 @@ test_nocheck_programs = \
 	test-http-client \
 	test-http-server
 
-noinst_PROGRAMS = $(test_programs) $(test_nocheck_programs)
+noinst_PROGRAMS += $(test_nocheck_programs)
 
 test_libs = \
 	../lib-settings/libsettings.la \
 	../lib-dns/libdns.la \
 	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
-	../lib/liblib.la \
-	$(MODULE_LIBS)
+	../lib/liblib.la
 
 test_deps = \
 	$(noinst_LTLIBRARIES) \
@@ -93,18 +95,19 @@ test_deps = \
 	../lib-settings/libsettings.la \
 	../lib-dns/libdns.la \
 	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib/liblib.la
 
 test_http_url_SOURCES = test-http-url.c
-test_http_url_LDADD = http-url.lo http-header.lo $(test_libs)
+test_http_url_LDADD = http-url.lo http-header.lo $(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_http_url_DEPENDENCIES = $(test_deps)
 
 test_http_date_SOURCES = test-http-date.c
-test_http_date_LDADD = http-date.lo  $(test_libs)
+test_http_date_LDADD = http-date.lo  $(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_http_date_DEPENDENCIES = $(test_deps)
 
 test_http_header_parser_SOURCES = test-http-header-parser.c
-test_http_header_parser_LDADD = http-parser.lo http-header-parser.lo http-header.lo $(test_libs)
+test_http_header_parser_LDADD = http-parser.lo http-header-parser.lo http-header.lo $(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_http_header_parser_DEPENDENCIES = $(test_deps)
 
 test_http_transfer_SOURCES = test-http-transfer.c
@@ -113,14 +116,14 @@ test_http_transfer_LDADD = \
 	http-header-parser.lo \
 	http-transfer-chunked.lo \
 	http-header.lo \
-	$(test_libs)
+	$(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_http_transfer_DEPENDENCIES = $(test_deps)
 
 test_http_auth_SOURCES = test-http-auth.c
 test_http_auth_LDADD = \
 	http-auth.lo \
 	http-parser.lo \
-	$(test_libs)
+	$(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_http_auth_DEPENDENCIES = $(test_deps)
 
 test_http_response_parser_SOURCES = test-http-response-parser.c
@@ -132,7 +135,7 @@ test_http_response_parser_LDADD = \
 	http-transfer-chunked.lo \
 	http-message-parser.lo \
 	http-response-parser.lo \
-	$(test_libs)
+	$(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_http_response_parser_DEPENDENCIES = $(test_deps)
 
 test_http_request_parser_SOURCES = test-http-request-parser.c
@@ -145,7 +148,7 @@ test_http_request_parser_LDADD = \
 	http-transfer-chunked.lo \
 	http-message-parser.lo \
 	http-request-parser.lo \
-	$(test_libs)
+	$(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_http_request_parser_DEPENDENCIES = $(test_deps)
 
 test_http_libs = \
@@ -155,7 +158,7 @@ test_http_libs = \
 	../lib-ssl-iostream/libssl_iostream.la \
 	../lib-master/libmaster.la \
 	../lib-auth-client/libauth-client.la \
-	$(test_libs)
+	$(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_http_deps = \
 	libhttp.la \
 	../lib-dns-client/libdns-client.la  \
@@ -165,7 +168,7 @@ test_http_deps = \
 	../lib-auth-client/libauth-client.la \
 	$(test_deps)
 
-test_http_libs_ssl = ../lib-ssl-iostream/libssl_iostream_openssl.la
+test_http_libs_ssl = ../lib-ssl-iostream/libssl_iostream_openssl.la $(LIBDOVECOT_TEST_LIBS)
 
 test_http_payload_SOURCES = test-http-payload.c
 test_http_payload_LDFLAGS = -export-dynamic
@@ -212,7 +215,24 @@ test_http_server_errors_LDADD = \
 test_http_server_errors_DEPENDENCIES = \
 	$(test_http_deps)
 
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done
+if USE_FUZZER
+noinst_PROGRAMS += fuzz-http-request-parser
+nodist_EXTRA_fuzz_http_request_parser_SOURCES = force-cxx-linking.cxx
+fuzz_http_request_parser_SOURCES = fuzz-http-request-parser.c
+fuzz_http_request_parser_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_http_request_parser_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_http_request_parser_LDADD = libhttp.la $(test_libs)
+fuzz_http_request_parser_DEPENDENCIES = libhttp.la $(test_deps)
+
+noinst_PROGRAMS += fuzz-http-response-parser
+nodist_EXTRA_fuzz_http_response_parser_SOURCES = force-cxx-linking.cxx
+fuzz_http_response_parser_SOURCES = fuzz-http-response-parser.c
+fuzz_http_response_parser_CPPFLAGS = $(FUZZER_CPPFLAGS)
+fuzz_http_response_parser_LDFLAGS = $(FUZZER_LDFLAGS)
+fuzz_http_response_parser_LDADD = libhttp.la $(test_libs)
+fuzz_http_response_parser_DEPENDENCIES = libhttp.la $(test_deps)
+
+EXTRA_DIST = \
+	fuzz-http-request-parser.dict \
+	fuzz-http-response-parser.dict
+endif

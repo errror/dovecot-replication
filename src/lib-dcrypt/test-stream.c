@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -76,7 +76,7 @@ static void test_static_v1_input(void)
 	ssize_t siz;
 	const struct hash_method *hash = hash_method_lookup("sha256");
 	unsigned char hash_ctx[hash->context_size];
-	unsigned char hash_dgst[hash->digest_size];
+	unsigned char hash_digest[hash->digest_size];
 	hash->init(hash_ctx);
 
 	test_begin("test_static_v1_input");
@@ -100,10 +100,10 @@ static void test_static_v1_input(void)
 
 	i_stream_unref(&is_4);
 
-	hash->result(hash_ctx, hash_dgst);
+	hash->result(hash_ctx, hash_digest);
 
 	test_assert(strcmp(test_sample_v1_hash,
-			   binary_to_hex(hash_dgst, sizeof(hash_dgst))) == 0);
+			   binary_to_hex(hash_digest, sizeof(hash_digest))) == 0);
 
 	test_end();
 }
@@ -113,7 +113,7 @@ static void test_static_v1_input_short(void)
 	ssize_t siz;
 	const struct hash_method *hash = hash_method_lookup("sha256");
 	unsigned char hash_ctx[hash->context_size];
-	unsigned char hash_dgst[hash->digest_size];
+	unsigned char hash_digest[hash->digest_size];
 	hash->init(hash_ctx);
 
 	test_begin("test_static_v1_input_short");
@@ -137,10 +137,10 @@ static void test_static_v1_input_short(void)
 
 	i_stream_unref(&is_4);
 
-	hash->result(hash_ctx, hash_dgst);
+	hash->result(hash_ctx, hash_digest);
 
 	test_assert(strcmp(test_sample_v1_short_hash,
-			   binary_to_hex(hash_dgst, sizeof(hash_dgst))) == 0);
+			   binary_to_hex(hash_digest, sizeof(hash_digest))) == 0);
 
 	test_end();
 }
@@ -152,7 +152,7 @@ static void test_static_v2_input(void)
 	ssize_t amt;
 	const struct hash_method *hash = hash_method_lookup("sha256");
 	unsigned char hash_ctx[hash->context_size];
-	unsigned char hash_dgst[hash->digest_size];
+	unsigned char hash_digest[hash->digest_size];
 	hash->init(hash_ctx);
 
 	struct istream *is_1 =
@@ -174,10 +174,10 @@ static void test_static_v2_input(void)
 
 	i_stream_unref(&is_4);
 
-	hash->result(hash_ctx, hash_dgst);
+	hash->result(hash_ctx, hash_digest);
 
 	test_assert(strcmp(test_sample_v2_hash,
-		    binary_to_hex(hash_dgst, sizeof(hash_dgst))) == 0);
+		    binary_to_hex(hash_digest, sizeof(hash_digest))) == 0);
 
 	test_end();
 
@@ -203,8 +203,8 @@ static void test_static_v2_input(void)
 	o_stream_close(os_2);
 	i_stream_close(is_2);
 
-	hash->result(hash_ctx, hash_dgst);
-	printf("%s\n", binary_to_hex(hash_dgst, sizeof(hash_dgst)));
+	hash->result(hash_ctx, hash_digest);
+	printf("%s\n", binary_to_hex(hash_digest, sizeof(hash_digest)));
 */
 }
 
@@ -426,10 +426,19 @@ static void test_write_read_v2_real(const struct dcrypt_keypair *pair,
 	test_end();
 }
 
+static void test_write_read_v2_short(const char *curve, const char *algo,
+				     const struct dcrypt_keypair *kp);
+static void test_write_read_v2_empty(const char *curve, const char *algo,
+				     const struct dcrypt_keypair *kp);
+
 static void test_write_read_v2_algos(const char *kalg, const struct dcrypt_keypair *pair)
 {
-	for (size_t i = 0; i < N_ELEMENTS(test_algos); i++)
+	for (size_t i = 0; i < N_ELEMENTS(test_algos); i++) {
 		test_write_read_v2_real(pair, kalg, test_algos[i]);
+		test_write_read_v2_empty(kalg, test_algos[i], pair);
+		test_write_read_v2_short(kalg, test_algos[i], pair);
+	}
+
 }
 
 static void test_write_read_v2(void)
@@ -445,7 +454,7 @@ static void test_write_read_v2_x25519(void)
 	bool ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0,
 					   SN_X25519, &error);
 	if (!ret)
-		i_panic("%s", error);
+		i_fatal("%s", error);
 
 	test_write_read_v2_algos(SN_X25519, &pair);
 	dcrypt_keypair_unref(&pair);
@@ -458,16 +467,62 @@ static void test_write_read_v2_x448(void)
 	bool ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0,
 					   SN_X448, &error);
 	if (!ret)
-		i_panic("%s", error);
+		i_fatal("%s", error);
 
 	test_write_read_v2_algos(SN_X448, &pair);
 	dcrypt_keypair_unref(&pair);
 }
 #endif
 
-static void test_write_read_v2_short(const char *algo)
+/* Whether the OpenSSL we're running against supports ML-KEM. This can't be
+   decided at build time. */
+static bool have_kem = FALSE;
+
+static void test_kem_detect(void)
 {
-	test_begin(t_strdup_printf("test_write_read_v2_short("SN_X9_62_prime256v1", %s)", algo));
+	struct dcrypt_keypair pair;
+	const char *error;
+
+	have_kem = dcrypt_keypair_generate(&pair, DCRYPT_KEY_KEM, 0,
+					   DCRYPT_ML_KEM_512, &error);
+	if (!have_kem) {
+		i_info("ML-KEM not supported by OpenSSL, "
+		       "skipping ML-KEM tests: %s", error);
+		return;
+	}
+	dcrypt_keypair_unref(&pair);
+}
+
+static void test_write_read_v2_kem_curve(const char *curve)
+{
+	struct dcrypt_keypair pair;
+	const char *error;
+	bool ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_KEM, 0,
+					   curve, &error);
+	if (!ret)
+		i_fatal("%s", error);
+
+	test_write_read_v2_algos(curve, &pair);
+	dcrypt_keypair_unref(&pair);
+}
+
+static void test_write_read_v2_kem(void)
+{
+	static const char *const curves[] = {
+		DCRYPT_ML_KEM_512, DCRYPT_ML_KEM_768, DCRYPT_ML_KEM_1024
+	};
+	if (!have_kem)
+		return;
+
+	for (size_t i = 0; i < N_ELEMENTS(curves); i++) T_BEGIN {
+		test_write_read_v2_kem_curve(curves[i]);
+	} T_END;
+}
+
+static void test_write_read_v2_short(const char *curve, const char *algo,
+				     const struct dcrypt_keypair *kp)
+{
+	test_begin(t_strdup_printf("test_write_read_v2_short(%s, %s)", curve, algo));
 	enum io_stream_encrypt_flags flags = 0;
 	unsigned char payload[1];
 	const unsigned char *ptr;
@@ -481,7 +536,7 @@ static void test_write_read_v2_short(const char *algo)
 	buffer_t *buf = buffer_create_dynamic(default_pool, 64);
 	struct ostream *os = o_stream_create_buffer(buf);
 	struct ostream *os_2 = o_stream_create_encrypt(os,
-		algo, test_v1_kp.pub, flags);
+		algo, kp->pub, flags);
 	o_stream_nsend(os_2, payload, sizeof(payload));
 	test_assert(o_stream_finish(os_2) > 0);
 	if (os_2->stream_errno != 0)
@@ -491,7 +546,7 @@ static void test_write_read_v2_short(const char *algo)
 	o_stream_unref(&os_2);
 
 	struct istream *is = test_istream_create_data(buf->data, buf->used);
-	struct istream *is_2 = i_stream_create_decrypt(is, test_v1_kp.priv);
+	struct istream *is_2 = i_stream_create_decrypt(is, kp->priv);
 
 	size_t offset = 0;
 	test_istream_set_allow_eof(is, FALSE);
@@ -520,18 +575,13 @@ static void test_write_read_v2_short(const char *algo)
 	test_end();
 }
 
-static void test_write_read_v2_short_algos(void)
-{
-	for (size_t i = 0; i < N_ELEMENTS(test_algos); i++)
-		test_write_read_v2_short(test_algos[i]);
-}
-
-static void test_write_read_v2_empty(const char *algo)
+static void test_write_read_v2_empty(const char *curve, const char *algo,
+				     const struct dcrypt_keypair *kp)
 {
 	const unsigned char *ptr;
 	size_t siz;
 	enum io_stream_encrypt_flags flags = 0;
-	test_begin(t_strdup_printf("test_write_read_v2_empty("SN_X9_62_prime256v1", %s)", algo));
+	test_begin(t_strdup_printf("test_write_read_v2_empty(%s, %s)", curve, algo));
 	if (strstr(algo, "-gcm") != NULL ||
 	    strstr(algo, "-poly1305") != NULL)
 		flags |= IO_STREAM_ENC_INTEGRITY_AEAD;
@@ -540,7 +590,7 @@ static void test_write_read_v2_empty(const char *algo)
 	buffer_t *buf = buffer_create_dynamic(default_pool, 64);
 	struct ostream *os = o_stream_create_buffer(buf);
 	struct ostream *os_2 = o_stream_create_encrypt(os,
-		algo, test_v1_kp.pub, flags);
+		algo, kp->pub, flags);
 	test_assert(o_stream_finish(os_2) > 0);
 	if (os_2->stream_errno != 0)
 		i_debug("error: %s", o_stream_get_error(os_2));
@@ -550,7 +600,7 @@ static void test_write_read_v2_empty(const char *algo)
 	/* this should've been enough */
 
 	struct istream *is = test_istream_create_data(buf->data, buf->used);
-	struct istream *is_2 = i_stream_create_decrypt(is, test_v1_kp.priv);
+	struct istream *is_2 = i_stream_create_decrypt(is, kp->priv);
 
 	/* read should not fail */
 	size_t offset = 0;
@@ -572,12 +622,6 @@ static void test_write_read_v2_empty(const char *algo)
 	buffer_free(&buf);
 
 	test_end();
-}
-
-static void test_write_read_v2_empty_algos(void)
-{
-	for (size_t i = 0; i < N_ELEMENTS(test_algos); i++)
-		test_write_read_v2_empty(test_algos[i]);
 }
 
 static int
@@ -727,18 +771,19 @@ int main(void)
 		test_write_read_v1_short,
 		test_write_read_v1_empty,
 		test_write_read_v2,
-		test_write_read_v2_short_algos,
-		test_write_read_v2_empty_algos,
 #ifdef HAVE_X25519
 		test_write_read_v2_x448,
 		test_write_read_v2_x25519,
 #endif
+		test_write_read_v2_kem,
 		test_free_keys,
 		test_read_0_to_400_byte_garbage,
 		test_read_large_header,
 		test_read_garbage,
 		NULL
 	};
+
+	test_kem_detect();
 
 	return test_run(test_functions);
 }

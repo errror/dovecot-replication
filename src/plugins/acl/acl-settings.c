@@ -1,4 +1,4 @@
-/* Copyright (c) 2023 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -48,11 +48,11 @@ static const struct setting_define acl_setting_defines[] = {
 	DEF(STR, acl_user),
 	DEF(BOOLLIST, acl_groups),
 	DEF(STR, acl_driver),
-	DEF(STR, acl_global_path),
 	DEF(TIME, acl_cache_ttl),
 	DEF(BOOL, acl_globals_only),
 	DEF(BOOL, acl_defaults_from_inbox),
 	DEF(BOOL, acl_ignore),
+	DEF(BOOL, acl_dict_index),
 	{ .type = SET_FILTER_NAME, .key = "acl_sharing_map",
 		.required_setting = "dict", },
 	{ .type = SET_FILTER_ARRAY,
@@ -68,11 +68,15 @@ static const struct acl_settings acl_default_settings = {
 	.acl_groups = ARRAY_INIT,
 	.acl_rights = ARRAY_INIT,
 	.acl_driver = "",
-	.acl_global_path = "",
 	.acl_cache_ttl = ACL_DEFAULT_CACHE_TTL_SECS,
 	.acl_globals_only = FALSE,
 	.acl_defaults_from_inbox = FALSE,
 	.acl_ignore = FALSE,
+#ifdef DOVECOT_PRO_EDITION
+	.acl_dict_index = TRUE,
+#else
+	.acl_dict_index = FALSE,
+#endif
 };
 
 static bool acl_settings_check(void *_set ATTR_UNUSED, pool_t pool ATTR_UNUSED,

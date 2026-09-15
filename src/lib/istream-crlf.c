@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -194,7 +194,8 @@ i_stream_create_crlf_full(struct istream *input, bool crlf)
 	cstream->istream.istream.blocking = input->blocking;
 	cstream->istream.istream.seekable = FALSE;
 	return i_stream_create(&cstream->istream, input,
-			       i_stream_get_fd(input), 0);
+			       i_stream_get_fd(input),
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }
 
 struct istream *i_stream_create_crlf(struct istream *input)

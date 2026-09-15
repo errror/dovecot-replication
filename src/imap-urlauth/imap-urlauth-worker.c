@@ -1,20 +1,17 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "ioloop.h"
 #include "net.h"
-#include "fdpass.h"
 #include "istream.h"
 #include "istream-unix.h"
 #include "ostream.h"
 #include "str.h"
 #include "str-sanitize.h"
 #include "strescape.h"
-#include "llist.h"
 #include "hostpid.h"
 #include "process-title.h"
-#include "randgen.h"
 #include "restrict-access.h"
 #include "settings.h"
 #include "connection.h"
@@ -23,8 +20,6 @@
 #include "master-interface.h"
 #include "mail-storage.h"
 #include "mail-storage-service.h"
-#include "mail-namespace.h"
-#include "imap-url.h"
 #include "imap-msgpart-url.h"
 #include "imap-urlauth.h"
 #include "imap-urlauth-fetch.h"
@@ -336,7 +331,9 @@ client_fetch_urlpart(struct client *client, const char *url,
 	if ((url_flags & IMAP_URLAUTH_FETCH_FLAG_BINARY) != 0)
 		imap_msgpart_url_set_decode_to_binary(client->url);
 	if ((url_flags & IMAP_URLAUTH_FETCH_FLAG_BODYPARTSTRUCTURE) != 0) {
-		ret = imap_msgpart_url_get_bodypartstructure(client->url,
+		/* FIXME: Implement UTF-8 support for quoted strings in
+		          generated BODYSTRUCTURE element. */
+		ret = imap_msgpart_url_get_bodypartstructure(client->url, 0,
 							     bpstruct_r, &error);
 		if (ret <= 0) {
 			*errormsg_r = t_strdup_printf(
@@ -599,6 +596,9 @@ client_handle_user_command(struct client *client, const char *cmd,
 	config.access_user = client->access_user;
 	config.access_service = client->access_service;
 	config.access_anonymous = client->access_anonymous;
+
+	array_append_zero(&client->access_apps);
+	array_pop_back(&client->access_apps);
 	config.access_applications =
 		(const void *)array_get(&client->access_apps, &count);
 
@@ -1018,7 +1018,12 @@ int main(int argc, char *argv[])
 	master_service_init_log_with_pid(master_service);
 	master_service_set_die_callback(master_service, imap_urlauth_worker_die);
 
-	if (master_service_settings_read_simple(master_service, &error) < 0)
+	struct master_service_settings_input set_input = {
+		.preserve_user = TRUE,
+	};
+	struct master_service_settings_output set_output;
+	if (master_service_settings_read(master_service, &set_input,
+					 &set_output, &error) < 0)
 		i_fatal("%s", error);
 
 	storage_service =

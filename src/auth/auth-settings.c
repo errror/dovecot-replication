@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -39,7 +39,7 @@ struct service_settings auth_service_settings = {
 };
 
 const struct setting_keyvalue auth_service_settings_defaults[] = {
-	{ "unix_listener", "auth-client auth-login auth-master auth-userdb login\\slogin token-login\\stokenlogin" },
+	{ "unix_listener", "auth-client auth-login auth-token auth-master auth-userdb login\\slogin token-login\\stokenlogin" },
 
 	{ "unix_listener/auth-client/path", "auth-client" },
 	{ "unix_listener/auth-client/type", "auth" },
@@ -50,6 +50,10 @@ const struct setting_keyvalue auth_service_settings_defaults[] = {
 	{ "unix_listener/auth-login/type", "login" },
 	{ "unix_listener/auth-login/mode", "0600" },
 	{ "unix_listener/auth-login/user", "$SET:default_internal_user" },
+
+	{ "unix_listener/auth-token/path", "auth-token" },
+	{ "unix_listener/auth-token/type", "token" },
+	{ "unix_listener/auth-token/mode", "0666" },
 
 	{ "unix_listener/auth-master/path", "auth-master" },
 	{ "unix_listener/auth-master/type", "master" },
@@ -136,7 +140,7 @@ static const struct auth_passdb_settings auth_passdb_default_settings = {
 	.mechanisms_filter = ARRAY_INIT,
 	.username_filter = "",
 
-	.default_password_scheme = "PLAIN",
+	.default_password_scheme = "CRYPT",
 
 	.skip = "never:authenticated:unauthenticated",
 	.result_success = "return-ok:return:return-fail:continue:continue-ok:continue-fail",
@@ -268,11 +272,17 @@ static const struct auth_static_settings auth_static_default_settings = {
 	.userdb_static_allow_all_users = FALSE,
 };
 
+static const struct setting_keyvalue auth_static_default_settings_keyvalue[] = {
+       { "passdb_static/passdb_default_password_scheme", "PLAIN" },
+       { NULL, NULL }
+};
+
 const struct setting_parser_info auth_static_setting_parser_info = {
 	.name = "auth_static",
 
 	.defines = auth_static_setting_defines,
 	.defaults = &auth_static_default_settings,
+	.default_settings = auth_static_default_settings_keyvalue,
 
 	.struct_size = sizeof(struct auth_static_settings),
 	.pool_offset1 = 1 + offsetof(struct auth_static_settings, pool),
@@ -400,9 +410,9 @@ static const struct auth_settings auth_default_settings = {
 	.base_dir = PKG_RUNDIR,
 	.verbose_proctitle = VERBOSE_PROCTITLE_DEFAULT,
 	.first_valid_uid = 500,
-	.last_valid_uid = 0,
+	.last_valid_uid = SET_UINT_UNLIMITED,
 	.first_valid_gid = 1,
-	.last_valid_gid = 0,
+	.last_valid_gid = SET_UINT_UNLIMITED,
 };
 static const struct setting_keyvalue auth_default_settings_keyvalue[] = {
 	{ "auth_mechanisms", "plain" },
@@ -588,6 +598,15 @@ static bool auth_settings_ext_check(struct event *event, void *_set,
 		set->debug = TRUE;
 	if (set->debug)
 		set->verbose = TRUE;
+
+	if (set->last_valid_uid == 0) {
+		*error_r = "last_valid_uid must not be 0";
+		return FALSE;
+	}
+	if (set->last_valid_gid == 0) {
+		*error_r = "last_valid_gid must not be 0";
+		return FALSE;
+	}
 
 	if (set->cache_size > 0 && set->cache_size < 1024) {
 		/* probably a configuration error.

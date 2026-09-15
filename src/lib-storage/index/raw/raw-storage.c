@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -231,14 +231,9 @@ struct mail_storage raw_storage = {
 		MAIL_STORAGE_CLASS_FLAG_BINARY_DATA,
 
 	.v = {
-		raw_storage_alloc,
-		NULL,
-		index_storage_destroy,
-		NULL,
-		NULL,
-		raw_mailbox_alloc,
-		NULL,
-		NULL,
+		.alloc = raw_storage_alloc,
+		.destroy = index_storage_destroy,
+		.mailbox_alloc = raw_mailbox_alloc,
 	}
 };
 

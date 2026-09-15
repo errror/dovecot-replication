@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -19,6 +19,11 @@ struct service_settings indexer_worker_service_settings = {
 
 	.process_limit = 10,
 	.client_limit = 1,
+#ifdef DOVECOT_PRO_EDITION
+	.restart_request_count = 1000,
+#else
+	.restart_request_count = 1,
+#endif
 
 	.unix_listeners = ARRAY_INIT,
 	.fifo_listeners = ARRAY_INIT,
@@ -36,7 +41,9 @@ const struct setting_keyvalue indexer_worker_service_settings_defaults[] = {
 	{ "unix_listener/srv.indexer-worker\\s%{pid}/type", "admin" },
 	{ "unix_listener/srv.indexer-worker\\s%{pid}/mode", "0600" },
 
-	{ "service_extra_groups", "$SET:default_internal_group" },
+	/* This needs to be here explicitly until the backwards compatibility
+	   is removed from settings-history-core.txt */
+	{ "service_extra_groups", "" },
 
 	{ NULL, NULL }
 };

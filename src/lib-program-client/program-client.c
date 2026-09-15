@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -351,6 +351,8 @@ program_client_input_finish(struct program_client *pclient)
 	size_t size;
 	int ret;
 
+	i_assert(input != NULL);
+
 	/* read (the remainder of) the raw program input */
 	while ((ret=i_stream_read_more(input, &data, &size)) > 0)
 		i_stream_skip(input, size);
@@ -551,6 +553,7 @@ void program_client_set_input(struct program_client *pclient,
 void program_client_set_output(struct program_client *pclient,
 			       struct ostream *output)
 {
+	o_stream_ignore_last_errors(pclient->output);
 	o_stream_unref(&pclient->output);
 	if (output != NULL)
 		o_stream_ref(output);
@@ -561,6 +564,7 @@ void program_client_set_output(struct program_client *pclient,
 void program_client_set_output_seekable(struct program_client *pclient,
 					const char *temp_prefix)
 {
+	o_stream_ignore_last_errors(pclient->output);
 	o_stream_unref(&pclient->output);
 	pclient->output = iostream_temp_create_sized(temp_prefix, 0,
 		"(program client seekable output)",
@@ -677,6 +681,7 @@ void program_client_destroy(struct program_client **_pclient)
 	i_assert(pclient->callback == NULL);
 
 	i_stream_unref(&pclient->input);
+	o_stream_ignore_last_errors(pclient->output);
 	o_stream_unref(&pclient->output);
 
 	i_stream_unref(&pclient->program_input);

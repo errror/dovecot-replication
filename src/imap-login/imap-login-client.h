@@ -11,6 +11,10 @@
 /* maximum length for IMAP command line. */
 #define IMAP_LOGIN_MAX_LINE_LENGTH 8192
 
+/* Maximum number of '(' allowed in an IMAP command. Pre-login only uses
+   lists in the ID command. */
+#define IMAP_LOGIN_LIST_COUNT_LIMIT 1
+
 enum imap_client_id_state {
 	IMAP_CLIENT_ID_STATE_LIST = 0,
 	IMAP_CLIENT_ID_STATE_KEY,
@@ -49,6 +53,19 @@ struct imap_client_cmd_id {
 	struct event *params_event;
 	struct imap_id_params *params;
 	string_t *log_reply;
+	/* Number of external (non internal x-*) key/value pairs accounted so
+	   far. Used to bound the pre-login accounting (logging, event fields,
+	   client_id) done per external pair. */
+	unsigned int processed_pairs_count;
+	/* ID contained internal x-* keys containing IPs/session/etc */
+	bool seen_internal_keys;
+	/* ID contained non-internal keys, i.e. the end user client had sent
+	   an ID command with some parameters. Note that Dovecot proxy can
+	   send an ID command with both internal and external keys. */
+	bool seen_external_keys;
+	/* ID contained internal x-* keys which can affect settings. Reload
+	   the login settings after the ID command handling is finished. */
+	bool reload_settings;
 };
 
 struct imap_client {

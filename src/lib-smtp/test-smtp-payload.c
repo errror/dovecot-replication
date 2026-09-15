@@ -1,9 +1,10 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
 #include "llist.h"
 #include "array.h"
+#include "base64.h"
 #include "path-util.h"
 #include "hostpid.h"
 #include "ioloop.h"
@@ -16,7 +17,11 @@
 #include "iostream-ssl-test.h"
 #include "iostream-openssl.h"
 #include "connection.h"
+#include "password-scheme.h"
+#include "dsasl-client.h"
+#include "sasl-server.h"
 #include "test-common.h"
+#include "test-dir.h"
 #include "test-subprocess.h"
 #include "settings.h"
 #include "smtp-server.h"
@@ -47,9 +52,16 @@ enum test_ssl_mode {
 	TEST_SSL_MODE_STARTTLS
 };
 
-static unsigned int test_max_pending = 1;
-static bool test_unknown_size = FALSE;
-static enum test_ssl_mode test_ssl_mode = TEST_SSL_MODE_NONE;
+static struct test_settings {
+	unsigned int max_pending;
+	bool unknown_size;
+	enum test_ssl_mode ssl_mode;
+
+	const char *sasl_mech;
+	const char *authid;
+	const char *authzid;
+	const char *password;
+} tset;
 
 static struct ip_addr bind_ip;
 static in_port_t bind_port = 0;
@@ -89,6 +101,12 @@ static void test_files_read_dir(const char *path)
 		if ((dp = readdir(dirp)) == NULL)
 			break;
 		if (*dp->d_name == '.')
+			continue;
+
+		if (str_ends_with(dp->d_name, ".tmp") ||
+		    str_ends_with(dp->d_name, ".log") ||
+		    str_ends_with(dp->d_name, ".trs") ||
+		    str_begins_with(dp->d_name, "test.out"))
 			continue;
 
 		file = t_abspath_to(dp->d_name, path);
@@ -161,6 +179,20 @@ struct client {
 	struct client *prev, *next;
 
 	struct smtp_server_connection *smtp_conn;
+
+	struct {
+		struct smtp_server_cmd_ctx *cmd;
+
+		struct sasl_server_req_ctx sasl_req;
+		const char *password_scheme;
+		sasl_server_passdb_callback_t *passdb_callback;
+		struct timeout *to_passdb;
+
+		const char *authid;
+		const char *authzid;
+		const char *realm;
+		const char *password;
+	} auth;
 };
 
 struct client_transaction {
@@ -173,6 +205,8 @@ struct client_transaction {
 	struct istream *payload, *file;
 };
 
+static struct sasl_server *sasl_server;
+static struct sasl_server_instance *sasl_server_inst;
 static struct smtp_server *smtp_server;
 
 static struct io *io_listen;
@@ -377,12 +411,280 @@ test_server_conn_cmd_data_continue(void *conn_ctx ATTR_UNUSED,
 	return client_transaction_read_more(ctrans);
 }
 
+/* authentication */
+
+static int
+test_server_conn_cmd_helo(void *conn_ctx ATTR_UNUSED,
+			  struct smtp_server_cmd_ctx *cmd,
+			  struct smtp_server_cmd_helo *data)
+{
+	struct smtp_server_reply *reply;
+
+	reply = smtp_server_reply_create_ehlo(cmd->cmd);
+	if (data->helo.old_smtp) {
+		smtp_server_reply_submit(reply);
+		return 1;
+	}
+
+	smtp_server_reply_ehlo_add_8bitmime(reply);
+	if (tset.sasl_mech != NULL) T_BEGIN {
+		struct sasl_server_mech_iter *mech_iter;
+		string_t *param = t_str_new(128);
+
+		mech_iter =
+			sasl_server_instance_mech_iter_new(sasl_server_inst);
+		while (sasl_server_mech_iter_next(mech_iter)) {
+			if (str_len(param) > 0)
+				str_append_c(param, ' ');
+			str_append(param, mech_iter->name);
+		}
+		sasl_server_mech_iter_free(&mech_iter);
+
+		if (str_len(param) > 0) {
+			smtp_server_reply_ehlo_add_param(reply, "AUTH", "%s",
+							 str_c(param));
+		}
+	} T_END;
+	smtp_server_reply_ehlo_add_binarymime(reply);
+	smtp_server_reply_ehlo_add_chunking(reply);
+	smtp_server_reply_ehlo_add_dsn(reply);
+	smtp_server_reply_ehlo_add_enhancedstatuscodes(reply);
+	smtp_server_reply_ehlo_add_starttls(reply);
+	smtp_server_reply_ehlo_add_pipelining(reply);
+	smtp_server_reply_ehlo_add_vrfy(reply);
+	smtp_server_reply_submit(reply);
+	return 1;
+}
+
+static bool
+test_server_sasl_set_authid(struct sasl_server_req_ctx *rctx,
+			    enum sasl_server_authid_type authid_type,
+			    const char *authid)
+{
+	struct client *client =
+		container_of(rctx, struct client, auth.sasl_req);
+
+	test_assert(authid_type == SASL_SERVER_AUTHID_TYPE_USERNAME);
+
+	client->auth.authid = p_strdup(client->pool, authid);
+	return TRUE;
+}
+
+static bool
+test_server_sasl_set_authzid(struct sasl_server_req_ctx *rctx,
+			     const char *authzid)
+{
+	struct client *client =
+		container_of(rctx, struct client, auth.sasl_req);
+
+	client->auth.authzid = p_strdup(client->pool, authzid);
+	return TRUE;
+}
+
+static void
+test_server_sasl_set_realm(struct sasl_server_req_ctx *rctx,
+			   const char *realm)
+{
+	struct client *client =
+		container_of(rctx, struct client, auth.sasl_req);
+
+	client->auth.realm = p_strdup(client->pool, realm);
+}
+
+static void test_server_sasl_passdb_result(struct client *client)
+{
+	sasl_server_passdb_callback_t *callback = client->auth.passdb_callback;
+	struct sasl_passdb_result result;
+
+	timeout_remove(&client->auth.to_passdb);
+
+	i_zero(&result);
+
+	if (tset.authid == NULL ||
+	    strcmp(client->auth.authid, tset.authid) != 0) {
+		result.status = SASL_PASSDB_RESULT_USER_UNKNOWN;
+		callback(&client->auth.sasl_req, &result);
+		return;
+	}
+	if (client->auth.authzid != NULL &&
+	    (tset.authzid == NULL ||
+	     strcmp(client->auth.authzid, tset.authzid) != 0)) {
+		result.status = SASL_PASSDB_RESULT_USER_UNKNOWN;
+		callback(&client->auth.sasl_req, &result);
+		return;
+	}
+
+	if (client->auth.password != NULL) {
+		if (strcmp(tset.password, client->auth.password) == 0) {
+			result.status = SASL_PASSDB_RESULT_OK;
+			callback(&client->auth.sasl_req, &result);
+		} else {
+			result.status = SASL_PASSDB_RESULT_PASSWORD_MISMATCH;
+			callback(&client->auth.sasl_req, &result);
+		}
+		return;
+	}
+
+	const struct password_generate_params params = {
+		.user = (client->auth.realm == NULL ? tset.authid :
+			 t_strconcat(tset.authid, "@", client->auth.realm, NULL)),
+	};
+
+	if (!password_generate(tset.password, &params,
+			       client->auth.password_scheme,
+			       &result.credentials.data,
+			       &result.credentials.size)) {
+		i_zero(&result);
+		result.status = SASL_PASSDB_RESULT_INTERNAL_FAILURE;
+		callback(&client->auth.sasl_req, &result);
+		return;
+	}
+
+	result.status = SASL_PASSDB_RESULT_OK;
+	callback(&client->auth.sasl_req, &result);
+}
+
+static void
+test_server_sasl_verify_plain(struct sasl_server_req_ctx *rctx,
+			      const char *password,
+			      sasl_server_passdb_callback_t *callback)
+{
+	struct client *client =
+		container_of(rctx, struct client, auth.sasl_req);
+
+	i_assert(client->auth.to_passdb == NULL);
+
+	/* Simulate async lookup */
+	client->auth.passdb_callback = callback;
+	client->auth.password = p_strdup(client->pool, password);
+	client->auth.to_passdb = timeout_add_short(0,
+		test_server_sasl_passdb_result, client);
+}
+
+static void
+test_server_sasl_lookup_credentials(struct sasl_server_req_ctx *rctx,
+				    const char *scheme,
+				    sasl_server_passdb_callback_t *callback)
+{
+	struct client *client =
+		container_of(rctx, struct client, auth.sasl_req);
+
+	i_assert(client->auth.to_passdb == NULL);
+
+	/* Simulate async lookup */
+	client->auth.passdb_callback = callback;
+	client->auth.password_scheme = p_strdup(client->pool, scheme);
+	client->auth.to_passdb = timeout_add_short(0,
+		test_server_sasl_passdb_result, client);
+}
+
+static void
+test_server_sasl_output(struct sasl_server_req_ctx *rctx,
+			const struct sasl_server_output *output)
+{
+	struct client *client =
+		container_of(rctx, struct client, auth.sasl_req);
+	struct smtp_server_cmd_ctx *cmd = client->auth.cmd;
+
+	switch (output->status) {
+	case SASL_SERVER_OUTPUT_INTERNAL_FAILURE:
+		smtp_server_reply(cmd, 454, "4.7.0", "Internal error");
+		return;
+	case SASL_SERVER_OUTPUT_PASSWORD_MISMATCH:
+	case SASL_SERVER_OUTPUT_FAILURE:
+		smtp_server_reply(cmd, 535, "5.7.8", "Authentication failed");
+		return;
+	case SASL_SERVER_OUTPUT_SUCCESS:
+		if (output->data_size == 0) {
+			smtp_server_reply(cmd, 235, "2.7.0", "Logged in");
+			return;
+		}
+		break;
+	case SASL_SERVER_OUTPUT_CONTINUE:
+		break;
+	}
+
+	i_assert(output->data_size > 0);
+
+	buffer_t *chal = t_base64_encode(0, 0, output->data, output->data_size);
+	smtp_server_cmd_auth_send_challenge(cmd, str_c(chal));
+}
+
+static int
+test_server_conn_cmd_auth(void *conn_ctx, struct smtp_server_cmd_ctx *cmd,
+			  struct smtp_server_cmd_auth *data)
+{
+	struct client *client = conn_ctx;
+	const struct sasl_server_mech *server_mech;
+
+	server_mech = sasl_server_mech_find(sasl_server_inst, data->sasl_mech);
+	if (server_mech == NULL) {
+		smtp_server_reply(cmd, 504, "5.5.4", "Invalid mechanism");
+		return -1;
+	}
+
+	i_zero(&client->auth);
+	client->auth.cmd = cmd;
+	sasl_server_request_create(&client->auth.sasl_req, server_mech, "smtp",
+				   NULL);
+
+	const unsigned char *sasl_data;
+	size_t sasl_data_size;
+
+	if (data->initial_response == NULL) {
+		sasl_data = NULL;
+		sasl_data_size = 0;
+	} else if (strcmp(data->initial_response, "=") == 0) {
+		sasl_data = uchar_empty_ptr;
+		sasl_data_size = 0;
+	} else {
+		size_t b64_size = strlen(data->initial_response);
+		buffer_t *resp = t_buffer_create(MAX_BASE64_DECODED_SIZE(b64_size));
+		if (base64_decode(data->initial_response, b64_size, resp) < 0) {
+			smtp_server_reply(cmd, 501, "5.5.2",
+					 "Invalid Base64 encoding");
+			return -1;
+		}
+
+		sasl_data = resp->data;
+		sasl_data_size = resp->used;
+	}
+	sasl_server_request_initial(&client->auth.sasl_req,
+				    sasl_data, sasl_data_size);
+	return 0;
+}
+
+static int
+test_server_conn_cmd_auth_continue(void *conn_ctx,
+				   struct smtp_server_cmd_ctx *cmd,
+				   const char *response)
+{
+	struct client *client = conn_ctx;
+
+	size_t b64_size = strlen(response);
+	buffer_t *resp = t_buffer_create(MAX_BASE64_DECODED_SIZE(b64_size));
+	if (base64_decode(response, b64_size, resp) < 0) {
+		smtp_server_reply(cmd, 501, "5.5.2",
+				 "Invalid Base64 encoding");
+		sasl_server_request_destroy(&client->auth.sasl_req);
+		return -1;
+	}
+
+	sasl_server_request_input(&client->auth.sasl_req,
+				  resp->data, resp->used);
+	return 0;
+}
+
 /* client connection */
 
 static void test_server_connection_free(void *context);
 
 static const struct smtp_server_callbacks server_callbacks =
 {
+	.conn_cmd_helo = test_server_conn_cmd_helo,
+	.conn_cmd_auth = test_server_conn_cmd_auth,
+	.conn_cmd_auth_continue = test_server_conn_cmd_auth_continue,
+
 	.conn_cmd_rcpt = test_server_conn_cmd_rcpt,
 	.conn_cmd_data_begin = test_server_conn_cmd_data_begin,
 	.conn_cmd_data_continue = test_server_conn_cmd_data_continue,
@@ -404,8 +706,8 @@ static void client_init(int fd)
 	client->pool = pool;
 
 	client->smtp_conn = smtp_server_connection_create(
-		smtp_server, fd, fd, NULL, 0,
-		(test_ssl_mode == TEST_SSL_MODE_IMMEDIATE),
+		smtp_server, fd, fd, NULL, 0, NULL, 0,
+		(tset.ssl_mode == TEST_SSL_MODE_IMMEDIATE),
 		NULL, &server_callbacks, client);
 	smtp_server_connection_start(client->smtp_conn);
 	DLLIST_PREPEND(&clients, client);
@@ -423,6 +725,8 @@ static void client_deinit(struct client **_client)
 		smtp_server_connection_terminate(&client->smtp_conn,
 						 NULL, "deinit");
 	}
+	timeout_remove(&client->auth.to_passdb);
+	sasl_server_request_destroy(&client->auth.sasl_req);
 	pool_unref(&client->pool);
 }
 
@@ -454,11 +758,34 @@ static void client_accept(void *context ATTR_UNUSED)
 
 /* */
 
+static const struct sasl_server_request_funcs server_sasl_funcs = {
+	.request_set_authid = test_server_sasl_set_authid,
+	.request_set_authzid = test_server_sasl_set_authzid,
+	.request_set_realm = test_server_sasl_set_realm,
+
+	.request_verify_plain = test_server_sasl_verify_plain,
+	.request_lookup_credentials = test_server_sasl_lookup_credentials,
+
+	.request_output = test_server_sasl_output,
+};
+
 static void test_server_init(const struct smtp_server_settings *server_set)
 {
+	const struct sasl_server_settings sasl_set = {};
+
 	/* open server socket */
 	io_listen = io_add(fd_listen, IO_READ, client_accept, NULL);
 
+	/* init SASL server */
+	sasl_server = sasl_server_init(server_set->event_parent,
+				       &server_sasl_funcs);
+	sasl_server_inst = sasl_server_instance_create(sasl_server, &sasl_set);
+
+	sasl_server_mech_register_plain(sasl_server_inst);
+	sasl_server_mech_register_login(sasl_server_inst);
+	sasl_server_mech_register_scram_sha256(sasl_server_inst);
+
+	/* init SMTP server */
 	smtp_server = smtp_server_init(server_set);
 }
 
@@ -469,6 +796,8 @@ static void test_server_deinit(void)
 
 	/* deinitialize */
 	smtp_server_deinit(&smtp_server);
+	sasl_server_instance_unref(&sasl_server_inst);
+	sasl_server_deinit(&sasl_server);
 }
 
 /*
@@ -509,7 +838,7 @@ static struct test_client_connection *test_client_connection_get(void)
 
 	i_assert(i < MAX_PARALLEL_PENDING);
 
-	switch (test_ssl_mode) {
+	switch (tset.ssl_mode) {
 	case TEST_SSL_MODE_NONE:
 	default:
 		ssl_mode = SMTP_CLIENT_SSL_MODE_NONE;
@@ -523,10 +852,18 @@ static struct test_client_connection *test_client_connection_get(void)
 	}
 
 	if (test_conns[i].conn == NULL) {
+		struct smtp_client_settings set;
+
+		i_zero(&set);
+		if (tset.sasl_mech != NULL) {
+			i_assert(tset.authid != NULL);
+			set.username = tset.authid;
+			set.password = tset.password;
+		}
+
 		test_conns[i].conn = smtp_client_connection_create(
 			smtp_client, client_protocol,
-			net_ip2addr(&bind_ip), bind_port,
-			ssl_mode, NULL);
+			net_ip2addr(&bind_ip), bind_port, ssl_mode, &set);
 	}
 	return &test_conns[i];
 }
@@ -716,7 +1053,7 @@ static void test_client_continue(void *dummy ATTR_UNUSED)
 		return;
 	}
 
-	for (; client_files_last < count && pending_count < test_max_pending;
+	for (; client_files_last < count && pending_count < tset.max_pending;
 	     client_files_last++, pending_count++) {
 		struct istream *fstream, *payload;
 		const char *path = paths[client_files_last];
@@ -768,7 +1105,7 @@ static void test_client_continue(void *dummy ATTR_UNUSED)
 				test_client_transaction_rcpt_data, tctrans);
 		}
 
-		if (!test_unknown_size) {
+		if (!tset.unknown_size) {
 			payload = i_stream_create_base64_encoder(
 				fstream, 80, TRUE);
 		} else {
@@ -926,7 +1263,7 @@ test_run_client_server(
 {
 	struct test_server_data data;
 
-	if (test_ssl_mode == TEST_SSL_MODE_STARTTLS)
+	if (tset.ssl_mode == TEST_SSL_MODE_STARTTLS)
 		server_set->capabilities |= SMTP_CAPABILITY_STARTTLS;
 
 	failure = NULL;
@@ -1001,16 +1338,18 @@ test_run_scenarios(
 	smtp_server_set.hostname = "localhost";
 	smtp_server_set.max_client_idle_time_msecs = CLIENT_PROGRESS_TIMEOUT_MSECS;
 	smtp_server_set.max_pipelined_commands = 1;
-	smtp_server_set.auth_optional = TRUE;
+	smtp_server_set.auth_optional = (tset.sasl_mech == NULL);
 	smtp_server_set.ssl = &ssl_server_set;
 	smtp_server_set.debug = debug;
+	smtp_server_set.max_recipients = SET_UINT_UNLIMITED;
 
 	/* client settings */
 	i_zero(&smtp_client_set);
 	smtp_client_set.my_hostname = "localhost";
-	smtp_client_set.temp_path_prefix = "/tmp";
+	smtp_client_set.temp_path_prefix = test_dir_get();
 	smtp_client_set.command_timeout_msecs = CLIENT_PROGRESS_TIMEOUT_MSECS;
 	smtp_client_set.connect_timeout_msecs = CLIENT_PROGRESS_TIMEOUT_MSECS;
+	smtp_client_set.sasl_mechanisms = tset.sasl_mech;
 	smtp_client_set.ssl = &ssl_client_set;
 	smtp_client_set.debug = debug;
 
@@ -1023,17 +1362,17 @@ test_run_scenarios(
 		smtp_server_set.socket_recv_buffer_size = 4096;
 	}
 
-	test_max_pending = 1;
-	test_unknown_size = FALSE;
-	test_ssl_mode = TEST_SSL_MODE_NONE;
+	tset.max_pending = 1;
+	tset.unknown_size = FALSE;
+	tset.ssl_mode = TEST_SSL_MODE_NONE;
 	test_run_client_server(protocol, &smtp_client_set, &smtp_server_set,
 			       client_init);
 
 	test_out_reason("sequential", (failure == NULL), failure);
 
-	test_max_pending = MAX_PARALLEL_PENDING;
-	test_unknown_size = FALSE;
-	test_ssl_mode = TEST_SSL_MODE_NONE;
+	tset.max_pending = MAX_PARALLEL_PENDING;
+	tset.unknown_size = FALSE;
+	tset.ssl_mode = TEST_SSL_MODE_NONE;
 	test_run_client_server(protocol, &smtp_client_set, &smtp_server_set,
 			       client_init);
 
@@ -1041,9 +1380,9 @@ test_run_scenarios(
 
 	smtp_server_set.max_pipelined_commands = 5;
 	smtp_server_set.capabilities |= SMTP_CAPABILITY_PIPELINING;
-	test_max_pending = MAX_PARALLEL_PENDING;
-	test_unknown_size = FALSE;
-	test_ssl_mode = TEST_SSL_MODE_NONE;
+	tset.max_pending = MAX_PARALLEL_PENDING;
+	tset.unknown_size = FALSE;
+	tset.ssl_mode = TEST_SSL_MODE_NONE;
 	test_run_client_server(protocol, &smtp_client_set, &smtp_server_set,
 			       client_init);
 
@@ -1051,9 +1390,9 @@ test_run_scenarios(
 
 	smtp_server_set.max_pipelined_commands = 5;
 	smtp_server_set.capabilities |= SMTP_CAPABILITY_PIPELINING;
-	test_max_pending = MAX_PARALLEL_PENDING;
-	test_unknown_size = TRUE;
-	test_ssl_mode = TEST_SSL_MODE_NONE;
+	tset.max_pending = MAX_PARALLEL_PENDING;
+	tset.unknown_size = TRUE;
+	tset.ssl_mode = TEST_SSL_MODE_NONE;
 	test_run_client_server(protocol, &smtp_client_set, &smtp_server_set,
 			       client_init);
 
@@ -1061,9 +1400,9 @@ test_run_scenarios(
 
 	smtp_server_set.max_pipelined_commands = 5;
 	smtp_server_set.capabilities |= SMTP_CAPABILITY_PIPELINING;
-	test_max_pending = MAX_PARALLEL_PENDING;
-	test_unknown_size = FALSE;
-	test_ssl_mode = TEST_SSL_MODE_IMMEDIATE;
+	tset.max_pending = MAX_PARALLEL_PENDING;
+	tset.unknown_size = FALSE;
+	tset.ssl_mode = TEST_SSL_MODE_IMMEDIATE;
 	test_run_client_server(protocol, &smtp_client_set, &smtp_server_set,
 			       client_init);
 
@@ -1072,9 +1411,9 @@ test_run_scenarios(
 
 	smtp_server_set.max_pipelined_commands = 5;
 	smtp_server_set.capabilities |= SMTP_CAPABILITY_PIPELINING;
-	test_max_pending = MAX_PARALLEL_PENDING;
-	test_unknown_size = FALSE;
-	test_ssl_mode = TEST_SSL_MODE_STARTTLS;
+	tset.max_pending = MAX_PARALLEL_PENDING;
+	tset.unknown_size = FALSE;
+	tset.ssl_mode = TEST_SSL_MODE_STARTTLS;
 	test_run_client_server(protocol, &smtp_client_set, &smtp_server_set,
 			       client_init);
 
@@ -1086,6 +1425,7 @@ test_run_scenarios(
 
 static void test_smtp_normal(void)
 {
+	i_zero(&tset);
 	test_begin("smtp payload - normal");
 	test_run_scenarios(SMTP_PROTOCOL_SMTP,
 			   SMTP_CAPABILITY_DSN, test_client);
@@ -1094,6 +1434,7 @@ static void test_smtp_normal(void)
 
 static void test_smtp_chunking(void)
 {
+	i_zero(&tset);
 	test_begin("smtp payload - chunking");
 	test_run_scenarios(SMTP_PROTOCOL_SMTP,
 			   SMTP_CAPABILITY_DSN | SMTP_CAPABILITY_CHUNKING,
@@ -1103,6 +1444,7 @@ static void test_smtp_chunking(void)
 
 static void test_lmtp_normal(void)
 {
+	i_zero(&tset);
 	test_begin("lmtp payload - normal");
 	test_run_scenarios(SMTP_PROTOCOL_LMTP,
 			   SMTP_CAPABILITY_DSN, test_client);
@@ -1111,9 +1453,44 @@ static void test_lmtp_normal(void)
 
 static void test_lmtp_chunking(void)
 {
+	i_zero(&tset);
 	test_begin("lmtp payload - chunking");
 	test_run_scenarios(SMTP_PROTOCOL_LMTP,
 			   SMTP_CAPABILITY_DSN | SMTP_CAPABILITY_CHUNKING,
+			   test_client);
+	test_end();
+}
+
+
+static void test_smtp_authentication(void)
+{
+	i_zero(&tset);
+	test_begin("smtp payload - auth - PLAIN");
+	tset.sasl_mech = "PLAIN";
+	tset.authid = "user";
+	tset.password = "password";
+	test_run_scenarios(SMTP_PROTOCOL_SMTP,
+			   SMTP_CAPABILITY_DSN | SMTP_CAPABILITY_AUTH,
+			   test_client);
+	test_end();
+
+	i_zero(&tset);
+	test_begin("smtp payload - auth - LOGIN");
+	tset.sasl_mech = "LOGIN";
+	tset.authid = "user";
+	tset.password = "password";
+	test_run_scenarios(SMTP_PROTOCOL_SMTP,
+			   SMTP_CAPABILITY_DSN | SMTP_CAPABILITY_AUTH,
+			   test_client);
+	test_end();
+
+	i_zero(&tset);
+	test_begin("smtp payload - auth - SCRAM-SHA-256");
+	tset.sasl_mech = "SCRAM-SHA-256";
+	tset.authid = "user";
+	tset.password = "password";
+	test_run_scenarios(SMTP_PROTOCOL_SMTP,
+			   SMTP_CAPABILITY_DSN | SMTP_CAPABILITY_AUTH,
 			   test_client);
 	test_end();
 }
@@ -1123,6 +1500,7 @@ static void (*const test_functions[])(void) = {
 	test_smtp_chunking,
 	test_lmtp_normal,
 	test_lmtp_chunking,
+	test_smtp_authentication,
 	NULL
 };
 
@@ -1133,10 +1511,14 @@ static void (*const test_functions[])(void) = {
 static void main_init(void)
 {
 	ssl_iostream_openssl_init();
+	password_schemes_init();
+	dsasl_clients_init();
 }
 
 static void main_deinit(void)
 {
+	dsasl_clients_deinit();
+	password_schemes_deinit();
 	ssl_iostream_context_cache_free();
 	ssl_iostream_openssl_deinit();
 }
@@ -1162,7 +1544,10 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	test_subprocesses_init(debug);
+	test_init();
+	event_set_forced_debug(test_event, debug);
+	test_dir_init("smtp-payload");
+	test_subprocesses_init();
 
 	/* listen on localhost */
 	i_zero(&bind_ip);
@@ -1171,7 +1556,6 @@ int main(int argc, char *argv[])
 
 	ret = test_run(test_functions);
 
-	test_subprocesses_deinit();
 	main_deinit();
 	lib_deinit();
 

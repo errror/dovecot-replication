@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "imap-common.h"
 #include "str.h"
@@ -8,6 +8,7 @@
 #include "mailbox-list-notify.h"
 #include "mail-search.h"
 #include "mail-search-build.h"
+#include "imap-utf7.h"
 #include "imap-commands.h"
 #include "imap-fetch.h"
 #include "imap-list.h"
@@ -20,8 +21,12 @@ static int imap_notify_list(struct imap_notify_namespace *notify_ns,
 			    const struct mailbox_list_notify_rec *rec,
 			    enum mailbox_info_flags flags)
 {
-	string_t *str = t_str_new(128);
+	struct client *client = notify_ns->ctx->client;
+	bool utf8 = client_has_enabled(client, imap_feature_utf8accept);
+	enum imap_quote_flags qflags = (utf8 ? IMAP_QUOTE_FLAG_UTF8 : 0);
+	string_t *str = t_str_new(128), *mutf7_vname;
 	char ns_sep = mail_namespace_get_sep(notify_ns->ns);
+	const char *vname, *old_vname;
 
 	str_append(str, "* LIST (");
 	imap_mailbox_flags2str(str, flags);
@@ -31,13 +36,29 @@ static int imap_notify_list(struct imap_notify_namespace *notify_ns,
 	str_append_c(str, ns_sep);
 	str_append(str, "\" ");
 
-	imap_append_astring(str, rec->vname);
+	vname = rec->vname;
+	if (!utf8) {
+		mutf7_vname = t_str_new(128);
+		if (imap_utf8_to_utf7(vname, mutf7_vname) < 0)
+			i_panic("Mailbox name not UTF-8: %s", vname);
+		vname = str_c(mutf7_vname);
+	}
+	imap_append_astring(str, vname, qflags);
 	if (rec->old_vname != NULL) {
+		old_vname = rec->old_vname;
+		if (!utf8) {
+			str_truncate(mutf7_vname, 0);
+			if (imap_utf8_to_utf7(old_vname, mutf7_vname) < 0) {
+				i_panic("Mailbox name not UTF-8: %s",
+					old_vname);
+			}
+			old_vname = str_c(mutf7_vname);
+		}
 		str_append(str, " (\"OLDNAME\" (");
-		imap_append_astring(str, rec->old_vname);
+		imap_append_astring(str, old_vname, qflags);
 		str_append(str, "))");
 	}
-	return client_send_line_next(notify_ns->ctx->client, str_c(str));
+	return client_send_line_next(client, str_c(str));
 }
 
 static int imap_notify_status(struct imap_notify_namespace *notify_ns,
@@ -79,7 +100,16 @@ static int imap_notify_status(struct imap_notify_namespace *notify_ns,
 		if (error != MAIL_ERROR_PERM)
 			ret = -1;
 	} else {
-		ret = imap_status_send(client, rec->vname, &items, &result);
+		bool utf8 = client_has_enabled(client, imap_feature_utf8accept);
+		const char *vname = rec->vname;
+
+		if (!utf8) {
+			string_t *mutf7_vname = t_str_new(128);
+			if (imap_utf8_to_utf7(vname, mutf7_vname) < 0)
+				i_panic("Mailbox name not UTF-8: %s", vname);
+			vname = str_c(mutf7_vname);
+		}
+		ret = imap_status_send(client, vname, &items, &result);
 	}
 	mailbox_free(&box);
 	return ret;
@@ -93,8 +123,15 @@ imap_notify_next(struct imap_notify_namespace *notify_ns,
 	int ret;
 
 	if ((rec->events & MAILBOX_LIST_NOTIFY_CREATE) != 0) {
-		if (mailbox_list_mailbox(notify_ns->ns->list, rec->storage_name,
-					 &mailbox_flags) < 0)
+		if ((rec->events & MAILBOX_LIST_NOTIFY_DELETE) != 0) {
+			/* mailbox was created and deleted before we noticed
+			   it. Don't look up the flags, since the mailbox
+			   doesn't exist anymore - the delete event below
+			   tells that to the client. */
+			mailbox_flags = 0;
+		} else if (mailbox_list_mailbox(notify_ns->ns->list,
+						rec->storage_name,
+						&mailbox_flags) < 0)
 			mailbox_flags = 0;
 		if ((ret = imap_notify_list(notify_ns, rec, mailbox_flags)) <= 0)
 			return ret;

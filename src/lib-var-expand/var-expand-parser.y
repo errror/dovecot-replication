@@ -1,4 +1,4 @@
-/* Copyright (c) 2024 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 %define api.pure full
 %define api.prefix {var_expand_parser_}
@@ -35,6 +35,33 @@
 /* ignore unused parameters */
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+
+/* This will get used if you add YYDEBUG=1 to AM_CFLAGS and set
+   var_expand_parser_debug=1 global variable.
+   This can be done e.g.
+
+   extern int var_expand_parser_debug;
+   ...
+   var_expand_parser_debug=1;
+
+   it will print tracing information from the parser.
+*/
+static int i_vyyprintf (const char *format, const char *file, int line, ...) ATTR_FORMAT(1, 4);
+static int i_vyyprintf (const char *format, const char *file, int line, ...)
+{
+	va_list va;
+	va_start(va, line);
+	struct failure_context ctx = {
+		.type = LOG_TYPE_DEBUG,
+		.log_prefix = t_strdup_printf("Debug: %s:%d: ", file, line),
+	};
+	i_log_typev(&ctx, format, va);
+	va_end(va);
+	return 0;
+}
+
+#define YYFPRINTF(f, format, args...) i_vyyprintf(format, __FILE__, __LINE__, ##args)
 
 
 #include <stdio.h>
@@ -55,6 +82,10 @@ static const char *const filter_var_names[] = {
 	"lookup",
 	"if",
 	"calculate",
+	"epoch",
+	"from_epoch",
+	"date",
+	"iso8601",
 	NULL
 };
 
@@ -139,7 +170,7 @@ link_argument(VAR_EXPAND_PARSER_STYPE *state, struct var_expand_parameter *par)
 static void
 push_named_argument(VAR_EXPAND_PARSER_STYPE *state, const char *name,
 		    enum var_expand_parameter_value_type type,
-		    const union var_expand_parameter_value *value)
+		    const struct var_expand_parameter_value *value)
 {
 	struct var_expand_parameter *par =
 		p_new(state->plist->pool, struct var_expand_parameter, 1);
@@ -158,7 +189,7 @@ push_named_argument(VAR_EXPAND_PARSER_STYPE *state, const char *name,
 static void
 push_argument(VAR_EXPAND_PARSER_STYPE *state,
 	      enum var_expand_parameter_value_type type,
-	      const union var_expand_parameter_value *value)
+	      const struct var_expand_parameter_value *value)
 {
 	struct var_expand_parameter *par =
 		p_new(state->plist->pool, struct var_expand_parameter, 1);
@@ -174,10 +205,19 @@ push_argument(VAR_EXPAND_PARSER_STYPE *state,
 
 static void make_new_program(VAR_EXPAND_PARSER_STYPE *pstate)
 {
-	struct var_expand_program *p =
+	struct var_expand_program *plast, *pp, *p =
 		p_new(pstate->plist->pool, struct var_expand_program, 1);
 	p->pool = pstate->plist->pool;
-	pstate->pp->next = p;
+	pp = pstate->plist;
+	plast = NULL;
+	while (pp != NULL) {
+		plast = pp;
+		pp = pp->next;
+	}
+	if (plast != NULL)
+		plast->next = p;
+	else
+		pstate->plist = p;
 	pstate->p = p;
 }
 
@@ -205,11 +245,35 @@ static void push_function(VAR_EXPAND_PARSER_STYPE *state, const char *func)
 
 static void push_new_program(VAR_EXPAND_PARSER_STYPE *pstate)
 {
-	pstate->pp = pstate->p;
-	pstate->p = NULL;
+	if (pstate->p != NULL) {
+		pstate->pp = pstate->p;
+		pstate->p = NULL;
+	}
 }
 
-static union var_expand_parameter_value tmp_value;
+/* Special optimization: If the previous program was also a literal, reuse it
+   instead of creating a new program.
+ */
+static void create_literal(VAR_EXPAND_PARSER_STYPE *pstate,
+			   const char *value)
+{
+	struct var_expand_parameter_value ep_value = {
+		.str = value
+	};
+	if (pstate->pp != NULL && pstate->pp->only_literal) {
+		struct var_expand_parameter *param =
+			(struct var_expand_parameter *)pstate->pp->first->params;
+		/* just put it as extra value */
+		param->value.str = p_strconcat(pstate->plist->pool,
+					       param->value.str, value, NULL);
+		return;
+	}
+	push_argument(pstate, VAR_EXPAND_PARAMETER_VALUE_TYPE_STRING, &ep_value);
+	push_function(pstate, "literal");
+	pstate->p->only_literal = TRUE;
+}
+
+static struct var_expand_parameter_value tmp_value;
 
 %}
 
@@ -232,9 +296,9 @@ expression_list:
 	       | expression_list expression { push_new_program(state); }
 	       ;
 
-expression: VALUE { i_zero(&tmp_value); tmp_value.str = str_c($1); push_argument(state, VAR_EXPAND_PARAMETER_VALUE_TYPE_STRING, &tmp_value); push_function(state, "literal"); state->p->only_literal = TRUE;}
-          | OCBRACE filter_list CCBRACE
-	  | PERC { i_zero(&tmp_value); tmp_value.str = "%"; push_argument(state, VAR_EXPAND_PARAMETER_VALUE_TYPE_STRING, &tmp_value); push_function(state, "literal"); state->p->only_literal = TRUE; }
+expression: VALUE { create_literal(state, str_c($1)); }
+	  | OCBRACE filter_list CCBRACE
+	  | PERC { create_literal(state, "%"); }
 	  | error { return -1; }
 	  ;
 

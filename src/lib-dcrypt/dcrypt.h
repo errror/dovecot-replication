@@ -2,6 +2,15 @@
 #define DCRYPT_H 1
 #include "array.h"
 
+#define DCRYPT_AEAD_TAG_LEN 16
+
+/* ML-KEM (FIPS 203) algorithm names, as understood by OpenSSL. Support for
+   these is detected at runtime, since the OpenSSL that dcrypt is built
+   against isn't necessarily the one it ends up running against. */
+#define DCRYPT_ML_KEM_512 "ML-KEM-512"
+#define DCRYPT_ML_KEM_768 "ML-KEM-768"
+#define DCRYPT_ML_KEM_1024 "ML-KEM-1024"
+
 struct dcrypt_context_symmetric;
 struct dcrypt_context_hmac;
 struct dcrypt_public_key;
@@ -18,8 +27,11 @@ enum dcrypt_sym_mode {
 };
 
 enum dcrypt_key_type {
+	/* Key algorithm is not supported by the backend. */
+	DCRYPT_KEY_UNKNOWN = 0x0,
 	DCRYPT_KEY_RSA = 0x1,
-	DCRYPT_KEY_EC  = 0x2
+	DCRYPT_KEY_EC  = 0x2,
+	DCRYPT_KEY_KEM = 0x4,
 };
 
 /**
@@ -221,19 +233,19 @@ bool dcrypt_ctx_hmac_final(struct dcrypt_context_hmac *ctx, buffer_t *result,
 			   const char **error_r);
 
 /**
- * Elliptic Curve based Diffie-Heffman shared secret derivation */
-bool dcrypt_ecdh_derive_secret(struct dcrypt_private_key *priv_key,
-			       struct dcrypt_public_key *pub_key,
-			       buffer_t *shared_secret,
-			       const char **error_r);
+ * Diffie-Heffman shared secret derivation */
+bool dcrypt_derive_secret(struct dcrypt_private_key *priv_key,
+		          struct dcrypt_public_key *pub_key,
+		          buffer_t *shared_secret,
+		          const char **error_r);
 /**
  * Helpers for DCRYPT file format */
-bool dcrypt_ecdh_derive_secret_local(struct dcrypt_private_key *local_key,
-				     buffer_t *R, buffer_t *S,
-				     const char **error_r);
-bool dcrypt_ecdh_derive_secret_peer(struct dcrypt_public_key *peer_key,
-				    buffer_t *R, buffer_t *S,
-				    const char **error_r);
+bool dcrypt_derive_secret_local(struct dcrypt_private_key *local_key,
+			        buffer_t *R, buffer_t *S,
+			        const char **error_r);
+bool dcrypt_derive_secret_peer(struct dcrypt_public_key *peer_key,
+			       buffer_t *R, buffer_t *S,
+			       const char **error_r);
 
 /** Signature functions
   algorithm is name of digest algorithm to use, such as SHA256.
@@ -307,6 +319,8 @@ void dcrypt_key_ref_private(struct dcrypt_private_key *key);
 void dcrypt_key_unref_public(struct dcrypt_public_key **key);
 void dcrypt_key_unref_private(struct dcrypt_private_key **key);
 
+/* Return the key algorithm type, or DCRYPT_KEY_UNKNOWN if the key uses an
+   algorithm that this backend does not support. */
 enum dcrypt_key_type dcrypt_key_type_private(struct dcrypt_private_key *key);
 enum dcrypt_key_type dcrypt_key_type_public(struct dcrypt_public_key *key);
 /* return digest of key */

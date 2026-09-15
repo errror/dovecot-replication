@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "login-common.h"
 #include "buffer.h"
@@ -77,7 +77,8 @@ bool client_handle_parser_error(struct imap_client *client,
 static bool is_login_cmd_disabled(struct client *client)
 {
 	if (client->connection_secured) {
-		if (sasl_server_find_available_mech(client, "PLAIN") == NULL) {
+		if (sasl_proxy_find_available_mech(
+				client, SASL_MECH_NAME_PLAIN) == NULL) {
 			/* no PLAIN authentication, can't use LOGIN command */
 			return TRUE;
 		}
@@ -379,10 +380,13 @@ static int imap_client_create(struct client *client)
 		return -1;
 	}
 
+	const struct imap_parser_params params = {
+		.list_count_limit = IMAP_LOGIN_LIST_COUNT_LIMIT,
+	};
 	imap_client->parser =
 		imap_parser_create(imap_client->common.input,
 				   imap_client->common.output,
-				   IMAP_LOGIN_MAX_LINE_LENGTH);
+				   IMAP_LOGIN_MAX_LINE_LENGTH, &params);
 	struct settings_instance *set_instance = settings_instance_find(client->event);
 	if (set_instance == NULL) {
 		set_instance = settings_instance_new(
@@ -468,11 +472,14 @@ static void imap_client_starttls(struct client *client)
 	struct imap_client *imap_client =
 		container_of(client, struct imap_client, common);
 
+	const struct imap_parser_params params = {
+		.list_count_limit = IMAP_LOGIN_LIST_COUNT_LIMIT,
+	};
 	imap_parser_unref(&imap_client->parser);
 	imap_client->parser =
 		imap_parser_create(imap_client->common.input,
 				   imap_client->common.output,
-				   IMAP_LOGIN_MAX_LINE_LENGTH);
+				   IMAP_LOGIN_MAX_LINE_LENGTH, &params);
 
 	/* CRLF is lost from buffer when streams are reopened. */
 	imap_client->skip_line = FALSE;
@@ -606,6 +613,7 @@ static struct client_vfuncs imap_client_vfuncs = {
 
 static struct login_binary imap_login_binary = {
 	.protocol = "imap",
+	.service_name = "imap",
 	.process_name = "imap-login",
 	.default_port = 143,
 	.default_ssl_port = 993,

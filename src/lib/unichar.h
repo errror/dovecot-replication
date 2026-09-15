@@ -1,16 +1,18 @@
 #ifndef UNICHAR_H
 #define UNICHAR_H
 
+#include "unicode-break.h"
+
 /* Character used to replace invalid input. */
 #define UNICODE_REPLACEMENT_CHAR 0xfffd
 #define UNICODE_REPLACEMENT_CHAR_UTF8 "\xEF\xBF\xBD"
 #define UNICODE_REPLACEMENT_CHAR_UTF8_LEN \
-	(sizeof(UNICODE_REPLACEMENT_CHAR_UTF8) - 1);
+	(sizeof(UNICODE_REPLACEMENT_CHAR_UTF8) - 1)
 /* Horizontal ellipsis character ('...') */
 #define UNICODE_HORIZONTAL_ELLIPSIS_CHAR 0x2026
 #define UNICODE_HORIZONTAL_ELLIPSIS_CHAR_UTF8 "\xE2\x80\xA6"
 #define UNICODE_HORIZONTAL_ELLIPSIS_CHAR_UTF8_LEN \
-	(sizeof(UNICODE_HORIZONTAL_ELLIPSIS_CHAR_UTF8) - 1);
+	(sizeof(UNICODE_HORIZONTAL_ELLIPSIS_CHAR_UTF8) - 1)
 
 /* Characters >= base require surrogates */
 #define UTF16_SURROGATE_BASE 0x10000
@@ -41,6 +43,8 @@
 
 #define UTF16_VALID_HIGH_SURROGATE(chr) (((chr) & 0xfffc00) == UTF16_SURROGATE_HIGH_FIRST)
 #define UTF16_VALID_LOW_SURROGATE(chr) (((chr) & 0xfffc00) == UTF16_SURROGATE_LOW_FIRST)
+
+struct unicode_transform;
 
 typedef uint32_t unichar_t;
 ARRAY_DEFINE_TYPE(unichars, unichar_t);
@@ -116,6 +120,55 @@ uni_utf8_char_bytes(unsigned char chr)
 /* Return given character in titlecase. */
 unichar_t uni_ucs4_to_titlecase(unichar_t chr) ATTR_CONST;
 
+/* Run the UTF8 string through the provided Unicode transform and write the
+   result into the buffer again encoded in UTF8. */
+int uni_utf8_run_transform(const void *_input, size_t size,
+			   struct unicode_transform *trans, buffer_t *output,
+			   const char **error_r);
+
+/* Normalize the UTF-8 input in Unicode NFD, NFKD, NFC or NFKC form and write
+   the result to the output buffer.
+
+   Refer to Unicode Standard Annex #15, Section 1.2 for more information. An
+   excerpt can be found in unicode-nf.h.
+
+   NOTE: Do not blindly use this function to write and append several values
+   together expecting the result to be NF* normalized as well. This function
+   does not check whether concatenation preserves the desired normalization nor
+   does it endeavour to achieve this result. Blind concatination works only in
+   very specific cases, so make sure you know what you are doing.
+ */
+int uni_utf8_write_nfd(const void *input, size_t size, buffer_t *output);
+int uni_utf8_write_nfkd(const void *input, size_t size, buffer_t *output);
+int uni_utf8_write_nfc(const void *input, size_t size, buffer_t *output);
+int uni_utf8_write_nfkc(const void *input, size_t size, buffer_t *output);
+
+/* Same as the write variants, but return the normalized input in the
+   output_r argument as a C string.
+ */
+int uni_utf8_to_nfd(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_nfkd(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_nfc(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_nfkc(const void *input, size_t size, const char **output_r);
+
+/* Check whether the input is normalized in the indicated form. Returns -1 if
+   the input is not even valid UTF8 or contains invalid code points. Returns 1
+   if the input adheres to the requested normalization form and 0 otherwise. */
+int uni_utf8_is_nfd(const void *input, size_t size);
+int uni_utf8_is_nfkd(const void *input, size_t size);
+int uni_utf8_is_nfc(const void *input, size_t size);
+int uni_utf8_is_nfkc(const void *input, size_t size);
+
+/* Write the input UTF8 string to the provided buffer after mapping it to the
+   requested case. */
+int uni_utf8_write_uppercase(const void *_input, size_t size, buffer_t *output);
+int uni_utf8_write_lowercase(const void *_input, size_t size, buffer_t *output);
+int uni_utf8_write_casefold(const void *_input, size_t size, buffer_t *output);
+
+int uni_utf8_to_uppercase(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_lowercase(const void *input, size_t size, const char **output_r);
+int uni_utf8_to_casefold(const void *input, size_t size, const char **output_r);
+
 /* Convert UTF-8 input to titlecase and decompose the titlecase characters to
    output buffer. Returns 0 if ok, -1 if input was invalid. This generates
    output that's compatible with i;unicode-casemap comparator. Invalid input
@@ -156,4 +209,67 @@ static inline void uni_split_surrogate(unichar_t chr, unichar_t *high_r, unichar
 	*high_r = UTF16_SURROGATE_HIGH(chr);
 	*low_r = UTF16_SURROGATE_LOW(chr);
 }
+
+/*
+ * Grapheme clusters
+ */
+
+/* The grapheme cluster scanner is used to split a Unicode string into a
+   sequence of grapheme clusters, which are in essence the Unicode characters as
+   perceived by the user. These can be longer than a single code point and by
+   consequence longer than a single octet. The Unicode standard defines what
+   constitutes a grapheme cluster in Annex #29. */
+
+struct uni_gc_scanner {
+	pool_t pool;
+	struct unicode_gc_break gcbrk;
+
+	const unsigned char *poffset, *p, *pend;
+
+	unichar_t cp;
+	int cp_size;
+};
+
+/* Initialize the scanner. */
+void uni_gc_scanner_init(struct uni_gc_scanner *gcsc,
+			 const void *input, size_t size);
+/* Shift scanner position to next grapheme cluster. Returns TRUE when scanner
+   points to a valid grapheme cluster and has not reached the end. */
+bool uni_gc_scan_shift(struct uni_gc_scanner *gcsc) ATTR_NOWARN_UNUSED_RESULT;
+
+
+/* Obtain a pointer to the current grapheme cluster the scanner points to.
+   Returns the size of the cluster in octets in size_r. */
+static inline const unsigned char *
+uni_gc_scan_get(struct uni_gc_scanner *gcsc, size_t *size_r)
+{
+	if (gcsc->poffset == NULL)
+		uni_gc_scan_shift(gcsc);
+	if (size_r != NULL)
+		*size_r = gcsc->p - gcsc->poffset;
+	return gcsc->poffset;
+}
+
+/* Convenience function for checking whether current grapheme cluster is a
+   particular (single-octet) ASCII character.  */
+static inline bool
+uni_gc_scan_ascii_equals(struct uni_gc_scanner *gcsc, unsigned int c)
+{
+	size_t gc_size;
+	const unsigned char *gc = uni_gc_scan_get(gcsc, &gc_size);
+
+	if (gc_size != 1)
+		return FALSE;
+
+	return (*gc == (unsigned char)c);
+}
+
+/* Returns TRUE when the scanner has reached the end of input. */
+static inline bool uni_gc_scan_at_end(struct uni_gc_scanner *gcsc)
+{
+	size_t gc_size;
+	(void)uni_gc_scan_get(gcsc, &gc_size);
+	return (gc_size == 0);
+}
+
 #endif

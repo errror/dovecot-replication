@@ -1,10 +1,11 @@
-/* Copyright (c) 2014-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
 #include "settings.h"
 #include "settings-parser.h"
 #include "dict.h"
+#include "time-util.h"
 #include "mail-user.h"
 #include "mail-namespace.h"
 #include "mail-storage-private.h"
@@ -25,6 +26,7 @@ struct last_login_settings {
 
 	const char *last_login_key;
 	const char *last_login_precision;
+	ARRAY_TYPE(const_string) last_login_dict_fields;
 };
 
 #undef DEF
@@ -34,12 +36,14 @@ static const struct setting_define last_login_setting_defines[] = {
 	{ .type = SET_FILTER_NAME, .key = "last_login" },
 	DEF(STR, last_login_key),
 	DEF(ENUM, last_login_precision),
+	DEF(STRLIST, last_login_dict_fields),
 
 	SETTING_DEFINE_LIST_END
 };
 static const struct last_login_settings last_login_default_settings = {
 	.last_login_key = "last-login/%{user}",
 	.last_login_precision = "s:ms:us:ns",
+	.last_login_dict_fields = ARRAY_INIT,
 };
 
 const struct setting_parser_info last_login_setting_parser_info = {
@@ -105,6 +109,26 @@ last_login_dict_commit(const struct dict_commit_result *result,
 	luser->to = timeout_add(0, last_login_dict_deinit, user);
 }
 
+/* Return the now timestamp as a string in the given precision. */
+static const char *last_login_now_to_string(const char *precision)
+{
+	uint64_t nsecs = i_nanoseconds();
+	unsigned long long secs = nsecs / 1000000000;
+
+	if (strcmp(precision, "s") == 0)
+		return dec2str(secs);
+	else if (strcmp(precision, "ms") == 0)
+		return t_strdup_printf("%llu%03llu", secs,
+			(unsigned long long)(nsecs % 1000000000 / 1000000));
+	else if (strcmp(precision, "us") == 0)
+		return t_strdup_printf("%llu%06llu", secs,
+			(unsigned long long)(nsecs % 1000000000 / 1000));
+	else if (strcmp(precision, "ns") == 0)
+		return t_strdup_printf("%llu%09llu", secs,
+			(unsigned long long)(nsecs % 1000000000));
+	i_unreached();
+}
+
 static void last_login_mail_user_created(struct mail_user *user)
 {
 	struct mail_user_vfuncs *v = user->vlast;
@@ -112,7 +136,7 @@ static void last_login_mail_user_created(struct mail_user *user)
 	const struct last_login_settings *set;
 	struct dict *dict;
 	struct dict_transaction_context *trans;
-	const char *key_name, *error;
+	const char *error;
 	int ret;
 
 	if (user->autocreated) {
@@ -151,27 +175,21 @@ static void last_login_mail_user_created(struct mail_user *user)
 	luser->dict = dict;
 	MODULE_CONTEXT_SET(user, last_login_user_module, luser);
 
-	key_name = t_strconcat(DICT_PATH_SHARED, set->last_login_key, NULL);
-
 	struct dict_op_settings dset = *mail_user_get_dict_op_settings(user);
 	dset.no_slowness_warning = TRUE;
 	trans = dict_transaction_begin(dict, &dset);
-	if (strcmp(set->last_login_precision, "s") == 0)
-		dict_set(trans, key_name, dec2str(ioloop_time));
-	else if (strcmp(set->last_login_precision, "ms") == 0) {
-		dict_set(trans, key_name, t_strdup_printf(
-			"%ld%03u", (long)ioloop_timeval.tv_sec,
-			(unsigned int)(ioloop_timeval.tv_usec/1000)));
-	} else if (strcmp(set->last_login_precision, "us") == 0) {
-		dict_set(trans, key_name, t_strdup_printf(
-			"%ld%06u", (long)ioloop_timeval.tv_sec,
-			(unsigned int)ioloop_timeval.tv_usec));
-	} else if (strcmp(set->last_login_precision, "ns") == 0) {
-		dict_set(trans, key_name, t_strdup_printf(
-			"%ld%06u000", (long)ioloop_timeval.tv_sec,
-			(unsigned int)ioloop_timeval.tv_usec));
-	} else {
-		i_unreached();
+	dict_set(trans,
+		 t_strconcat(DICT_PATH_SHARED, set->last_login_key, NULL),
+		 last_login_now_to_string(set->last_login_precision));
+	if (!array_is_empty(&set->last_login_dict_fields)) {
+		unsigned int field_count;
+		const char *const *fields = array_get(&set->last_login_dict_fields,
+						      &field_count);
+		i_assert(field_count % 2 == 0);
+		for (unsigned int i = 0; i < field_count; i += 2) {
+			dict_set(trans, t_strconcat(DICT_PATH_SHARED, fields[i], NULL),
+				 fields[i + 1]);
+		}
 	}
 	dict_transaction_commit_async(&trans, last_login_dict_commit, user);
 	settings_free(set);

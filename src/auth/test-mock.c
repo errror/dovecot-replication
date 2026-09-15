@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-auth.h"
 #include "auth-common.h"
@@ -67,7 +67,7 @@ void passdb_mock_mod_init(void)
 		.master = FALSE,
 	};
 	struct event *event = event_create(NULL);
-	mock_passdb_mod = passdb_preinit(mock_pool, event, &set);
+	mock_passdb_mod = passdb_preinit(mock_pool, event, &set, FALSE);
 	event_unref(&event);
 	passdb_init(mock_passdb_mod);
 }

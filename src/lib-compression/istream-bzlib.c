@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 
@@ -51,88 +51,94 @@ static ssize_t i_stream_bzlib_read(struct istream_private *stream)
 	size_t size, out_size;
 	int ret;
 
-	high_offset = stream->istream.v_offset + (stream->pos - stream->skip);
-	if (zstream->eof_offset == high_offset) {
-		stream->istream.eof = TRUE;
-		return -1;
-	}
-
-	if (!zstream->marked) {
-		if (!i_stream_try_alloc(stream, CHUNK_SIZE, &out_size))
-			return -2; /* buffer full */
-	} else {
-		/* try to avoid compressing, so we can quickly seek backwards */
-		if (!i_stream_try_alloc_avoid_compress(stream, CHUNK_SIZE, &out_size))
-			return -2; /* buffer full */
-	}
-
-	if (i_stream_read_more(stream->parent, &data, &size) < 0) {
-		if (stream->parent->stream_errno != 0) {
-			stream->istream.stream_errno =
-				stream->parent->stream_errno;
-		} else {
-			i_assert(stream->parent->eof);
-			bzlib_read_error(zstream, "unexpected EOF");
-			if (!zstream->hdr_read)
-				stream->istream.stream_errno = EINVAL;
-			else
-				stream->istream.stream_errno = EPIPE;
-		}
-		return -1;
-	}
-	if (size == 0) {
-		/* no more input */
-		i_assert(!stream->istream.blocking);
-		return 0;
-	}
-
-	zstream->zs.next_in = (char *)data;
-	zstream->zs.avail_in = size;
-
-	zstream->zs.next_out = (char *)stream->w_buffer + stream->pos;
-	zstream->zs.avail_out = out_size;
-	ret = BZ2_bzDecompress(&zstream->zs);
-	zstream->hdr_read = TRUE;
-
-	out_size -= zstream->zs.avail_out;
-	stream->pos += out_size;
-
-	i_stream_skip(stream->parent, size - zstream->zs.avail_in);
-
-	switch (ret) {
-	case BZ_OK:
-		break;
-	case BZ_PARAM_ERROR:
-		i_unreached();
-	case BZ_DATA_ERROR:
-		bzlib_read_error(zstream, "corrupted data");
-		stream->istream.stream_errno = EINVAL;
-		return -1;
-	case BZ_DATA_ERROR_MAGIC:
-		bzlib_read_error(zstream,
-			"wrong magic in header (not bz2 file?)");
-		stream->istream.stream_errno = EINVAL;
-		return -1;
-	case BZ_MEM_ERROR:
-		i_fatal_status(FATAL_OUTOFMEM, "bzlib.read(%s): Out of memory",
-			       i_stream_get_name(&stream->istream));
-	case BZ_STREAM_END:
-		zstream->eof_offset = stream->istream.v_offset +
-			(stream->pos - stream->skip);
-		stream->cached_stream_size = zstream->eof_offset;
-		if (out_size == 0) {
+	/* Loop instead of recursing when a decompress step yields no output:
+	   a crafted stream can produce an unbounded number of zero-output
+	   steps, and tail-call recursion (not guaranteed) would exhaust the
+	   stack. */
+	for (;;) {
+		high_offset = stream->istream.v_offset + (stream->pos - stream->skip);
+		if (zstream->eof_offset == high_offset) {
 			stream->istream.eof = TRUE;
 			return -1;
 		}
-		break;
-	default:
-		i_fatal("BZ2_bzDecompress() failed with %d", ret);
+
+		if (!zstream->marked) {
+			if (!i_stream_try_alloc(stream, CHUNK_SIZE, &out_size))
+				return -2; /* buffer full */
+		} else {
+			/* try to avoid compressing, so we can quickly seek backwards */
+			if (!i_stream_try_alloc_avoid_compress(stream, CHUNK_SIZE, &out_size))
+				return -2; /* buffer full */
+		}
+
+		if (i_stream_read_more(stream->parent, &data, &size) < 0) {
+			if (stream->parent->stream_errno != 0) {
+				stream->istream.stream_errno =
+					stream->parent->stream_errno;
+			} else {
+				i_assert(stream->parent->eof);
+				bzlib_read_error(zstream, "unexpected EOF");
+				if (!zstream->hdr_read)
+					stream->istream.stream_errno = EINVAL;
+				else
+					stream->istream.stream_errno = EPIPE;
+			}
+			return -1;
+		}
+		if (size == 0) {
+			/* no more input */
+			i_assert(!stream->istream.blocking);
+			return 0;
+		}
+
+		zstream->zs.next_in = (char *)data;
+		zstream->zs.avail_in = size;
+
+		zstream->zs.next_out = (char *)stream->w_buffer + stream->pos;
+		zstream->zs.avail_out = out_size;
+		ret = BZ2_bzDecompress(&zstream->zs);
+		zstream->hdr_read = TRUE;
+
+		out_size -= zstream->zs.avail_out;
+		stream->pos += out_size;
+
+		i_stream_skip(stream->parent, size - zstream->zs.avail_in);
+
+		switch (ret) {
+		case BZ_OK:
+			break;
+		case BZ_PARAM_ERROR:
+			i_unreached();
+		case BZ_DATA_ERROR:
+			bzlib_read_error(zstream, "corrupted data");
+			stream->istream.stream_errno = EINVAL;
+			return -1;
+		case BZ_DATA_ERROR_MAGIC:
+			bzlib_read_error(zstream,
+				"wrong magic in header (not bz2 file?)");
+			stream->istream.stream_errno = EINVAL;
+			return -1;
+		case BZ_MEM_ERROR:
+			i_fatal_status(FATAL_OUTOFMEM, "bzlib.read(%s): Out of memory",
+				       i_stream_get_name(&stream->istream));
+		case BZ_STREAM_END:
+			zstream->eof_offset = stream->istream.v_offset +
+				(stream->pos - stream->skip);
+			stream->cached_stream_size = zstream->eof_offset;
+			if (out_size == 0) {
+				stream->istream.eof = TRUE;
+				return -1;
+			}
+			break;
+		default:
+			i_fatal("BZ2_bzDecompress() failed with %d", ret);
+		}
+		if (out_size == 0) {
+			/* no output yet; read more input without recursing */
+			continue;
+		}
+		return out_size;
 	}
-	if (out_size == 0) {
-		/* read more input */
-		return i_stream_bzlib_read(stream);
-	}
-	return out_size;
 }
 
 static void i_stream_bzlib_init(struct bzlib_istream *zstream)
@@ -226,6 +232,7 @@ struct istream *i_stream_create_bz2(struct istream *input)
 	zstream->istream.istream.seekable = input->seekable;
 
 	return i_stream_create(&zstream->istream, input,
-			       i_stream_get_fd(input), 0);
+			       i_stream_get_fd(input),
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }
 #endif

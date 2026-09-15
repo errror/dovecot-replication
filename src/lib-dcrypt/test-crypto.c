@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -73,7 +73,7 @@ static void test_cipher_test_vectors(void)
 		hex_to_binary(vectors[i].pt, pt);
 		hex_to_binary(vectors[i].ct, ct);
 
-		if (!dcrypt_ctx_sym_create("AES-128-CBC", DCRYPT_MODE_ENCRYPT,
+		if (!dcrypt_ctx_sym_create(SN_aes_128_cbc, DCRYPT_MODE_ENCRYPT,
 					   &ctx, &error)) {
 			test_assert_failed("dcrypt_ctx_sym_create",
 					   __FILE__, __LINE__-1);
@@ -95,7 +95,7 @@ static void test_cipher_test_vectors(void)
 
 		dcrypt_ctx_sym_destroy(&ctx);
 
-		if (!dcrypt_ctx_sym_create("AES-128-CBC", DCRYPT_MODE_DECRYPT,
+		if (!dcrypt_ctx_sym_create(SN_aes_128_cbc, DCRYPT_MODE_DECRYPT,
 					   &ctx, NULL)) {
 			test_assert_failed("dcrypt_ctx_sym_create",
 					   __FILE__, __LINE__-1);
@@ -127,7 +127,7 @@ static void test_cipher_aead_test_vectors(void)
 
 	test_begin("test_cipher_aead_test_vectors");
 
-	if (!dcrypt_ctx_sym_create("aes-128-gcm", DCRYPT_MODE_ENCRYPT,
+	if (!dcrypt_ctx_sym_create(SN_aes_128_gcm, DCRYPT_MODE_ENCRYPT,
 				   &ctx, &error)) {
 		test_assert_failed("dcrypt_ctx_sym_create",
 				   __FILE__, __LINE__-1);
@@ -171,7 +171,7 @@ static void test_cipher_aead_test_vectors(void)
 
 	dcrypt_ctx_sym_destroy(&ctx);
 
-	if (!dcrypt_ctx_sym_create("aes-128-gcm", DCRYPT_MODE_DECRYPT,
+	if (!dcrypt_ctx_sym_create(SN_aes_128_gcm, DCRYPT_MODE_DECRYPT,
 				   &ctx, &error)) {
 		test_assert_failed("dcrypt_ctx_sym_create",
 				   __FILE__, __LINE__-1);
@@ -214,7 +214,7 @@ static void test_hmac_test_vectors(void)
 		      "2959098b3ef8c122d9635514ced565fe", res);
 
 	struct dcrypt_context_hmac *hctx;
-	if (!dcrypt_ctx_hmac_create("sha256", &hctx, &error)) {
+	if (!dcrypt_ctx_hmac_create(SN_sha256, &hctx, &error)) {
 		test_assert_failed("dcrypt_ctx_hmac_create",
 				   __FILE__, __LINE__-1);
 	} else {
@@ -365,7 +365,7 @@ static void test_load_v1_key(void)
 		test_assert(dcrypt_key_store_public(pubkey,
 			    DCRYPT_FORMAT_DOVECOT, key_1, NULL));
 		buffer_set_used_size(key_1, 0);
-		dcrypt_key_id_public(pubkey, "sha256", key_1, &error);
+		dcrypt_key_id_public(pubkey, SN_sha256, key_1, &error);
 		test_assert(strcmp("792caad4d38c9eb2134a0cbc844eae38"
 				   "6116de096a0ccafc98479825fc99b6a1",
 				   binary_to_hex(key_1->data, key_1->used))
@@ -516,7 +516,7 @@ static void test_load_v2_key(void)
 	test_assert_idx(dcrypt_key_load_private(&priv,
 		keys[2], "This Is Sparta", NULL, &error), 2);
 	test_assert_idx(dcrypt_key_store_private(priv,
-		DCRYPT_FORMAT_DOVECOT, "aes-256-ctr", tmp,
+		DCRYPT_FORMAT_DOVECOT, SN_aes_256_ctr, tmp,
 		"This Is Sparta", NULL, &error), 2);
 	buffer_set_used_size(tmp, 0);
 	dcrypt_key_unref_private(&priv);
@@ -526,7 +526,7 @@ static void test_load_v2_key(void)
 	test_assert_idx(dcrypt_key_load_private(&priv,
 		keys[3], NULL, priv2, &error), 3);
 	test_assert_idx(dcrypt_key_store_private(priv,
-		DCRYPT_FORMAT_DOVECOT, "ecdh-aes-256-ctr", tmp,
+		DCRYPT_FORMAT_DOVECOT, "ecdh-"SN_aes_256_ctr, tmp,
 		NULL, pub, &error), 3);
 	buffer_set_used_size(tmp, 0);
 	dcrypt_key_unref_private(&priv2);
@@ -591,6 +591,54 @@ static void test_load_v2_public_key(void)
 			dcrypt_key_unref_public(&pub);
 		}
 	}
+
+	test_end();
+}
+
+static void
+test_store_load_v2_key_encrypted_algo(const char *algo, struct dcrypt_keypair *pair)
+{
+	bool ok;
+	const char *error;
+	string_t *dest = t_str_new(128);
+	/* store it encrypted without aead */
+	ok = dcrypt_key_store_private(pair->priv, DCRYPT_FORMAT_DOVECOT,
+				      algo, dest, "password", NULL,
+				      &error);
+	if (!ok) {
+		i_error("%s", error);
+	} else {
+		struct dcrypt_private_key *priv;
+		/* ok, and try load it now */
+		ok = dcrypt_key_load_private(&priv, str_c(dest), "password",
+					     NULL, &error);
+		if (!ok)
+			i_error("%s", error);
+		else {
+			dcrypt_key_unref_private(&pair->priv);
+			pair->priv = priv;
+		}
+	}
+}
+
+static void test_store_load_v2_key_encrypted(void)
+{
+	test_begin("test_store_load_v2_encrypted_key");
+
+	/* generate keypair */
+	struct dcrypt_keypair pair;
+	const char *error;
+
+	bool ok = dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0,
+					  SN_X9_62_prime256v1, &error);
+	if (!ok)
+		i_fatal("%s", error);
+
+	test_store_load_v2_key_encrypted_algo(SN_aes_256_ctr, &pair);
+	test_store_load_v2_key_encrypted_algo(SN_aes_256_gcm, &pair);
+	test_store_load_v2_key_encrypted_algo(SN_chacha20_poly1305, &pair);
+
+	dcrypt_keypair_unref(&pair);
 
 	test_end();
 }
@@ -785,17 +833,17 @@ static void test_get_info_key_encrypted(void)
 	struct dcrypt_keypair p1, p2;
 	const char *error = NULL;
 	bool ret = dcrypt_keypair_generate(&p1,
-		DCRYPT_KEY_EC, 0, "secp521r1", &error);
+		DCRYPT_KEY_EC, 0, SN_secp521r1, &error);
 	test_assert(ret == TRUE);
 	ret = dcrypt_keypair_generate(&p2,
-		DCRYPT_KEY_EC, 0, "secp521r1", &error);
+		DCRYPT_KEY_EC, 0, SN_secp521r1, &error);
 	test_assert(ret == TRUE);
 
 	string_t* buf = t_str_new(4096);
 
 	buffer_set_used_size(buf, 0);
 	ret = dcrypt_key_store_private(p1.priv,
-		DCRYPT_FORMAT_DOVECOT, "ecdh-aes-256-ctr", buf,
+		DCRYPT_FORMAT_DOVECOT, "ecdh-"SN_aes_256_ctr, buf,
 		NULL, p2.pub, &error);
 	test_assert(ret == TRUE);
 
@@ -830,12 +878,12 @@ static void test_get_info_pw_encrypted(void)
 	i_zero(&p1);
 	const char *error;
 	bool ret = dcrypt_keypair_generate(&p1,
-		DCRYPT_KEY_EC, 0, "secp521r1", &error);
+		DCRYPT_KEY_EC, 0, SN_secp521r1, &error);
 	test_assert(ret == TRUE);
 
 	string_t* buf = t_str_new(4096);
 	ret = dcrypt_key_store_private(p1.priv,
-		DCRYPT_FORMAT_DOVECOT, "aes-256-ctr", buf, "pw", NULL, &error);
+		DCRYPT_FORMAT_DOVECOT, SN_aes_256_ctr, buf, "pw", NULL, &error);
 	test_assert(ret == TRUE);
 
 	enum dcrypt_key_format format;
@@ -869,12 +917,12 @@ static void test_password_change(void)
 	const char *error = NULL;
 
 	bool ret = dcrypt_keypair_generate(&orig,
-		DCRYPT_KEY_EC, 0, "secp521r1", &error);
+		DCRYPT_KEY_EC, 0, SN_secp521r1, &error);
 	test_assert(ret == TRUE);
 
 	string_t *buf = t_str_new(4096);
 	ret = dcrypt_key_store_private(orig.priv,
-		DCRYPT_FORMAT_DOVECOT, "aes-256-ctr", buf, pw1, NULL, &error);
+		DCRYPT_FORMAT_DOVECOT, SN_aes_256_ctr, buf, pw1, NULL, &error);
 	test_assert(ret == TRUE);
 
 	/* load the pw-encrypted key */
@@ -885,14 +933,14 @@ static void test_password_change(void)
 	/* encrypt a key with the pw-encrypted key k1 */
 	struct dcrypt_keypair k2;
 	ret = dcrypt_keypair_generate(&k2,
-		DCRYPT_KEY_EC, 0, "secp521r1", &error);
+		DCRYPT_KEY_EC, 0, SN_secp521r1, &error);
 	test_assert(ret == TRUE);
 
 	string_t *buf2 = t_str_new(4096);
 	struct dcrypt_public_key *k1_pub = NULL;
 	dcrypt_key_convert_private_to_public(k1_priv, &k1_pub);
 	ret = dcrypt_key_store_private(k2.priv,
-		DCRYPT_FORMAT_DOVECOT, "ecdh-aes-256-ctr", buf2,
+		DCRYPT_FORMAT_DOVECOT, "ecdh-"SN_aes_256_ctr, buf2,
 		NULL, k1_pub, &error);
 	test_assert(ret == TRUE);
 
@@ -902,7 +950,7 @@ static void test_password_change(void)
 
 	/* encrypt k1 with pw2 */
 	ret = dcrypt_key_store_private(k1_priv,
-		DCRYPT_FORMAT_DOVECOT, "aes-256-ctr", buf3, pw2, NULL, &error);
+		DCRYPT_FORMAT_DOVECOT, SN_aes_256_ctr, buf3, pw2, NULL, &error);
 	test_assert(ret == TRUE);
 
 	/* load the pw2 encrypted key */
@@ -1274,7 +1322,7 @@ static void test_raw_keys(void)
 
 	/* generate ECC key */
 	struct dcrypt_keypair pair;
-	i_assert(dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "prime256v1", &error));
+	i_assert(dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, SN_X9_62_prime256v1, &error));
 
 	/* store it */
 	test_assert(dcrypt_key_store_private_raw(pair.priv, pool, &t, &priv_key,
@@ -1292,7 +1340,7 @@ static void test_raw_keys(void)
 	dcrypt_keypair_unref(&pair);
 
 	/* test load known raw private key */
-	const char *curve = "prime256v1";
+	const char *curve = SN_X9_62_prime256v1;
 	const unsigned char priv_key_data[] = {
 		0x16, 0x9e, 0x62, 0x36, 0xaf, 0x9c, 0xae, 0x0e, 0x71, 0xda,
 		0xf2, 0x63, 0xe2, 0xe0, 0x5d, 0xf1, 0xd5, 0x35, 0x8c, 0x2b,
@@ -1406,10 +1454,10 @@ static void test_sign_verify_rsa(void)
 	if (priv_key == NULL)
 		i_fatal("%s", error);
 	dcrypt_key_convert_private_to_public(priv_key, &pub_key);
-	test_assert(dcrypt_sign(priv_key, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_sign(priv_key, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		 data, strlen(data), signature, 0, &error));
 	/* verify signature */
-	test_assert(dcrypt_verify(pub_key, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_verify(pub_key, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		 data, strlen(data),
 		 signature->data, signature->used, &valid, 0, &error) && valid);
 
@@ -1443,10 +1491,10 @@ static void test_sign_verify_ecdsa(void)
 	if (priv_key == NULL)
 		i_fatal("%s", error);
 	dcrypt_key_convert_private_to_public(priv_key, &pub_key);
-	test_assert(dcrypt_sign(priv_key, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_sign(priv_key, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		data, strlen(data), signature, 0, &error));
 	/* verify signature */
-	test_assert(dcrypt_verify(pub_key, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_verify(pub_key, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		data, strlen(data), signature->data,
 		signature->used, &valid, 0, &error) && valid);
 
@@ -1480,12 +1528,60 @@ static void test_sign_verify_x962(void)
 	if (priv_key == NULL)
 		i_fatal("%s", error);
 	dcrypt_key_convert_private_to_public(priv_key, &pub_key);
-	test_assert(dcrypt_sign(priv_key, "sha256", DCRYPT_SIGNATURE_FORMAT_X962,
+	test_assert(dcrypt_sign(priv_key, SN_sha256, DCRYPT_SIGNATURE_FORMAT_X962,
 		data, strlen(data), signature, 0, &error));
 	/* verify signature */
-	test_assert(dcrypt_verify(pub_key, "sha256", DCRYPT_SIGNATURE_FORMAT_X962,
+	test_assert(dcrypt_verify(pub_key, SN_sha256, DCRYPT_SIGNATURE_FORMAT_X962,
 		data, strlen(data), signature->data,
 		signature->used, &valid, 0, &error) && valid);
+
+	dcrypt_key_unref_public(&pub_key);
+	dcrypt_key_unref_private(&priv_key);
+
+	test_end();
+}
+
+static void test_sign_verify_x962_fixed_width(void)
+{
+	const char *error = NULL;
+	bool valid;
+	struct dcrypt_private_key *priv_key = NULL;
+	struct dcrypt_public_key *pub_key = NULL;
+	const char *data = "signed data";
+	/* P-256 order is 256 bits, so the x9.62 signature is 2*32 bytes */
+	const size_t expected_len = 2 * 32;
+
+	test_begin("sign and verify (x9.62) fixed width");
+	const char *key =
+"-----BEGIN PRIVATE KEY-----\n"
+"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZ4AMMyJ9XDl5lKM2\n"
+"vusbT1OQ6VzBWBkB3/4syovaKtyhRANCAAQHTR+6L2qMh5fdcMZF+Y1rctBsq8Oy\n"
+"7jZ4uV+MiuaoGNQ5sTxlcv6ETX/XrEDq4S/DUhFKzQ6u9VXYZImvRCT1\n"
+"-----END PRIVATE KEY-----";
+
+	test_assert(dcrypt_key_load_private(&priv_key, key, NULL, NULL, &error));
+	if (priv_key == NULL)
+		i_fatal("%s", error);
+	dcrypt_key_convert_private_to_public(priv_key, &pub_key);
+
+	/* ECDSA signing uses a random nonce, so r and s vary in length each
+	   time. The x9.62 format must always be a fixed width regardless, and
+	   the signature must round-trip back through verification. Loop enough
+	   times to hit the cases where r or s has leading zero bytes. */
+	for (unsigned int i = 0; i < 1000; i++) T_BEGIN {
+		buffer_t *signature =
+			buffer_create_dynamic(pool_datastack_create(), 128);
+		bool ok = dcrypt_sign(priv_key, "sha256",
+				      DCRYPT_SIGNATURE_FORMAT_X962,
+				      data, strlen(data), signature, 0, &error);
+		test_assert_idx(ok, i);
+		test_assert_idx(signature->used == expected_len, i);
+		test_assert_idx(dcrypt_verify(pub_key, "sha256",
+					      DCRYPT_SIGNATURE_FORMAT_X962,
+					      data, strlen(data),
+					      signature->data, signature->used,
+					      &valid, 0, &error) && valid, i);
+	} T_END;
 
 	dcrypt_key_unref_public(&pub_key);
 	dcrypt_key_unref_private(&priv_key);
@@ -1527,7 +1623,7 @@ static void test_static_verify_ecdsa(void)
 	test_assert(dcrypt_key_load_public(&pair.pub, pub_key_pem, &error));
 	test_assert(dcrypt_key_load_private(&pair.priv, priv_key_pem, NULL, NULL, &error));
 	/* validate signature */
-	test_assert(dcrypt_verify(pair.pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_verify(pair.pub, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 				  input, strlen(input),
 				  sig, sizeof(sig), &valid, 0, &error) &&
 		    valid == TRUE);
@@ -1765,7 +1861,7 @@ static void test_static_verify_rsa(void)
 	test_assert(dcrypt_key_load_public(&pub_key, key, &error));
 	if (pub_key == NULL)
 		i_fatal("%s", error);
-	test_assert(dcrypt_verify(pub_key, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_verify(pub_key, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		data, strlen(data),
 		sig, sizeof(sig), &valid, DCRYPT_PADDING_RSA_PKCS1, &error) &&
 		valid);
@@ -1803,7 +1899,7 @@ static void test_static_verify_ecdsa_x962(void)
 	test_assert(dcrypt_key_load_public(&pub_key, key, &error));
 	if (pub_key == NULL)
 		i_fatal("%s", error);
-	test_assert(dcrypt_verify(pub_key, "sha256", DCRYPT_SIGNATURE_FORMAT_X962,
+	test_assert(dcrypt_verify(pub_key, SN_sha256, DCRYPT_SIGNATURE_FORMAT_X962,
 		data, strlen(data),
 		sig, sizeof(sig), &valid, DCRYPT_PADDING_RSA_PKCS1, &error) &&
 		valid);
@@ -1824,14 +1920,14 @@ static void test_sign_verify_ed25519(void)
 
 	test_begin("sign and verify (ed25519)");
 
-	ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "ED25519", &error);
+	ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, SN_ED25519, &error);
 	if (!ret)
-		i_panic("%s", error);
+		i_fatal("%s", error);
 
-	test_assert(dcrypt_sign(pair.priv, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_sign(pair.priv, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		 data, strlen(data), signature, 0, &error));
 	/* verify signature */
-	test_assert(dcrypt_verify(pair.pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_verify(pair.pub, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		 data, strlen(data),
 		 signature->data, signature->used, &valid, 0, &error) && valid);
 
@@ -1862,10 +1958,10 @@ static void test_static_verify_ed25519(void)
 
 	ret = dcrypt_key_load_public(&pub, key, &error);
 	if (!ret)
-		i_panic("%s", error);
+		i_fatal("%s", error);
 
 	/* verify signature */
-	test_assert(dcrypt_verify(pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_verify(pub, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		 data, strlen(data),
 		 sig, sizeof(sig), &valid, 0, &error) && valid);
 	dcrypt_key_unref_public(&pub);
@@ -1900,10 +1996,10 @@ static void test_static_verify_ed448(void)
 
 	ret = dcrypt_key_load_public(&pub, key, &error);
 	if (!ret)
-		i_panic("%s", error);
+		i_fatal("%s", error);
 
 	/* verify signature */
-	test_assert(dcrypt_verify(pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_verify(pub, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		 data, strlen(data),
 		 sig, sizeof(sig), &valid, 0, &error) && valid);
 	dcrypt_key_unref_public(&pub);
@@ -1922,14 +2018,14 @@ static void test_sign_verify_ed448(void)
 
 	test_begin("sign and verify (ed448)");
 
-	ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "ED448", &error);
+	ret = dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, SN_ED448, &error);
 	if (!ret)
-		i_panic("%s", error);
+		i_fatal("%s", error);
 
-	test_assert(dcrypt_sign(pair.priv, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_sign(pair.priv, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		 data, strlen(data), signature, 0, &error));
 	/* verify signature */
-	test_assert(dcrypt_verify(pair.pub, "sha256", DCRYPT_SIGNATURE_FORMAT_DSS,
+	test_assert(dcrypt_verify(pair.pub, SN_sha256, DCRYPT_SIGNATURE_FORMAT_DSS,
 		 data, strlen(data),
 		 signature->data, signature->used, &valid, 0, &error) && valid);
 
@@ -1946,8 +2042,8 @@ static void test_xd_keypair(struct dcrypt_keypair *pair)
 	/* perform ecdh */
 	buffer_t *R = t_buffer_create(64), *S = t_buffer_create(64);
 	buffer_t *S2 = t_buffer_create(64);
-	test_assert(dcrypt_ecdh_derive_secret_peer(pair->pub, R, S, &error));
-	test_assert(dcrypt_ecdh_derive_secret_local(pair->priv, R, S2, &error));
+	test_assert(dcrypt_derive_secret_peer(pair->pub, R, S, &error));
+	test_assert(dcrypt_derive_secret_local(pair->priv, R, S2, &error));
 	test_assert(S->used > 0);
 	test_assert(R->used > 0);
 	test_assert(buffer_cmp(S, S2));
@@ -1977,6 +2073,9 @@ static void test_xd_keypair(struct dcrypt_keypair *pair)
 	test_assert(ret == TRUE);
 
 	dcrypt_key_unref_public(&pub2);
+
+	test_store_load_v2_key_encrypted_algo(SN_aes_256_gcm, pair);
+
 	dcrypt_keypair_unref(pair);
 	dcrypt_keypair_unref(&pair2);
 }
@@ -1987,8 +2086,8 @@ static void test_xd25519_keypair(void)
 	struct dcrypt_keypair pair;
 	const char *error = NULL;
 
-	if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "X25519", &error))
-		i_panic("%s", error);
+	if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, SN_X25519, &error))
+		i_fatal("%s", error);
 
 	test_xd_keypair(&pair);
 
@@ -2001,14 +2100,202 @@ static void test_xd448_keypair(void)
 	struct dcrypt_keypair pair;
 	const char *error = NULL;
 
-	if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, "X448", &error))
-		i_panic("%s", error);
+	if (!dcrypt_keypair_generate(&pair, DCRYPT_KEY_EC, 0, SN_X448, &error))
+		i_fatal("%s", error);
 
 	test_xd_keypair(&pair);
 
 	test_end();
 }
 #endif
+
+/* Whether the OpenSSL we're running against supports ML-KEM. This can't be
+   decided at build time. */
+static bool have_kem = FALSE;
+
+static void test_kem_detect(void)
+{
+	struct dcrypt_keypair pair;
+	const char *error;
+
+	have_kem = dcrypt_keypair_generate(&pair, DCRYPT_KEY_KEM, 0,
+					   DCRYPT_ML_KEM_512, &error);
+	if (!have_kem) {
+		i_info("ML-KEM not supported by OpenSSL, "
+		       "skipping ML-KEM tests: %s", error);
+		return;
+	}
+	dcrypt_keypair_unref(&pair);
+}
+
+static const char *static_dovecot_kem_key_private =
+"2:2.16.840.1.101.3.4.4.1:2:aes-256-ctr:af989fcbc4978b476211f5ecbe5b4b29:sha256"
+":2048:d305523dd57270fcf583f55fdc3d6f72d65c34078a6ec4fd210a67fcf2a7ea519c2d1e51"
+"2aa755ab6d149b0016e930bbca3d49a9734155f4cd95ad40c5682f8d12971d41054e17a0a0be89"
+"6c0856817e636a3146ac690b0c39f5ec6a8741d59b505916c40e5dc25a7abf31af893236dc11af"
+"665fc5e94fb5ce5b3beaa164fadb32a02ff7fe45cf17ace52c2f281c2347caac4e3e8fc5681818"
+"a05807e75e23c4ee64dbb349f75f3bc55a4adca026a945b448cf707da0c293b958fe37ac54295c"
+"3405f092e9e78d1a2080eac6c5da184b1335644f9874ad135f496bb844eb5faeacf944c834d064"
+"899df5ae51d8d2589d4f4401fe22b12c4cb3bce9b739a81a665c9a24eb93d83f8e85ab6c9fc7ad"
+"469b5bc59bac2cbc5275fe82364048cec9d719ef748a99af4c6da66e7d0e98b598b75506cc3edc"
+"3f4b0dd24a22561d1c09692485e972b685016495975090dc3d7eba801e25488680fe9d6e861866"
+"45be6c655766fa47a9efd0380f2c9cb9c0fa33e052b6c901aa370b8cb57278058c81c42236f954"
+"5dd8706ce7c32668bb4fad141e673be43665dc203683b579130832e19c2a7534f3cbefd29a0491"
+"011c11cc2abe0dca82d0c4dbd3a0cc7eedb3c45910e0851eb26fd416d71ca2ecea155e515d4719"
+"56abbf781d2a6ea66a2b79ad4f9ade3b9152daccfed92870a85341e241388ff92eb75669fe1cd7"
+"02850797023e3b96a6f44edb64951a5afb882ad7f069bb15af2ce14876eef522bc26287dee4a53"
+"653e493faa27ac1d65eb8831be05fe3faab26cec5f757a4fae3fc52c89048ccd654ea1e9aed927"
+"89b459c98c332fcfe57987f3c503044cfe0849d7cf90f6200daad4283be6a182bfa1a1ef9434c1"
+"16077bfa347ea975ba4c2c81b2001cd2fc1001c8145629c828ca78ed6a06922a43d7532b55908d"
+"33440f8d7906cd5cbdcb6befccd6590355041331cb9ec0d3f7eba912cad9e300593cd05abf314a"
+"3cb0e04efc956be92f7ac33a2b7783ac6d000636e5be14548fd33d71efcb403c37ce31ac127ced"
+"f9fe6e859e21faa4c0d5e3f5dd2a281275bb383f3497511ddedbc5c3184ad48e9eca8df1a9481e"
+"024875b8bbdce04276d0f9e95804745f900a7976b59aacb56dc50f162cf2965cacea43a31b426e"
+"6c7f2f911573d765cb81f9317a0d5398cc4a9d68a6383d7b12ad6596fdb1b3a7c9ebf7149e565e"
+"42f6e7a9484f2fb176af15281dcafbb6cc3bcbdccfc198f6390d6310806749c00831cc1253d72e"
+"185584d310e44338a50c6d35ce845bb04466cedef5c3fb6eb603bf24fada62c5a0cd485a2ba3a9"
+"2b6c6d4e2c9fb7d9fb182006698f887f5eb5a840858d866beee6167952573cba48ff243121de98"
+"91d721582d2c1092bb1f146e8f0d1c0772b53960ef57f865dd882303681af89d49d1f9651ec39d"
+"d1b78c857e4f4cc90b1453a420c2e8f83b7d13e5bac4654c2813916c19c1839819e3e3f4163158"
+"336d9f46285355367fb0a7bc129ece486e518d128f702cfe4d7bdd199f05cbaa3becae5ab53855"
+"3b91c70e5186c1b6518fa51b47359558fa7decaef36b6db0358fe32c6a0f8ebbf6253bd93ea241"
+"895dfc49800d28f94302f4956903c73d949688d6002a37c5091204e3219962169bf2922dd68388"
+"522a441ab67b23e734f56ec3992a8ae2897902b58c31473adbb03cf5364fb0ffde21dc51c1a2a1"
+"c11b4894fe752671cd83aa09fdeb2e143d57f418752b4b133f417fc1793f516de670e6547166a0"
+"ceb05b48968537b84f797da11cf49e0b35e05869cb6f2652131f8ca57affc480dba62835780a95"
+"31d54d5d12debacffaf8a788b9b67141a90fee6fb4b11fe57bbfce5027ff4ebe978203cbda1f52"
+"6e37d14f96de3d3f87ecd7b82f05f9ffe5294fc67af1b5813eebf792e4c1664b263bdd7f53124b"
+"cc31486fedce0e4ed3e396965affa6b8edd4a42f887ab134269fc53bce4d9505452e9b077cc567"
+"54dff6521a6e5e5dca26f298de1a4a0696ebbae05ba4242f6c082f2e35c7b6a58b45bb86968dd9"
+"f6ef9f6f20b743a2a9d7fa053320e6eb07860012f96f742a76390f8f43e7f340a2b3f7753ef9a1"
+"31edf6a568a8e71ee16a08e2aaea0475ae5fbad743b90d635e939e7b92eb3ad4faae6a8cde86a6"
+"934a8a0422ba83cece397873d10c6256fee714b8884a58402975c9a00e69decf6ce8701c6bfdb4"
+"1ff05f3629d8c501a53378ddbe4ed70fe58334bf1417aa551817970294a4f0d9d3f98edaf4f7b2"
+"defca7850a6fb45f65cae00a5773b251c9b6937837fcb0f145efa40c9d30f2bf0dc54d7a:168c6"
+"bd87f4619a9906d8e95737109d474659c703a00613529590c04706998a0";
+
+static const char *static_dovecot_kem_key_public =
+"2:30820332300b060960864801650304040103820321008584b0e6315a0fdbc54c595633853d67"
+"3cad5832236be2c14a5b077ed882e2a5881201cd4f72c7e2f68486bc89b2b6192736358b6383b6"
+"f89b117333b8761234332c45247ab7823df583c99ba6030df4ca60a0ccfb012410e2655f941d7e"
+"10340ed7754440b03029662921a38720a25728cec5b6ce117195d87445949a7c13939627677795"
+"da87efe27ec6d56b3eba83f9e51f53212c14b75065605978b47f978c57f66497e575198994560b"
+"331753981d2e403b2384abdab3bd3f182c0aac84c89139cd98678dd5abecd086439a36c595b43a"
+"0122051400e0dc256a18c6a3b112d82878fdfcaeb90c6bd12049695596feaa91df4a6bcbb0bfe3"
+"77a719c9c5ee90bd7a57820e5b3d7268835bc7433445c67345ca37c577a7411eaa860f418893d8"
+"601552d670758c15a2e342a9368424b7ad70e675b5a6cee494590000c67f585f7fdcc9341c6747"
+"e6bc19b4af3ebaa2dee88f0f1a2529693c3dac9b7b4514f9019811daa7cb1c25695611886009ca"
+"03419ae6767cf609b2b9c54238aab5e4c32bf3bc4cb2bc7cca00064ccc78164c81f52d6fdaca0e"
+"e4704bc00b15429bba9c48f5504d54b6143638c304443ccf070d326b5632722e6ef20fe6671246"
+"b0030f8402eb5a271f8040fc14008a100ffc221e322b8847e97703a03b412b39feb261491b6de0"
+"3cb312077fd6d0c0d657cd1bc1289d0b48b8ca26ff984c670013718634e5771c59c4238964bc6b"
+"364bda4b6264696c88244e68401483c875a4fb0bc18112bae362ed466b141233549b95ebf06dc6"
+"1a3949767bdc92ccb9330c7a4a589b1626f08165beaba50626457d0b7ad3c56edb477b1c8178ec"
+"e73c2eeb1e71eb5da6b4adceb87df32c4f20ca3ca8692df7e45dc0c19ab0e88f71237b71c21426"
+"393d59c268836b82485428e10694392a0128fc38f76a5c88bc07dcd8519df84be90a7247fb4cb0"
+"964760173aa690b620b9a890f64a561a494b1cb42e5bc076d7c8513b1694f16f42a35af0d284d1"
+"804272438030729016d19b97468439785895170330e065c8dcc4ef35672b74439b767bf91177fe"
+"06bf0df0a7454c06c4b8291f0e5639c948eaec7df621d9ca3a9c1ed6120349593b30ce4575c97a"
+"db30fc34:168c6bd87f4619a9906d8e95737109d474659c703a00613529590c04706998a0";
+
+static void test_kem_key_load(void)
+{
+	if (!have_kem)
+		return;
+
+	test_begin("KEM key static load");
+	struct dcrypt_keypair pair;
+	const char *error;
+	bool ok;
+
+	ok = dcrypt_key_load_private(&pair.priv, static_dovecot_kem_key_private,
+				     "password", NULL, &error);
+	if (!ok)
+		i_error("%s", error);
+
+	ok = dcrypt_key_load_public(&pair.pub, static_dovecot_kem_key_public, &error);
+	if (!ok)
+		i_error("%s", error);
+
+	/* ensure it works with gcm */
+	test_store_load_v2_key_encrypted_algo(SN_aes_256_gcm, &pair);
+
+	dcrypt_keypair_unref(&pair);
+
+	test_end();
+}
+
+static void test_kem_keypair_curve(const char *curve)
+{
+	const char *error = NULL;
+
+	test_begin(t_strdup_printf("KEM keypair (%s)", curve));
+
+	struct dcrypt_keypair pair;
+	bool ok = dcrypt_keypair_generate(&pair, DCRYPT_KEY_KEM, 0,
+					  curve, &error);
+	if (!ok)
+		i_fatal("%s", error);
+
+	test_assert(dcrypt_key_type_private(pair.priv) == DCRYPT_KEY_KEM);
+	test_assert(dcrypt_key_type_public(pair.pub) == DCRYPT_KEY_KEM);
+
+	/* encapsulate (peer side) */
+	buffer_t *R = t_buffer_create(1600);
+	buffer_t *S_peer = t_buffer_create(64);
+	test_assert(dcrypt_derive_secret_peer(pair.pub, R, S_peer, &error));
+	test_assert(R->used > 0);
+	test_assert(S_peer->used > 0);
+
+	/* decapsulate (local side) */
+	buffer_t *S_local = t_buffer_create(64);
+	test_assert(dcrypt_derive_secret_local(pair.priv, R, S_local,
+						   &error));
+	test_assert(buffer_cmp(S_peer, S_local));
+
+	/* round-trip: store and reload */
+	string_t *priv_str = t_str_new(256);
+	string_t *pub_str = t_str_new(256);
+	test_assert(dcrypt_key_store_private(pair.priv, DCRYPT_FORMAT_DOVECOT,
+					     NULL, priv_str, NULL, NULL,
+					     &error));
+	test_assert(dcrypt_key_store_public(pair.pub, DCRYPT_FORMAT_DOVECOT,
+					    pub_str, &error));
+
+	struct dcrypt_keypair pair2;
+	i_zero(&pair2);
+	test_assert(dcrypt_key_load_private(&pair2.priv, str_c(priv_str),
+					    NULL, NULL, &error));
+	test_assert(dcrypt_key_load_public(&pair2.pub, str_c(pub_str), &error));
+
+	if (pair2.priv != NULL && pair2.pub != NULL) {
+		test_assert(dcrypt_key_type_private(pair2.priv) == DCRYPT_KEY_KEM);
+		test_assert(dcrypt_key_type_public(pair2.pub) == DCRYPT_KEY_KEM);
+
+		buffer_t *S_reload = t_buffer_create(64);
+		test_assert(dcrypt_derive_secret_local(pair2.priv, R,
+							   S_reload, &error));
+		test_assert(buffer_cmp(S_peer, S_reload));
+	}
+
+	dcrypt_keypair_unref(&pair);
+	dcrypt_keypair_unref(&pair2);
+
+	test_end();
+}
+
+static void test_kem_keypair(void)
+{
+	static const char *const curves[] = {
+		DCRYPT_ML_KEM_512, DCRYPT_ML_KEM_768, DCRYPT_ML_KEM_1024
+	};
+	if (!have_kem)
+		return;
+
+	for (size_t i = 0; i < N_ELEMENTS(curves); i++) T_BEGIN {
+		test_kem_keypair_curve(curves[i]);
+	} T_END;
+}
 
 int main(void)
 {
@@ -2032,6 +2319,7 @@ int main(void)
 		test_load_v1_public_key,
 		test_load_v2_key,
 		test_load_v2_public_key,
+		test_store_load_v2_key_encrypted,
 		test_get_info_v2_key,
 		test_gen_and_get_info_rsa_pem,
 		test_get_info_rsa_private_key,
@@ -2045,6 +2333,7 @@ int main(void)
 		test_sign_verify_rsa,
 		test_sign_verify_ecdsa,
 		test_sign_verify_x962,
+		test_sign_verify_x962_fixed_width,
 		test_static_verify_ecdsa,
 		test_static_verify_rsa,
 		test_static_verify_ecdsa_x962,
@@ -2056,8 +2345,12 @@ int main(void)
 		test_xd25519_keypair,
 		test_xd448_keypair,
 #endif
+		test_kem_key_load,
+		test_kem_keypair,
 		NULL
 	};
+
+	test_kem_detect();
 
 	int ret = test_run(test_functions);
 

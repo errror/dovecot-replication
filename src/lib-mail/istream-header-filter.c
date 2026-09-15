@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,10 +8,15 @@
 #include "istream-private.h"
 #include "istream-header-filter.h"
 
+struct ref_buffer {
+	int refcount;
+	buffer_t *buf;
+};
+
 struct header_filter_istream_snapshot {
 	struct istream_snapshot snapshot;
 	struct header_filter_istream *mstream;
-	buffer_t *hdr_buf;
+	struct ref_buffer *hdr_buf;
 };
 
 struct header_filter_istream {
@@ -26,8 +31,10 @@ struct header_filter_istream {
 	header_filter_callback *callback;
 	void *context;
 
-	buffer_t *hdr_buf;
+	struct ref_buffer *hdr_buf;
+	int snapshot_pending_refcount;
 	struct message_size header_size;
+	size_t max_header_block_size;
 	uoff_t skip_count;
 	uoff_t last_lf_offset;
 
@@ -50,29 +57,37 @@ struct header_filter_istream {
 	bool eoh_not_matched:1;
 	bool callbacks_called:1;
 	bool prev_matched:1;
-	bool snapshot_pending:1;
 };
 
 header_filter_callback *null_header_filter_callback = NULL;
 
 static ssize_t i_stream_header_filter_read(struct istream_private *stream);
 
+static void ref_buffer_unref(struct ref_buffer **_ref_buffer)
+{
+	struct ref_buffer *ref_buffer = *_ref_buffer;
+
+	if (ref_buffer == NULL)
+		return;
+	*_ref_buffer = NULL;
+
+	i_assert(ref_buffer->refcount > 0);
+	if (--ref_buffer->refcount == 0) {
+		buffer_free(&ref_buffer->buf);
+		i_free(ref_buffer);
+	}
+}
+
 static void i_stream_header_filter_destroy(struct iostream_private *stream)
 {
 	struct header_filter_istream *mstream =
-		(struct header_filter_istream *)stream;
+		container_of(stream, struct header_filter_istream, istream.iostream);
 
 	if (mstream->hdr_ctx != NULL)
 		message_parse_header_deinit(&mstream->hdr_ctx);
 	if (array_is_created(&mstream->match_change_lines))
 		array_free(&mstream->match_change_lines);
-	if (!mstream->snapshot_pending)
-		buffer_free(&mstream->hdr_buf);
-	else {
-		/* Clear hdr_buf to make sure
-		   i_stream_header_filter_snapshot_free() frees it. */
-		mstream->hdr_buf = NULL;
-	}
+	ref_buffer_unref(&mstream->hdr_buf);
 	pool_unref(&mstream->pool);
 }
 
@@ -100,29 +115,29 @@ read_mixed(struct header_filter_istream *mstream, size_t body_highwater_size)
 		mstream->istream.istream.eof = mstream->istream.parent->eof;
 
 		if (ret <= 0) {
-			data = mstream->hdr_buf->data;
-			pos = mstream->hdr_buf->used;
+			data = mstream->hdr_buf->buf->data;
+			pos = mstream->hdr_buf->buf->used;
 			i_assert(pos > 0);
 
 			if (mstream->end_body_with_lf && data[pos-1] != '\n' &&
 			    ret == -1 && mstream->istream.istream.eof) {
 				/* add missing trailing LF to body */
 				if (mstream->crlf)
-					buffer_append_c(mstream->hdr_buf, '\r');
-				buffer_append_c(mstream->hdr_buf, '\n');
-				mstream->istream.buffer = mstream->hdr_buf->data;
-				mstream->istream.pos = mstream->hdr_buf->used;
-				return mstream->hdr_buf->used - pos;
+					buffer_append_c(mstream->hdr_buf->buf, '\r');
+				buffer_append_c(mstream->hdr_buf->buf, '\n');
+				mstream->istream.buffer = mstream->hdr_buf->buf->data;
+				mstream->istream.pos = mstream->hdr_buf->buf->used;
+				return mstream->hdr_buf->buf->used - pos;
 			}
 			return ret;
 		}
 
 		data = i_stream_get_data(mstream->istream.parent, &pos);
 	}
-	buffer_append(mstream->hdr_buf, data + body_highwater_size,
+	buffer_append(mstream->hdr_buf->buf, data + body_highwater_size,
 		      pos - body_highwater_size);
 
-	mstream->istream.buffer = buffer_get_data(mstream->hdr_buf, &pos);
+	mstream->istream.buffer = buffer_get_data(mstream->hdr_buf->buf, &pos);
 	ret = (ssize_t)(pos - mstream->istream.pos - mstream->istream.skip);
 	i_assert(ret > 0);
 	mstream->istream.pos = pos;
@@ -147,9 +162,9 @@ static bool match_line_changed(struct header_filter_istream *mstream)
 static void add_eol(struct header_filter_istream *mstream, bool orig_crlf)
 {
 	if (mstream->crlf || (orig_crlf && mstream->crlf_preserve))
-		buffer_append(mstream->hdr_buf, "\r\n", 2);
+		buffer_append(mstream->hdr_buf->buf, "\r\n", 2);
 	else
-		buffer_append_c(mstream->hdr_buf, '\n');
+		buffer_append_c(mstream->hdr_buf->buf, '\n');
 	mstream->last_orig_crlf = orig_crlf;
 	mstream->last_added_newline = TRUE;
 }
@@ -159,7 +174,7 @@ static ssize_t hdr_stream_update_pos(struct header_filter_istream *mstream)
 	ssize_t ret;
 	size_t pos;
 
-	mstream->istream.buffer = buffer_get_data(mstream->hdr_buf, &pos);
+	mstream->istream.buffer = buffer_get_data(mstream->hdr_buf->buf, &pos);
 	ret = (ssize_t)(pos - mstream->istream.pos - mstream->istream.skip);
 	i_assert(ret >= 0);
 	mstream->istream.pos = pos;
@@ -168,18 +183,22 @@ static ssize_t hdr_stream_update_pos(struct header_filter_istream *mstream)
 
 static void hdr_buf_realloc_if_needed(struct header_filter_istream *mstream)
 {
-	if (!mstream->snapshot_pending)
+	if (mstream->snapshot_pending_refcount == 0)
 		return;
 
 	/* hdr_buf exists in a snapshot. Leave it be and create a copy of it
 	   that we modify. */
-	buffer_t *old_buf = mstream->hdr_buf;
-	mstream->hdr_buf = buffer_create_dynamic(default_pool,
-						 I_MAX(1024, old_buf->used));
-	buffer_append(mstream->hdr_buf, old_buf->data, old_buf->used);
-	mstream->snapshot_pending = FALSE;
+	buffer_t *old_buf = mstream->hdr_buf->buf;
+	struct ref_buffer *new_buf = i_new(struct ref_buffer, 1);
+	new_buf->refcount = 1;
+	new_buf->buf = buffer_create_dynamic(default_pool,
+					     I_MAX(1024, old_buf->used));
+	buffer_append(new_buf->buf, old_buf->data, old_buf->used);
+	mstream->snapshot_pending_refcount = 0;
 
-	mstream->istream.buffer = mstream->hdr_buf->data;
+	ref_buffer_unref(&mstream->hdr_buf);
+	mstream->hdr_buf = new_buf;
+	mstream->istream.buffer = mstream->hdr_buf->buf->data;
 }
 
 static ssize_t read_header(struct header_filter_istream *mstream)
@@ -194,16 +213,18 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 		mstream->hdr_ctx =
 			message_parse_header_init(mstream->istream.parent,
 						  NULL, 0);
+		message_parse_header_set_limit(mstream->hdr_ctx,
+					       mstream->max_header_block_size);
 	}
 
 	/* remove skipped data from hdr_buf */
 	hdr_buf_realloc_if_needed(mstream);
-	buffer_copy(mstream->hdr_buf, 0,
-		    mstream->hdr_buf, mstream->istream.skip, SIZE_MAX);
+	buffer_copy(mstream->hdr_buf->buf, 0,
+		    mstream->hdr_buf->buf, mstream->istream.skip, SIZE_MAX);
 
         mstream->istream.pos -= mstream->istream.skip;
 	mstream->istream.skip = 0;
-	buffer_set_used_size(mstream->hdr_buf, mstream->istream.pos);
+	buffer_set_used_size(mstream->hdr_buf->buf, mstream->istream.pos);
 
 	if (mstream->header_read) {
 		i_assert(mstream->istream.skip == 0);
@@ -218,7 +239,7 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 	}
 
 	max_buffer_size = i_stream_get_max_buffer_size(&mstream->istream.istream);
-	if (mstream->hdr_buf->used >= max_buffer_size) {
+	if (mstream->hdr_buf->buf->used >= max_buffer_size) {
 		i_assert(max_buffer_size > 0);
 		return -2;
 	}
@@ -298,20 +319,20 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 			/* ignore */
 		} else {
 			if (!hdr->continued) {
-				buffer_append(mstream->hdr_buf,
+				buffer_append(mstream->hdr_buf->buf,
 					      hdr->name, hdr->name_len);
-				buffer_append(mstream->hdr_buf,
+				buffer_append(mstream->hdr_buf->buf,
 					      hdr->middle, hdr->middle_len);
 			}
-			buffer_append(mstream->hdr_buf,
+			buffer_append(mstream->hdr_buf->buf,
 				      hdr->value, hdr->value_len);
 			if (!hdr->no_newline)
 				add_eol(mstream, hdr->crlf_newline);
 
-			if (mstream->skip_count >= mstream->hdr_buf->used) {
+			if (mstream->skip_count >= mstream->hdr_buf->buf->used) {
 				/* we need more */
-				mstream->skip_count -= mstream->hdr_buf->used;
-				buffer_set_used_size(mstream->hdr_buf, 0);
+				mstream->skip_count -= mstream->hdr_buf->buf->used;
+				buffer_set_used_size(mstream->hdr_buf->buf, 0);
 			} else {
 				if (mstream->skip_count > 0) {
 					mstream->istream.skip =
@@ -321,13 +342,13 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 				break;
 			}
 		}
-		if (mstream->hdr_buf->used >= max_buffer_size)
+		if (mstream->hdr_buf->buf->used >= max_buffer_size)
 			break;
 	}
-	if (mstream->hdr_buf->used > 0) {
-		const unsigned char *data = mstream->hdr_buf->data;
+	if (mstream->hdr_buf->buf->used > 0) {
+		const unsigned char *data = mstream->hdr_buf->buf->data;
 		mstream->last_added_newline =
-			data[mstream->hdr_buf->used-1] == '\n';
+			data[mstream->hdr_buf->buf->used-1] == '\n';
 	}
 
 	if (hdr_ret < 0) {
@@ -449,17 +470,17 @@ handle_end_body_with_lf(struct header_filter_istream *mstream, ssize_t ret)
 		i_assert(size == 0 || data[size-1] != '\n');
 
 		hdr_buf_realloc_if_needed(mstream);
-		buffer_set_used_size(mstream->hdr_buf, 0);
-		buffer_append(mstream->hdr_buf, data, size);
+		buffer_set_used_size(mstream->hdr_buf->buf, 0);
+		buffer_append(mstream->hdr_buf->buf, data, size);
 		if (mstream->crlf)
-			buffer_append_c(mstream->hdr_buf, '\r');
-		buffer_append_c(mstream->hdr_buf, '\n');
+			buffer_append_c(mstream->hdr_buf->buf, '\r');
+		buffer_append_c(mstream->hdr_buf->buf, '\n');
 		mstream->last_lf_offset = last_offset;
 		mstream->last_lf_added = TRUE;
 
 		stream->skip = 0;
-		stream->pos = mstream->hdr_buf->used;
-		stream->buffer = mstream->hdr_buf->data;
+		stream->pos = mstream->hdr_buf->buf->used;
+		stream->buffer = mstream->hdr_buf->buf->data;
 		return mstream->crlf ? 2 : 1;
 	} else {
 		mstream->last_lf_offset = last_lf ? last_offset : UOFF_T_MAX;
@@ -470,7 +491,7 @@ handle_end_body_with_lf(struct header_filter_istream *mstream, ssize_t ret)
 static ssize_t i_stream_header_filter_read(struct istream_private *stream)
 {
 	struct header_filter_istream *mstream =
-		(struct header_filter_istream *)stream;
+		container_of(stream, struct header_filter_istream, istream);
 	uoff_t v_offset;
 	ssize_t ret;
 
@@ -547,14 +568,14 @@ stream_reset_to(struct header_filter_istream *mstream, uoff_t v_offset)
 	mstream->istream.istream.v_offset = v_offset;
 	mstream->istream.skip = mstream->istream.pos = 0;
 	mstream->istream.buffer = NULL;
-	buffer_set_used_size(mstream->hdr_buf, 0);
+	buffer_set_used_size(mstream->hdr_buf->buf, 0);
 }
 
 static void i_stream_header_filter_seek(struct istream_private *stream,
 					uoff_t v_offset, bool mark ATTR_UNUSED)
 {
 	struct header_filter_istream *mstream =
-		(struct header_filter_istream *)stream;
+		container_of(stream, struct header_filter_istream, istream);
 
 	if (stream->istream.v_offset == v_offset) {
 		/* just reset the input buffer */
@@ -604,7 +625,7 @@ static int
 i_stream_header_filter_stat(struct istream_private *stream, bool exact)
 {
 	struct header_filter_istream *mstream =
-		(struct header_filter_istream *)stream;
+		container_of(stream, struct header_filter_istream, istream);
 	const struct stat *st;
 	uoff_t old_offset;
 
@@ -659,12 +680,11 @@ i_stream_header_filter_snapshot_free(struct istream_snapshot *_snapshot)
 	struct header_filter_istream_snapshot *snapshot =
 		container_of(_snapshot, struct header_filter_istream_snapshot, snapshot);
 
-	if (snapshot->mstream->hdr_buf != snapshot->hdr_buf)
-		buffer_free(&snapshot->hdr_buf);
-	else {
-		i_assert(snapshot->mstream->snapshot_pending);
-		snapshot->mstream->snapshot_pending = FALSE;
+	if (snapshot->mstream->hdr_buf == snapshot->hdr_buf) {
+		i_assert(snapshot->mstream->snapshot_pending_refcount > 0);
+		snapshot->mstream->snapshot_pending_refcount--;
 	}
+	ref_buffer_unref(&snapshot->hdr_buf);
 	i_free(snapshot);
 }
 
@@ -673,10 +693,10 @@ i_stream_header_filter_snapshot(struct istream_private *stream,
 				struct istream_snapshot *prev_snapshot)
 {
 	struct header_filter_istream *mstream =
-		(struct header_filter_istream *)stream;
+		container_of(stream, struct header_filter_istream, istream);
 	struct header_filter_istream_snapshot *snapshot;
 
-	if (stream->buffer != mstream->hdr_buf->data) {
+	if (stream->buffer != mstream->hdr_buf->buf->data) {
 		/* reading body */
 		return i_stream_default_snapshot(stream, prev_snapshot);
 	}
@@ -685,9 +705,10 @@ i_stream_header_filter_snapshot(struct istream_private *stream,
 	snapshot = i_new(struct header_filter_istream_snapshot, 1);
 	snapshot->mstream = mstream;
 	snapshot->hdr_buf = mstream->hdr_buf;
+	snapshot->hdr_buf->refcount++;
 	snapshot->snapshot.free = i_stream_header_filter_snapshot_free;
 	snapshot->snapshot.prev_snapshot = prev_snapshot;
-	mstream->snapshot_pending = TRUE;
+	mstream->snapshot_pending_refcount++;
 	return &snapshot->snapshot;
 }
 
@@ -709,6 +730,9 @@ i_stream_create_header_filter(struct istream *input,
 	mstream->pool = pool_alloconly_create(MEMPOOL_GROWING
 					      "header filter stream", 256);
 	mstream->istream.max_buffer_size = input->real_stream->max_buffer_size;
+	/* Default to no per-header block size limit. Callers that want one
+	   call i_stream_header_filter_set_max_header_block_size(). */
+	mstream->max_header_block_size = SIZE_MAX;
 
 	mstream->headers = headers_count == 0 ? NULL :
 		p_new(mstream->pool, const char *, headers_count);
@@ -723,7 +747,9 @@ i_stream_create_header_filter(struct istream *input,
 		mstream->headers[j++] = p_strdup(mstream->pool, headers[i]);
 	}
 	mstream->headers_count = j;
-	mstream->hdr_buf = buffer_create_dynamic(default_pool, 1024);
+	mstream->hdr_buf = i_new(struct ref_buffer, 1);
+	mstream->hdr_buf->refcount = 1;
+	mstream->hdr_buf->buf = buffer_create_dynamic(default_pool, 1024);
 
 	mstream->callback = callback;
 	mstream->context = context;
@@ -752,13 +778,28 @@ i_stream_create_header_filter(struct istream *input,
 	mstream->istream.istream.blocking = input->blocking;
 	mstream->istream.istream.seekable = input->seekable;
 
-	return i_stream_create(&mstream->istream, input, -1, 0);
+	return i_stream_create(&mstream->istream, input, -1,
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }
 
 void i_stream_header_filter_add(struct header_filter_istream *input,
 				const void *data, size_t size)
 {
 	hdr_buf_realloc_if_needed(input);
-	buffer_append(input->hdr_buf, data, size);
+	buffer_append(input->hdr_buf->buf, data, size);
 	input->headers_edited = TRUE;
+}
+
+void i_stream_header_filter_set_max_header_block_size(
+	struct istream *input, size_t max_header_block_size)
+{
+	struct header_filter_istream *mstream =
+		container_of(input->real_stream, struct header_filter_istream,
+			     istream);
+
+	mstream->max_header_block_size = max_header_block_size;
+	if (mstream->hdr_ctx != NULL) {
+		message_parse_header_set_limit(mstream->hdr_ctx,
+					       max_header_block_size);
+	}
 }

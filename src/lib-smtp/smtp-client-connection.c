@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -269,7 +269,7 @@ void smtp_client_connection_cork(struct smtp_client_connection *conn)
 void smtp_client_connection_uncork(struct smtp_client_connection *conn)
 {
 	conn->corked = FALSE;
-	if (conn->conn.output != NULL) {
+	if (!conn->conn.output->closed) {
 		if (o_stream_uncork_flush(conn->conn.output) < 0) {
 			smtp_client_connection_handle_output_error(conn);
 			return;
@@ -323,8 +323,9 @@ void smtp_client_connection_start_cmd_timeout(
 
 	e_debug(conn->event, "Start timeout");
 	if (conn->to_commands == NULL) {
-		conn->to_commands = timeout_add(
-			msecs, smtp_client_command_timeout, conn);
+		conn->to_commands = timeout_add_to(
+			conn->conn.ioloop, msecs,
+			smtp_client_command_timeout, conn);
 	}
 }
 
@@ -397,8 +398,9 @@ void smtp_client_connection_fail(struct smtp_client_connection *conn,
 
 	if (status == SMTP_CLIENT_COMMAND_ERROR_CONNECT_FAILED &&
 	    !smtp_client_connection_last_ip(conn)) {
-		conn->to_connect = timeout_add_short(
-			0, smtp_client_connection_connect_next_ip, conn);
+		conn->to_connect = timeout_add_to(
+			conn->conn.ioloop, 0,
+			smtp_client_connection_connect_next_ip, conn);
 		return;
 	}
 
@@ -443,7 +445,10 @@ smtp_client_connection_lost(struct smtp_client_connection *conn,
 			error = t_strdup_printf(
 				"Connection lost (last SSL error: %s)", sslerr);
 		}
-		if (ssl_iostream_has_handshake_failed(conn->ssl_iostream)) {
+		enum ssl_iostream_state state =
+			ssl_iostream_get_state(conn->ssl_iostream);
+		if (state == SSL_IOSTREAM_STATE_INVALID_CERT ||
+		    state == SSL_IOSTREAM_STATE_NAME_MISMATCH) {
 			/* This isn't really a "connection lost", but that we
 			   don't trust the remote's SSL certificate. */
 			i_assert(error != NULL);
@@ -715,6 +720,31 @@ void smtp_client_connection_send_xclient(struct smtp_client_connection *conn)
 						   "ADDR", addr);
 	}
 
+	/* DESTPORT */
+	if (xclient->dest_port != 0 &&
+	    str_array_icase_find(xclient_args, "DESTPORT")) {
+		smtp_client_connection_xclient_addf(conn, str, offset,
+						    "DESTPORT", "%u",
+						    xclient->dest_port);
+	}
+
+	/* DESTADDR */
+	if (xclient->dest_ip.family != 0 &&
+	    str_array_icase_find(xclient_args, "DESTADDR")) {
+		const char *addr = net_ip2addr(&xclient->dest_ip);
+
+		/* Older versions of Dovecot LMTP don't quite follow Postfix'
+		   specification of the XCLIENT command regarding IPv6
+		   addresses: the "IPV6:" prefix is omitted. For now, we
+		   maintain this deviation for LMTP. Newer versions of Dovecot
+		   LMTP can work with or without the prefix. */
+		if (conn->protocol != SMTP_PROTOCOL_LMTP &&
+			xclient->dest_ip.family == AF_INET6)
+			addr = t_strconcat("IPV6:", addr, NULL);
+		smtp_client_connection_xclient_add(conn, str, offset,
+						   "DESTADDR", addr);
+	}
+
 	/* final XCLIENT command */
 	if (str_len(str) > offset)
 		smtp_client_connection_xclient_submit(conn, str_c(str));
@@ -798,11 +828,11 @@ smtp_client_connection_auth_cb(const struct smtp_reply *reply,
 				reply->text_lines[0]);
 		} else if (dsasl_client_input(conn->sasl_client,
 					      buf->data, buf->used,
-					      &error) < 0) {
+					      &error) != DSASL_CLIENT_RESULT_OK) {
 			error = t_strdup_printf("Authentication failed: %s",
 						error);
 		} else if (dsasl_client_output(conn->sasl_client, &sasl_output,
-					       &sasl_output_len, &error) < 0) {
+					       &sasl_output_len, &error) != DSASL_CLIENT_RESULT_OK) {
 			error = t_strdup_printf("Authentication failed: %s",
 						error);
 		} else {
@@ -813,7 +843,7 @@ smtp_client_connection_auth_cb(const struct smtp_reply *reply,
 			cmd = smtp_client_command_new(
 				conn, SMTP_CLIENT_COMMAND_FLAG_PRELOGIN,
 				smtp_client_connection_auth_cb, conn);
-			smtp_client_command_write(cmd, conn->sasl_ir);
+			smtp_client_command_write(cmd, str_c(smtp_output));
 			smtp_client_command_submit_after(cmd, cmd_auth);
 			conn->cmd_auth = cmd;
 			return;
@@ -940,6 +970,7 @@ smtp_client_connection_authenticate(struct smtp_client_connection *conn)
 	}
 
 	i_zero(&sasl_set);
+	sasl_set.event_parent = conn->event;
 	if (set->master_user == NULL)
 		sasl_set.authid = set->username;
 	else {
@@ -947,11 +978,14 @@ smtp_client_connection_authenticate(struct smtp_client_connection *conn)
 		sasl_set.authzid = set->username;
 	}
 	sasl_set.password = set->password;
+	sasl_set.protocol = "smtp";
+	sasl_set.host = conn->host;
+	sasl_set.port = conn->port;
 
 	conn->sasl_client = dsasl_client_new(sasl_mech, &sasl_set);
 
 	if (dsasl_client_output(conn->sasl_client, &sasl_output,
-				&sasl_output_len, &error) < 0) {
+				&sasl_output_len, &error) != DSASL_CLIENT_RESULT_OK) {
 		error = t_strdup_printf(
 			"Failed to create initial %s SASL reply: %s",
 			dsasl_client_mech_get_name(sasl_mech), error);
@@ -1319,7 +1353,7 @@ smtp_client_connection_input_reply(struct smtp_client_connection *conn,
 	ret = smtp_client_command_input_reply(conn->cmd_wait_list_head, reply);
 
 	if (conn->state == SMTP_CLIENT_CONNECTION_STATE_DISCONNECTED ||
-	    conn->conn.output == NULL)
+	    conn->conn.output->closed)
 		return -1;
 	return ret;
 }
@@ -1429,7 +1463,7 @@ static void smtp_client_connection_input(struct connection *_conn)
 				error);
 		}
 	}
-	if (ret >= 0 && conn->conn.output != NULL && !conn->corked) {
+	if (ret >= 0 && !conn->conn.output->closed && !conn->corked) {
 		if (o_stream_uncork_flush(conn->conn.output) < 0)
 			smtp_client_connection_handle_output_error(conn);
 	}
@@ -1454,7 +1488,7 @@ static int smtp_client_connection_output(struct smtp_client_connection *conn)
 	o_stream_cork(conn->conn.output);
 	if (smtp_client_command_send_more(conn) < 0)
 		ret = -1;
-	if (ret >= 0 && conn->conn.output != NULL && !conn->corked) {
+	if (ret >= 0 && !conn->conn.output->closed && !conn->corked) {
 		if (o_stream_uncork_flush(conn->conn.output) < 0)
 			smtp_client_connection_handle_output_error(conn);
 	}
@@ -1527,23 +1561,26 @@ smtp_client_connection_established(struct smtp_client_connection *conn)
 		smtp_client_connection_output, conn);
 }
 
-static int
+static enum ssl_iostream_state
 smtp_client_connection_ssl_handshaked(const char **error_r, void *context)
 {
 	struct smtp_client_connection *conn = context;
 	const char *error, *host = conn->host;
+	enum ssl_iostream_cert_validity validity =
+		ssl_iostream_check_cert_validity(conn->ssl_iostream, host, &error);
 
-	if (ssl_iostream_check_cert_validity(conn->ssl_iostream,
-					     host, &error) == 0) {
+	if (validity == SSL_IOSTREAM_CERT_VALIDITY_OK) {
 		e_debug(conn->event, "SSL handshake successful");
 	} else if (ssl_iostream_get_allow_invalid_cert(conn->ssl_iostream)) {
 		e_debug(conn->event, "SSL handshake successful, "
 			"ignoring invalid certificate: %s", error);
 	} else {
 		*error_r = error;
-		return -1;
+		return validity == SSL_IOSTREAM_CERT_VALIDITY_NAME_MISMATCH ?
+			SSL_IOSTREAM_STATE_NAME_MISMATCH :
+			SSL_IOSTREAM_STATE_INVALID_CERT;
 	}
-	return 0;
+	return SSL_IOSTREAM_STATE_OK;
 }
 
 static void
@@ -1553,7 +1590,9 @@ smtp_client_connection_streams_changed(struct smtp_client_connection *conn)
 
 	if (conn->set.rawlog_dir != NULL &&
 	    stat(conn->set.rawlog_dir, &st) == 0) {
-		iostream_rawlog_create(conn->set.rawlog_dir,
+		/* FIXME: we don't know the setting name here */
+		iostream_rawlog_create(conn->event, "smtp client rawlog",
+				       conn->set.rawlog_dir,
 				       &conn->conn.input, &conn->conn.output);
 	}
 
@@ -1779,8 +1818,9 @@ smtp_client_connection_do_connect(struct smtp_client_connection *conn)
 	msecs = conn->set.connect_timeout_msecs;
 	i_assert(conn->to_connect == NULL);
 	if (msecs > 0) {
-		conn->to_connect = timeout_add(
-			msecs, smtp_client_connection_connect_timeout, conn);
+		conn->to_connect = timeout_add_to(
+			conn->conn.ioloop, msecs,
+			smtp_client_connection_connect_timeout, conn);
 	}
 }
 
@@ -1854,8 +1894,9 @@ smtp_client_connection_dns_callback(const struct dns_lookup_result *result,
 		e_error(conn->event, "dns_lookup(%s) failed: %s",
 			conn->host, result->error);
 		timeout_remove(&conn->to_connect);
-		conn->to_connect = timeout_add_short(
-			0, smtp_client_connection_delayed_host_lookup_failure,
+		conn->to_connect = timeout_add_to(
+			conn->conn.ioloop, 0,
+			smtp_client_connection_delayed_host_lookup_failure,
 			conn);
 		return;
 	}
@@ -1882,15 +1923,21 @@ smtp_client_connection_lookup_ip(struct smtp_client_connection *conn)
 
 	if (conn->set.dns_client != NULL) {
 		e_debug(conn->event, "Performing asynchronous DNS lookup");
-		(void)dns_client_lookup(
+		dns_client_lookup(
 			conn->set.dns_client, conn->host,
 			conn->event,
 			smtp_client_connection_dns_callback, conn,
 			&conn->dns_lookup);
+		dns_client_switch_ioloop_to(conn->set.dns_client,
+					    conn->conn.ioloop);
 	} else {
 		e_debug(conn->event, "Performing asynchronous DNS lookup");
 
-		(void)dns_lookup(conn->host, NULL, conn->event,
+		const struct dns_client_parameters dns_params = {
+			.ioloop = conn->conn.ioloop,
+		};
+
+		dns_lookup(conn->host, &dns_params, conn->event,
 				 smtp_client_connection_dns_callback, conn,
 				 &conn->dns_lookup);
 	}
@@ -1931,8 +1978,9 @@ smtp_client_connection_connect_more(struct smtp_client_connection *conn)
 
 	/* Schedule immediate login callback */
 	i_assert(conn->to_connect == NULL);
-	conn->to_connect = timeout_add(
-		0, smtp_client_connection_already_connected, conn);
+	conn->to_connect = timeout_add_short_to(
+		conn->conn.ioloop, 0,
+		smtp_client_connection_already_connected, conn);
 }
 
 void smtp_client_connection_connect(
@@ -1982,13 +2030,15 @@ void smtp_client_connection_connect(
 
 		/* always work asynchronously */
 		timeout_remove(&conn->to_connect);
-		conn->to_connect = timeout_add(
-			0, smtp_client_connection_connect_next_ip, conn);
+		conn->to_connect = timeout_add_short_to(
+			conn->conn.ioloop, 0,
+			smtp_client_connection_connect_next_ip, conn);
 	} else {
 		/* always work asynchronously */
 		timeout_remove(&conn->to_connect);
-		conn->to_connect = timeout_add(
-			0, smtp_client_connection_connect_unix, conn);
+		conn->to_connect = timeout_add_short_to(
+			conn->conn.ioloop, 0,
+			smtp_client_connection_connect_unix, conn);
 	}
 }
 
@@ -2365,8 +2415,15 @@ void smtp_client_connection_close(struct smtp_client_connection **_conn)
 		return;
 	conn->closed = TRUE;
 
-	smtp_client_connection_transactions_abort(conn);
-	smtp_client_connection_commands_abort(conn);
+	if (!conn->failing) {
+		smtp_client_connection_transactions_abort(conn);
+		smtp_client_connection_commands_abort(conn);
+	} else {
+		/* Called from a callback of the connection failure handling,
+		   which is still iterating the transactions and the commands.
+		   Aborting them here would free them from under it. They are
+		   all failed by the failure handling anyway. */
+	}
 	smtp_client_connection_disconnect(conn);
 
 	/* could have been created while already disconnected */
@@ -2386,27 +2443,43 @@ void smtp_client_connection_update_proxy_data(
 	smtp_proxy_data_merge(conn->pool, &conn->set.proxy_data, proxy_data);
 }
 
-void smtp_client_connection_switch_ioloop(struct smtp_client_connection *conn)
+void smtp_client_connection_switch_ioloop_to(
+	struct smtp_client_connection *conn, struct ioloop *ioloop)
 {
 	struct smtp_client_transaction *trans;
 
-	if (conn->io_cmd_payload != NULL)
-		conn->io_cmd_payload = io_loop_move_io(&conn->io_cmd_payload);
-	if (conn->to_connect != NULL)
-		conn->to_connect = io_loop_move_timeout(&conn->to_connect);
-	if (conn->to_trans != NULL)
-		conn->to_trans = io_loop_move_timeout(&conn->to_trans);
-	if (conn->to_commands != NULL)
-		conn->to_commands = io_loop_move_timeout(&conn->to_commands);
-	if (conn->to_cmd_fail != NULL)
-		conn->to_cmd_fail = io_loop_move_timeout(&conn->to_cmd_fail);
-	connection_switch_ioloop(&conn->conn);
+	connection_switch_ioloop_to(&conn->conn, ioloop);
+	if (conn->io_cmd_payload != NULL) {
+		conn->io_cmd_payload =
+			io_loop_move_io_to(ioloop, &conn->io_cmd_payload);
+	}
+	if (conn->to_connect != NULL) {
+		conn->to_connect =
+			io_loop_move_timeout_to(ioloop, &conn->to_connect);
+	}
+	if (conn->to_trans != NULL) {
+		conn->to_trans =
+			io_loop_move_timeout_to(ioloop, &conn->to_trans);
+	}
+	if (conn->to_commands != NULL) {
+		conn->to_commands =
+			io_loop_move_timeout_to(ioloop, &conn->to_commands);
+	}
+	if (conn->to_cmd_fail != NULL) {
+		conn->to_cmd_fail =
+			io_loop_move_timeout_to(ioloop, &conn->to_cmd_fail);
+	}
 
 	trans = conn->transactions_head;
 	while (trans != NULL) {
 		smtp_client_transaction_switch_ioloop(trans);
 		trans = trans->next;
 	}
+}
+
+void smtp_client_connection_switch_ioloop(struct smtp_client_connection *conn)
+{
+	smtp_client_connection_switch_ioloop_to(conn, current_ioloop);
 }
 
 static void
@@ -2466,8 +2539,9 @@ smtp_client_connection_start_transaction(struct smtp_client_connection *conn)
 
 	smtp_client_connection_set_state(
 		conn, SMTP_CLIENT_CONNECTION_STATE_TRANSACTION);
-	conn->to_trans = timeout_add_short(
-		0, smtp_client_connection_do_start_transaction, conn);
+	conn->to_trans = timeout_add_short_to(
+		conn->conn.ioloop, 0,
+		smtp_client_connection_do_start_transaction, conn);
 }
 
 void smtp_client_connection_add_transaction(

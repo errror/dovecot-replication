@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -462,8 +462,9 @@ static int driver_mysql_do_query(struct mysql_db *db, const char *query,
 	return -1;
 }
 
-static const char *
-driver_mysql_escape_string(struct sql_db *_db, const char *string)
+static int
+driver_mysql_escape_string(struct sql_db *_db, const char *string,
+			   const char **output_r, const char **error_r)
 {
 	struct mysql_db *db = container_of(_db, struct mysql_db, api);
 	size_t len = strlen(string);
@@ -475,22 +476,15 @@ driver_mysql_escape_string(struct sql_db *_db, const char *string)
 	}
 
 	if (_db->state == SQL_DB_STATE_DISCONNECTED) {
-		/* FIXME: we don't have a valid connection, so fallback
-		   to using default escaping. the next query will most
-		   likely fail anyway so it shouldn't matter that much
-		   what we return here.. Anyway, this API needs
-		   changing so that the escaping function could already
-		   fail the query reliably. */
-		to = t_buffer_get(len * 2 + 1);
-		len = mysql_escape_string(to, string, len);
-		t_buffer_alloc(len + 1);
-		return to;
+		*error_r = SQL_ERRSTR_NOT_CONNECTED;
+		return -1;
 	}
 
 	to = t_buffer_get(len * 2 + 1);
 	len = mysql_real_escape_string(db->mysql, to, string, len);
 	t_buffer_alloc(len + 1);
-	return to;
+	*output_r = to;
+	return 0;
 }
 
 static void driver_mysql_exec(struct sql_db *_db, const char *query)
@@ -501,18 +495,6 @@ static void driver_mysql_exec(struct sql_db *_db, const char *query)
 	(void)driver_mysql_do_query(db, query, event);
 
 	event_unref(&event);
-}
-
-static void driver_mysql_query(struct sql_db *db, const char *query,
-			       sql_query_callback_t *callback, void *context)
-{
-	struct sql_result *result;
-
-	result = sql_query_s(db, query);
-	result->callback = TRUE;
-	callback(result, context);
-	result->callback = FALSE;
-	sql_result_unref(result);
 }
 
 static struct sql_result *
@@ -718,19 +700,6 @@ driver_mysql_transaction_begin(struct sql_db *db)
 	return &ctx->ctx;
 }
 
-static void
-driver_mysql_transaction_commit(struct sql_transaction_context *ctx,
-				sql_commit_callback_t *callback, void *context)
-{
-	struct sql_commit_result result;
-	const char *error;
-
-	i_zero(&result);
-	if (sql_transaction_commit_s(&ctx, &error) < 0)
-		result.error = error;
-	callback(&result, context);
-}
-
 static int ATTR_NULL(3)
 transaction_send_query(struct mysql_transaction_context *ctx, const char *query,
 		       unsigned int *affected_rows_r)
@@ -887,11 +856,9 @@ const struct sql_db driver_mysql_db = {
 		.disconnect = driver_mysql_disconnect,
 		.escape_string = driver_mysql_escape_string,
 		.exec = driver_mysql_exec,
-		.query = driver_mysql_query,
 		.query_s = driver_mysql_query_s,
 
 		.transaction_begin = driver_mysql_transaction_begin,
-		.transaction_commit = driver_mysql_transaction_commit,
 		.transaction_commit_s = driver_mysql_transaction_commit_s,
 		.transaction_rollback = driver_mysql_transaction_rollback,
 
@@ -942,6 +909,9 @@ void driver_mysql_init(void)
 void driver_mysql_deinit(void)
 {
 	struct mysql_db_cache *cache;
+
+	if (!array_is_created(&mysql_db_cache))
+		return;
 
 	array_foreach_modifiable(&mysql_db_cache, cache) {
 		settings_free(cache->set);

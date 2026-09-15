@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 
@@ -25,7 +25,8 @@ struct lz4_istream {
 static void i_stream_lz4_close(struct iostream_private *stream,
 			       bool close_parent)
 {
-	struct lz4_istream *zstream = (struct lz4_istream *)stream;
+	struct lz4_istream *zstream =
+		container_of(stream, struct lz4_istream, istream.iostream);
 
 	buffer_free(&zstream->chunk_buf);
 	if (close_parent)
@@ -42,17 +43,19 @@ static void lz4_read_error(struct lz4_istream *zstream, const char *error)
 
 static int i_stream_lz4_read_header(struct lz4_istream *zstream)
 {
+	struct istream_private *stream = &zstream->istream;
 	const struct iostream_lz4_header *hdr;
 	const unsigned char *data;
 	size_t size;
 	int ret;
 
-	ret = i_stream_read_bytes(zstream->istream.parent, &data,
-				  &size, sizeof(*hdr));
-	size = I_MIN(size, sizeof(*hdr));
+	i_assert(zstream->chunk_buf->used <= sizeof(*hdr));
+	size_t wanted = sizeof(*hdr) - zstream->chunk_buf->used;
+	ret = i_stream_read_bytes(stream->parent, &data, &size, wanted);
+	size = I_MIN(size, wanted);
 	buffer_append(zstream->chunk_buf, data, size);
 	i_stream_skip(zstream->istream.parent, size);
-	if (ret < 0 || (ret == 0 && zstream->istream.istream.eof)) {
+	if (ret < 0) {
 		i_assert(ret != -2);
 		if (zstream->istream.istream.stream_errno == 0) {
 			lz4_read_error(zstream, "missing header (not lz4 file?)");
@@ -77,9 +80,10 @@ static int i_stream_lz4_read_header(struct lz4_istream *zstream)
 	zstream->max_uncompressed_chunk_size =
 		be32_to_cpu_unaligned(hdr->max_uncompressed_chunk_size);
 	buffer_set_used_size(zstream->chunk_buf, 0);
-	if (zstream->max_uncompressed_chunk_size > ISTREAM_LZ4_CHUNK_SIZE) {
+	if (zstream->max_uncompressed_chunk_size  == 0 ||
+	    zstream->max_uncompressed_chunk_size > ISTREAM_LZ4_CHUNK_SIZE) {
 		lz4_read_error(zstream, t_strdup_printf(
-			"lz4 max chunk size too large (%u > %u)",
+			"invalid lz4 max chunk size (%u, max %u)",
 			zstream->max_uncompressed_chunk_size,
 			ISTREAM_LZ4_CHUNK_SIZE));
 		zstream->istream.istream.stream_errno = EINVAL;
@@ -96,8 +100,9 @@ static int i_stream_lz4_read_chunk_header(struct lz4_istream *zstream)
 	struct istream_private *stream = &zstream->istream;
 
 	i_assert(zstream->chunk_buf->used <= IOSTREAM_LZ4_CHUNK_PREFIX_LEN);
-	ret = i_stream_read_more(stream->parent, &data, &size);
-	size = I_MIN(size, IOSTREAM_LZ4_CHUNK_PREFIX_LEN - zstream->chunk_buf->used);
+	size_t wanted = IOSTREAM_LZ4_CHUNK_PREFIX_LEN - zstream->chunk_buf->used;
+	ret = i_stream_read_bytes(stream->parent, &data, &size, wanted);
+	size = I_MIN(size, wanted);
 	buffer_append(zstream->chunk_buf, data, size);
 	i_stream_skip(stream->parent, size);
 	if (ret < 0) {
@@ -131,7 +136,8 @@ static int i_stream_lz4_read_chunk_header(struct lz4_istream *zstream)
 
 static ssize_t i_stream_lz4_read(struct istream_private *stream)
 {
-	struct lz4_istream *zstream = (struct lz4_istream *)stream;
+	struct lz4_istream *zstream =
+		container_of(stream, struct lz4_istream, istream);
 	const unsigned char *data;
 	size_t size;
 	int ret;
@@ -141,73 +147,86 @@ static ssize_t i_stream_lz4_read(struct istream_private *stream)
 		return -2;
 
 	if (!zstream->header_read) {
-		if ((ret = i_stream_lz4_read_header(zstream)) <= 0) {
-			stream->istream.eof = TRUE;
-			return ret;
-		}
-		zstream->header_read = TRUE;
-	}
-
-	if (zstream->chunk_left == 0) {
-		while ((ret = i_stream_lz4_read_chunk_header(zstream)) == 0) {
+		while ((ret = i_stream_lz4_read_header(zstream)) == 0) {
 			if (!stream->istream.blocking)
 				return 0;
 		}
 		if (ret < 0)
 			return ret;
+		zstream->header_read = TRUE;
 	}
 
-	/* read the whole compressed chunk into memory */
-	while (zstream->chunk_left > 0 &&
-	       (ret = i_stream_read_more(zstream->istream.parent, &data, &size)) > 0) {
-		if (size > zstream->chunk_left)
-			size = zstream->chunk_left;
-		buffer_append(zstream->chunk_buf, data, size);
-		i_stream_skip(zstream->istream.parent, size);
-		zstream->chunk_left -= size;
-	}
-	if (zstream->chunk_left > 0) {
-		if (ret == -1 && zstream->istream.parent->stream_errno == 0) {
-			lz4_read_error(zstream, "truncated lz4 chunk");
-			stream->istream.stream_errno = EPIPE;
-			return -1;
+	/* Loop over chunks instead of recursing on zero-output chunks: a
+	   crafted stream can contain an unbounded number of chunks that each
+	   decompress to zero bytes, and tail-call recursion (which is not
+	   guaranteed) would let that exhaust the stack. */
+	for (;;) {
+		if (zstream->chunk_left == 0) {
+			while ((ret = i_stream_lz4_read_chunk_header(zstream)) == 0) {
+				if (!stream->istream.blocking)
+					return 0;
+			}
+			if (ret < 0)
+				return ret;
 		}
-		zstream->istream.istream.stream_errno =
-			zstream->istream.parent->stream_errno;
-		i_assert(ret != 0 || !stream->istream.blocking);
+
+		/* read the whole compressed chunk into memory */
+		while (zstream->chunk_left > 0 &&
+		       (ret = i_stream_read_more(zstream->istream.parent, &data, &size)) > 0) {
+			if (size > zstream->chunk_left)
+				size = zstream->chunk_left;
+			buffer_append(zstream->chunk_buf, data, size);
+			i_stream_skip(zstream->istream.parent, size);
+			zstream->chunk_left -= size;
+		}
+		if (zstream->chunk_left > 0) {
+			if (ret == -1 && zstream->istream.parent->stream_errno == 0) {
+				lz4_read_error(zstream, "truncated lz4 chunk");
+				stream->istream.stream_errno = EPIPE;
+				return -1;
+			}
+			zstream->istream.istream.stream_errno =
+				zstream->istream.parent->stream_errno;
+			i_assert(ret != 0 || !stream->istream.blocking);
+			return ret;
+		}
+		/* if we already have max_buffer_size amount of data, fail here */
+		if (stream->pos - stream->skip >= i_stream_get_max_buffer_size(&stream->istream))
+			return -2;
+		if (i_stream_get_data_size(zstream->istream.parent) > 0) {
+			/* Parent stream was only partially consumed. Set the
+			   stream's IO as pending to avoid hangs. */
+			i_stream_set_input_pending(&zstream->istream.istream, TRUE);
+		}
+		/* allocate enough space for the old data and the new
+		   decompressed chunk. we don't know the original compressed size,
+		   so just allocate the max amount of memory. */
+		void *dest = i_stream_alloc(stream, zstream->max_uncompressed_chunk_size);
+		ret = LZ4_decompress_safe(zstream->chunk_buf->data, dest,
+					  zstream->chunk_buf->used,
+					  zstream->max_uncompressed_chunk_size);
+		i_assert(ret <= (int)zstream->max_uncompressed_chunk_size);
+		if (ret < 0) {
+			lz4_read_error(zstream, "corrupted lz4 chunk");
+			stream->istream.stream_errno = EINVAL;
+			return -1;
+		} else if (ret == 0) {
+			/* chunk decompressed to zero bytes; read the next chunk
+			   without recursing so the stack stays bounded. */
+			buffer_set_used_size(zstream->chunk_buf, 0);
+			continue;
+		}
+		i_assert(ret > 0);
+		stream->pos += ret;
+		i_assert(stream->pos <= stream->buffer_size);
+
+		/* we are going to get next chunk after this, so reset here
+		   so we can reuse the chunk buf for reading next buffer prefix */
+		if (zstream->chunk_left == 0)
+			buffer_set_used_size(zstream->chunk_buf, 0);
+
 		return ret;
 	}
-	/* if we already have max_buffer_size amount of data, fail here */
-	if (stream->pos - stream->skip >= i_stream_get_max_buffer_size(&stream->istream))
-		return -2;
-	if (i_stream_get_data_size(zstream->istream.parent) > 0) {
-		/* Parent stream was only partially consumed. Set the stream's
-		   IO as pending to avoid hangs. */
-		i_stream_set_input_pending(&zstream->istream.istream, TRUE);
-	}
-	/* allocate enough space for the old data and the new
-	   decompressed chunk. we don't know the original compressed size,
-	   so just allocate the max amount of memory. */
-	void *dest = i_stream_alloc(stream, zstream->max_uncompressed_chunk_size);
-	ret = LZ4_decompress_safe(zstream->chunk_buf->data, dest,
-				  zstream->chunk_buf->used,
-				  zstream->max_uncompressed_chunk_size);
-	i_assert(ret <= (int)zstream->max_uncompressed_chunk_size);
-	if (ret < 0) {
-		lz4_read_error(zstream, "corrupted lz4 chunk");
-		stream->istream.stream_errno = EINVAL;
-		return -1;
-	}
-	i_assert(ret > 0);
-	stream->pos += ret;
-	i_assert(stream->pos <= stream->buffer_size);
-
-	/* we are going to get next chunk after this, so reset here
-	   so we can reuse the chunk buf for reading next buffer prefix */
-	if (zstream->chunk_left == 0)
-		buffer_set_used_size(zstream->chunk_buf, 0);
-
-	return ret;
 }
 
 static void i_stream_lz4_reset(struct lz4_istream *zstream)
@@ -227,7 +246,8 @@ static void i_stream_lz4_reset(struct lz4_istream *zstream)
 static void
 i_stream_lz4_seek(struct istream_private *stream, uoff_t v_offset, bool mark)
 {
-	struct lz4_istream *zstream = (struct lz4_istream *) stream;
+	struct lz4_istream *zstream =
+		container_of(stream, struct lz4_istream, istream);
 
 	if (i_stream_nonseekable_try_seek(stream, v_offset))
 		return;
@@ -243,7 +263,8 @@ i_stream_lz4_seek(struct istream_private *stream, uoff_t v_offset, bool mark)
 
 static void i_stream_lz4_sync(struct istream_private *stream)
 {
-	struct lz4_istream *zstream = (struct lz4_istream *) stream;
+	struct lz4_istream *zstream =
+		container_of(stream, struct lz4_istream, istream);
 	const struct stat *st;
 
 	if (i_stream_stat(stream->parent, FALSE, &st) == 0) {
@@ -276,6 +297,7 @@ struct istream *i_stream_create_lz4(struct istream *input)
 	zstream->chunk_buf = buffer_create_dynamic(default_pool, 1024);
 
 	return i_stream_create(&zstream->istream, input,
-			       i_stream_get_fd(input), 0);
+			       i_stream_get_fd(input),
+			       ISTREAM_HIDDEN_INPUTS_NONE, 0);
 }
 #endif

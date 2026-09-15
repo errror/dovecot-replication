@@ -1,11 +1,13 @@
-/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
-#include "time-util.h"
 #include "imap-common.h"
 #include "imap-quote.h"
+#include "imap-utf7.h"
 #include "ostream.h"
+#include "imap-feature.h"
+#include "imap-progress.h"
 #include "imap-storage-callbacks.h"
 
 static void notify_status(struct mailbox *mailbox ATTR_UNUSED,
@@ -50,70 +52,6 @@ static const char *find_cmd_tag(struct event *event)
 	       field->value.str : NULL;
 }
 
-const char *
-imap_storage_callback_line(const struct mail_storage_progress_details *dtl,
-			   const char *tag)
-{
-	const char *verb = dtl->verb;
-	unsigned int total = dtl->total;
-	unsigned int processed = dtl->processed;
-
-	if (verb == NULL || *verb == '\0')
-		verb = "Processed";
-
-	if (total > 0 && processed >= total)
-		processed = total - 1;
-
-	/* The "]" character is totally legit in command tags, but it is
-	   problematic inside IMAP resp-text-code(s), which are terminated
-	   with "]". If the caracter appears inside the tag, we avoid
-	   emitting the tag and replace it with NIL. */
-	bool has_tag = tag != NULL && *tag != '\0' && strchr(tag, ']') == NULL;
-
-	string_t *str = t_str_new(128);
-	str_append(str, "* OK [INPROGRESS");
-	if (has_tag || processed > 0 || total > 0) {
-		str_append(str, " (");
-		if (has_tag)
-			imap_append_quoted(str, tag);
-		else
-			str_append(str, "NIL");
-
-		if (processed > 0 || total > 0)
-			str_printfa(str, " %u", processed);
-		else
-			str_append(str, " NIL");
-
-		if (total > 0)
-			str_printfa(str, " %u", total);
-		else
-			str_append(str, " NIL");
-
-		str_append_c(str, ')');
-	}
-	str_append(str, "] ");
-
-	if (total > 0) {
-		float percentage = processed * 100.0 / total;
-		str_printfa(str, "%s %d%% of the mailbox", verb, (int)percentage);
-
-		long long elapsed_ms = timeval_diff_msecs(&dtl->now,
-							  &dtl->start_time);
-		if (percentage > 0 && elapsed_ms > 0) {
-			int eta_secs = elapsed_ms * (100 - percentage) /
-					    (1000 * percentage);
-
-			str_printfa(str, ", ETA %d:%02d",
-				    eta_secs / 60, eta_secs % 60);
-		}
-	} else if (processed > 0)
-		str_printfa(str, "%s %u item(s)", verb, processed);
-	else
-		str_append(str, "Hang in there..");
-
-	return str_c(str);
-}
-
 int imap_notify_progress(const struct mail_storage_progress_details *dtl,
 			 struct client *client)
 {
@@ -121,7 +59,7 @@ int imap_notify_progress(const struct mail_storage_progress_details *dtl,
 	T_BEGIN {
 		bool corked = o_stream_is_corked(client->output);
 		const char *tag = find_cmd_tag(event_get_global());
-		const char *line = imap_storage_callback_line(dtl, tag);
+		const char *line = imap_progress_line(dtl, tag);
 
 		client_send_line(client, line);
 		ret = o_stream_uncork_flush(client->output);
@@ -139,9 +77,75 @@ static void notify_progress(struct mailbox *mailbox ATTR_UNUSED,
 	(void)imap_notify_progress(dtl, client);
 }
 
+static const char *
+notify_mailbox_implicit_rename_line(struct client *client,
+				    struct mailbox *mailbox,
+				    const char *old_vname)
+{
+	string_t *str = t_str_new(256);
+	struct mail_namespace *ns = mailbox_get_namespace(mailbox);
+	char ns_sep = mail_namespace_get_sep(ns);
+	bool utf8 = client_has_enabled(client, imap_feature_utf8accept);
+	enum imap_quote_flags qflags = (utf8 ? IMAP_QUOTE_FLAG_UTF8 : 0);
+
+	str_append(str, "* LIST () \"");
+	if (ns_sep == '\\')
+		str_append_c(str, '\\');
+	str_append_c(str, ns_sep);
+	str_append(str, "\" ");
+
+	const char *vname = mailbox_get_vname(mailbox);
+	string_t *mutf7_vname = NULL;
+
+	if (!utf8) {
+		mutf7_vname = t_str_new(128);
+		if (imap_utf8_to_utf7(vname, mutf7_vname) < 0)
+			i_panic("Mailbox name not UTF-8: %s", vname);
+		vname = str_c(mutf7_vname);
+	}
+	imap_append_astring(str, vname, qflags);
+
+	if (old_vname != NULL) {
+		if (!utf8) {
+			str_truncate(mutf7_vname, 0);
+			if (imap_utf8_to_utf7(old_vname, mutf7_vname) < 0) {
+				i_panic("Mailbox name not UTF-8: %s",
+					old_vname);
+			}
+			old_vname = str_c(mutf7_vname);
+		}
+
+		str_append(str, " (\"OLDNAME\" (");
+		imap_append_astring(str, old_vname, qflags);
+		str_append(str, "))");
+	}
+
+	return str_c(str);
+}
+
+static void
+notify_mailbox_implicit_rename(struct mailbox *mailbox, const char *old_vname,
+			       void *context)
+{
+	struct client *client = context;
+
+	T_BEGIN {
+		bool corked = o_stream_is_corked(client->output);
+		const char *line =
+			notify_mailbox_implicit_rename_line(client, mailbox,
+							    old_vname);
+
+		client_send_line(client, line);
+		(void)o_stream_uncork_flush(client->output);
+		if (corked)
+			o_stream_cork(client->output);
+	} T_END;
+}
+
 struct mail_storage_callbacks imap_storage_callbacks = {
 	.notify_ok = notify_ok,
 	.notify_no = notify_no,
 	.notify_bad = notify_bad,
-	.notify_progress = notify_progress
+	.notify_progress = notify_progress,
+	.notify_mailbox_implicit_rename = notify_mailbox_implicit_rename,
 };

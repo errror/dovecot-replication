@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -26,8 +26,8 @@ struct mdbox_rebuild_msg {
 
 	guid_128_t guid_128;
 	uint32_t file_id;
-	uint32_t offset;
-	uint32_t rec_size;
+	uoff_t offset;
+	uoff_t rec_size;
 	uoff_t mail_size;
 	uint32_t map_uid;
 
@@ -64,6 +64,24 @@ struct mdbox_storage_rebuild_context {
 	bool have_pop3_orders:1;
 };
 
+/* Returns the mailbox list that the rebuild restores lost mails into, or NULL
+   if the storage has no namespace. */
+static struct mailbox_list *
+mdbox_rebuild_get_default_list(struct mdbox_storage *storage)
+{
+	struct mail_storage *_storage = &storage->storage.storage;
+	struct mailbox_list *list = NULL;
+	struct mail_namespace *ns;
+
+	for (ns = _storage->user->namespaces; ns != NULL; ns = ns->next) {
+		if (ns->storage == _storage && ns->alias_for == NULL &&
+		    (list == NULL ||
+		     HAS_ANY_BITS(ns->flags, NAMESPACE_FLAG_INBOX_ANY)))
+			list = ns->list;
+	}
+	return list;
+}
+
 static struct mdbox_storage_rebuild_context *
 mdbox_storage_rebuild_init(struct mdbox_storage *storage,
 			   struct mdbox_map_atomic_context *atomic)
@@ -75,6 +93,7 @@ mdbox_storage_rebuild_init(struct mdbox_storage *storage,
 	ctx = i_new(struct mdbox_storage_rebuild_context, 1);
 	ctx->storage = storage;
 	ctx->atomic = atomic;
+	ctx->default_list = mdbox_rebuild_get_default_list(storage);
 	ctx->pool = pool_alloconly_create("dbox map rebuild", 1024*256);
 	hash_table_create(&ctx->guid_hash, ctx->pool, 0,
 			  guid_128_hash, guid_128_cmp);
@@ -219,8 +238,8 @@ static int rebuild_file_mails(struct mdbox_storage_rebuild_context *ctx,
 		} else {
 			/* duplicate GUID, but not a duplicate message. */
 			e_error(event, "Duplicate GUID %s in "
-				"m.%u:%u (size=%"PRIuUOFF_T") and m.%u:%u "
-				"(size=%"PRIuUOFF_T")",
+				"m.%u:%"PRIuUOFF_T" (size=%"PRIuUOFF_T") and "
+				"m.%u:%"PRIuUOFF_T" (size=%"PRIuUOFF_T")",
 				guid, old_rec->file_id, old_rec->offset,
 				old_rec->mail_size, rec->file_id, rec->offset,
 				rec->mail_size);
@@ -558,8 +577,12 @@ rebuild_mailbox(struct mdbox_storage_rebuild_context *ctx,
 	enum mail_error error;
 	int ret;
 
+	/* The map is locked here, so the mailbox must not be autocreated:
+	   mailbox_create() locks the mailbox list, which must be locked before
+	   the map. */
 	box = mailbox_alloc(ns->list, vname, MAILBOX_FLAG_READONLY |
-			    MAILBOX_FLAG_IGNORE_ACLS);
+			    MAILBOX_FLAG_IGNORE_ACLS | MAILBOX_FLAG_RAW_NAME |
+			    MAILBOX_FLAG_NO_AUTOCREATE);
 	if (box->storage != &ctx->storage->storage.storage) {
 		/* the namespace has multiple storages. */
 		mailbox_free(&box);
@@ -567,6 +590,14 @@ rebuild_mailbox(struct mdbox_storage_rebuild_context *ctx,
 	}
 	if (mailbox_open(box) < 0) {
 		error = mailbox_get_last_mail_error(box);
+		if (error == MAIL_ERROR_NOTFOUND &&
+		    mailbox_is_autocreated(box)) {
+			/* The mailbox is listed, but it doesn't exist yet.
+			   It's created when it's next accessed outside the
+			   rebuild. There are no mails to scan in it. */
+			mailbox_free(&box);
+			return 0;
+		}
 		e_error(box->event, "Couldn't open mailbox: %s",
 			mailbox_get_last_internal_error(box, NULL));
 		mailbox_free(&box);
@@ -609,10 +640,6 @@ rebuild_namespace_mailboxes(struct mdbox_storage_rebuild_context *ctx,
 	struct mailbox_list_iterate_context *iter;
 	const struct mailbox_info *info;
 	int ret = 0;
-
-	if (ctx->default_list == NULL ||
-	    (ns->flags & NAMESPACE_FLAG_INBOX_ANY) != 0)
-		ctx->default_list = ns->list;
 
 	iter = mailbox_list_iter_init(ns->list, "*",
 				      MAILBOX_LIST_ITER_RAW_LIST |
@@ -915,7 +942,7 @@ static bool mdbox_mailbox_is_fscked(struct mailbox *box)
 
 static int
 mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx,
-				   struct mailbox *fsckd_box,
+				   struct mailbox *fscked_box,
 				   enum mdbox_rebuild_reason reason,
 				   const char **reason_string_r)
 {
@@ -946,9 +973,9 @@ mdbox_storage_rebuild_scan_prepare(struct mdbox_storage_rebuild_context *ctx,
 		   mdbox_map_is_fscked(ctx->storage->map))
 		*reason_string_r = "dovecot.index.map was fsck'd";
 	else if ((reason & MDBOX_REBUILD_REASON_MAILBOX_FSCKD) != 0 &&
-		 mdbox_mailbox_is_fscked(fsckd_box)) {
+		 mdbox_mailbox_is_fscked(fscked_box)) {
 		*reason_string_r = t_strdup_printf(
-			"Mailbox %s index was fsck'd", fsckd_box->vname);
+			"Mailbox %s index was fsck'd", fscked_box->vname);
 	} else {
 		/* storage was already rebuilt by someone else */
 		return 0;
@@ -1001,7 +1028,7 @@ static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx,
 static int
 mdbox_storage_rebuild_in_context(struct mdbox_storage *storage,
 				 struct mdbox_map_atomic_context *atomic,
-				 struct mailbox *fsckd_box,
+				 struct mailbox *fscked_box,
 				 enum mdbox_rebuild_reason rebuild_reason)
 {
 	struct mdbox_storage_rebuild_context *ctx;
@@ -1017,7 +1044,7 @@ mdbox_storage_rebuild_in_context(struct mdbox_storage *storage,
 	}
 
 	ctx = mdbox_storage_rebuild_init(storage, atomic);
-	if ((ret = mdbox_storage_rebuild_scan_prepare(ctx, fsckd_box,
+	if ((ret = mdbox_storage_rebuild_scan_prepare(ctx, fscked_box,
 						      rebuild_reason,
 						      &reason_string)) > 0) {
 		struct event_reason *reason = event_reason_begin("mdbox:rebuild");
@@ -1034,19 +1061,35 @@ mdbox_storage_rebuild_in_context(struct mdbox_storage *storage,
 }
 
 int mdbox_storage_rebuild(struct mdbox_storage *storage,
-			  struct mailbox *fsckd_box,
+			  struct mailbox *fscked_box,
 			  enum mdbox_rebuild_reason reason)
 {
 	struct mdbox_map_atomic_context *atomic;
+	struct mailbox_list *list;
 	int ret;
+
+	/* Restoring the lost mails may have to create their mailboxes, which
+	   locks the mailbox list. Lock it up front, because mailbox_delete()
+	   locks the mailbox list before the map and the opposite order would
+	   deadlock. The mails have to be restored while the map is locked, so
+	   that another process can't rebuild the storage at the same time and
+	   restore them a second time. */
+	list = mdbox_rebuild_get_default_list(storage);
+	if (list != NULL && mailbox_list_lock(list) < 0) {
+		mail_storage_copy_list_error(&storage->storage.storage, list);
+		return -1;
+	}
 
 	atomic = mdbox_map_atomic_begin(storage->map);
 	ret = mdbox_storage_rebuild_in_context(storage, atomic,
-					       fsckd_box, reason);
+					       fscked_box, reason);
 	mdbox_map_atomic_set_success(atomic);
 	mdbox_map_atomic_unset_fscked(atomic);
 	(void)mail_index_reset_fscked(storage->map->index);
 	if (mdbox_map_atomic_finish(&atomic) < 0)
 		ret = -1;
+
+	if (list != NULL)
+		mailbox_list_unlock(list);
 	return ret;
 }

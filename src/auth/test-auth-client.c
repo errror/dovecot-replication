@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-auth.h"
 #include "ioloop.h"
@@ -19,7 +19,8 @@ static void auth_client_connected(int *server_fd)
 
 static void
 test_callback(struct auth_client_request *req, enum auth_request_status status,
-	      const char *b64, const char *const *args, void *context)
+	      const char *log_error ATTR_UNUSED, const char *b64,
+	      const char *const *args, void *context)
 {
 	struct auth_client *client ATTR_UNUSED = context;
 	if (status == AUTH_REQUEST_STATUS_CONTINUE) {

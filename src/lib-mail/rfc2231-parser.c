@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -47,7 +47,7 @@
    them. So this implementation does a best-effort "garbage-in garbage-out" sort
    of thing. */
 
-static inline int _decode_hex_digit(const unsigned char digit)
+static inline int decode_hex_digit(char digit)
 {
 	if (digit >= '0' && digit <= '9')
 		return digit - '0';
@@ -58,18 +58,17 @@ static inline int _decode_hex_digit(const unsigned char digit)
 	return -1;
 }
 
-static inline bool _decode_percent_encoding(const unsigned char digit_a,
-					    const unsigned char digit_b,
-					    unsigned char *result_r)
+static inline bool decode_hex_byte(const char *digits, char *result_r)
 {
-	int decoded = _decode_hex_digit(digit_a);
-	if (decoded < 0)
+	int higher = decode_hex_digit(digits[0]);
+	if (higher < 0)
 		return FALSE;
-	*result_r = decoded;
-	decoded = _decode_hex_digit(digit_b);
-	if (decoded < 0)
+
+	int lower = decode_hex_digit(digits[1]);
+	if (lower < 0)
 		return FALSE;
-	*result_r = (*result_r << 4) + decoded;
+
+	*result_r = (char)((higher << 4) + lower);
 	return TRUE;
 }
 
@@ -81,9 +80,8 @@ static string_t *rfc2231_decode_value(const char *value)
 	while ((p = strchr(plast, '%')) != NULL) {
 		/* Append whatever we've seen so far. */
 		str_append_data(str, plast, (p - plast));
-		unsigned char ch;
-		if (*(p+1) == '\0' || *(p+2) == '\0' ||
-		    !_decode_percent_encoding(*(p+1), *(p+2), &ch))
+		char ch;
+		if (!decode_hex_byte(p+1, &ch))
 			return NULL;
 		plast = p + 3;
 		str_append_data(str, &ch, 1);
@@ -203,7 +201,7 @@ int rfc2231_parse(struct rfc822_parser_context *ctx,
 	struct rfc2231_parameter rfc2231_param;
 	const char *key, *p, *p2;
 	string_t *str;
-	unsigned int i, j, count, next, next_idx;
+	unsigned int i, j, count, next, next_idx, params_count = 0;
 	bool ok, broken = FALSE;
 	const char *prev_replacement_str;
 	int ret;
@@ -221,6 +219,8 @@ int rfc2231_parse(struct rfc822_parser_context *ctx,
 	t_array_init(&rfc2231_params_arr, 8);
 	str = t_str_new(64);
 	while ((ret = rfc822_parse_content_param(ctx, &key, str)) != 0) {
+		if (++params_count > RFC2231_MAX_PARAMS)
+			break;
 		if (ret < 0) {
 			/* try to continue anyway.. */
 			broken = TRUE;

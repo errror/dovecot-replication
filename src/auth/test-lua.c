@@ -1,8 +1,8 @@
-/* Copyright (c) 2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "test-auth.h"
 
-#ifdef BUILTIN_LUA
+#ifdef HAVE_LUA
 #include "istream.h"
 #include "auth-settings.h"
 #include "auth-request.h"
@@ -18,7 +18,7 @@ static struct auth_settings test_lua_auth_set = {
 static struct auth_request *test_db_lua_auth_request_new(void)
 {
 	const char *error;
-	struct auth_request *req = auth_request_new_dummy(NULL);
+	struct auth_request *req = auth_request_new(NULL);
 	req->set = global_auth_settings;
 	struct event *event = event_create(req->event);
 	array_push_back(&req->authdb_event, &event);

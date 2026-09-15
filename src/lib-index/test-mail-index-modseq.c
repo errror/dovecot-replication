@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "test-common.h"
@@ -73,5 +73,6 @@ int main(void)
 		test_mail_index_modseq_get_next_log_offset,
 		NULL
 	};
+	test_dir_init("mail-index-modseq");
 	return test_run(test_functions);
 }

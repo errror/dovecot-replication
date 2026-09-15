@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -622,6 +622,22 @@ static int imapc_sync(struct imapc_mailbox *mbox)
 	return 0;
 }
 
+int imapc_mailbox_flush_local_flag_changes(struct imapc_mailbox *mbox)
+{
+	bool changes ATTR_UNUSED;
+
+	/* Make sure any locally cached flag/keyword changes are sent to the
+	   remote server. This is needed before passing through a SEARCH/SORT
+	   command, so that the remote evaluates them against the up-to-date
+	   flags instead of stale ones. imapc_sync() is a no-op when there is
+	   nothing to flush. */
+	if (mbox->syncing || mbox->client_box == NULL)
+		return 0;
+	if (imapc_mailbox_commit_delayed_trans(mbox, FALSE, &changes) < 0)
+		return -1;
+	return imapc_sync(mbox);
+}
+
 static void
 imapc_noop_if_needed(struct imapc_mailbox *mbox, enum mailbox_sync_flags flags)
 {
@@ -659,11 +675,20 @@ struct mailbox_sync_context *
 imapc_mailbox_sync_init(struct mailbox *box, enum mailbox_sync_flags flags)
 {
 	struct imapc_mailbox *mbox = IMAPC_MAILBOX(box);
-	struct imapc_mailbox_list *list = mbox->storage->client->_list;
 	bool changes;
 	int ret = 0;
 
-	if (list != NULL) {
+	if (strcmp(box->list->name, MAILBOX_LIST_NAME_IMAPC) == 0) {
+		/* Allow the next mailbox existence lookup
+		   (imapc_list_get_mailbox_flags()) to refresh the cached
+		   mailbox list again. This must be done to the mailbox's own
+		   list: the storage may be shared by several namespaces, each
+		   of which has its own list and cache, while
+		   storage->client->_list is only the list of the namespace
+		   that created the storage. */
+		struct imapc_mailbox_list *list =
+			container_of(box->list, struct imapc_mailbox_list, list);
+
 		if (!list->refreshed_mailboxes &&
 		    list->last_refreshed_mailboxes < ioloop_time)
 			list->refreshed_mailboxes_recently = FALSE;

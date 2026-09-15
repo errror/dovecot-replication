@@ -1,4 +1,4 @@
-/* Copyright (c) 2020 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -1111,5 +1111,6 @@ int main(void)
 		test_mail_cache_purge_deadlines,
 		NULL
 	};
+	test_dir_init("mail-cache-purge");
 	return test_run(test_functions);
 }

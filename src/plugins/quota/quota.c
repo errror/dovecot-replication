@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -12,6 +12,7 @@
 #include "settings.h"
 #include "mailbox-list-private.h"
 #include "quota-private.h"
+#include "quota-plugin.h"
 #include "quota-fs.h"
 #include "llist.h"
 #include "program-client.h"
@@ -282,8 +283,11 @@ int quota_init(struct mail_user *user, struct quota **quota_r,
 	event_set_append_log_prefix(quota->event, "quota: ");
 	quota->user = user;
 	quota->test_alloc = quota_default_test_alloc;
+	quota->set = set;
+
 	i_array_init(&quota->global_private_roots, 8);
 	i_array_init(&quota->all_roots, 8);
+	i_array_init(&quota->recalc_callbacks, 1);
 
 	if (array_is_created(&set->quota_roots)) {
 		array_foreach_elem(&set->quota_roots, root_name) {
@@ -292,7 +296,6 @@ int quota_init(struct mail_user *user, struct quota **quota_r,
 			if (ret < 0) {
 				*error_r = t_strdup_printf("Quota root %s: %s",
 							   root_name, error);
-				settings_free(set);
 				quota_deinit(&quota);
 				return -1;
 			}
@@ -300,7 +303,6 @@ int quota_init(struct mail_user *user, struct quota **quota_r,
 				array_push_back(&quota->global_private_roots, &root);
 		}
 	}
-	settings_free(set);
 	*quota_r = quota;
 	return 0;
 }
@@ -320,6 +322,8 @@ void quota_deinit(struct quota **_quota)
 
 	array_free(&quota->global_private_roots);
 	array_free(&quota->all_roots);
+	array_free(&quota->recalc_callbacks);
+	settings_free(quota->set);
 	event_unref(&quota->event);
 	i_free(quota);
 }
@@ -923,10 +927,10 @@ static void quota_warnings_execute(struct quota_transaction_context *ctx,
 					count_before, count_current,
 					&reason)) {
 			struct event *event = event_create(root->backend.event);
-			event_set_ptr(event, SETTINGS_EVENT_FILTER_NAME,
-				      p_strdup_printf(event_get_pool(event),
-						      "quota_warning/%s",
-						      warn_name));
+			const char *filter_name = p_strdup_printf(
+				event_get_pool(event), "quota_warning/%s",
+				warn_name);
+			settings_event_add_filter_name(event, filter_name);
 			event_set_append_log_prefix(event, t_strdup_printf(
 				"quota_warning %s: ", warn_name));
 			quota_warning_execute(event, NULL, reason);
@@ -1179,7 +1183,33 @@ quota_try_alloc(struct quota_transaction_context *ctx,
 	   quota_alloc() or quota_free_bytes() was already used within the same
 	   transaction, but that doesn't normally happen. */
 	ctx->auto_updating = FALSE;
-	quota_alloc_with_size(ctx, size, expunged_size);
+	/* Do not subtract expunged_size from the persistent counter here:
+	   the expunge is tracked separately via quota_mail_expunge() ->
+	   qbox->expunge_qt (committed independently via sync_notify), so
+	   subtracting it again would double-count. expunged_size is still
+	   passed to quota_test_alloc() above so that moves/replaces at the
+	   quota boundary are correctly permitted. */
+	quota_alloc_with_size(ctx, size, 0);
+
+	/* Record the pending expunge per visible root so that subsequent
+	   quota_try_alloc() calls in the same transaction (e.g. a batch
+	   MOVE/REPLACE of several mails at the quota boundary) see the
+	   accumulated expunged amount in their limit calculations. The
+	   actual quota decrement still happens via qbox->expunge_qt. */
+	if (expunged_mail != NULL && expunged_box != NULL) {
+		struct quota_root *const *roots;
+		unsigned int i, count;
+
+		roots = array_get(&ctx->quota->all_roots, &count);
+		for (i = 0; i < count; i++) {
+			if (!quota_root_is_visible(roots[i], ctx->box) ||
+			    !quota_root_is_visible(roots[i], expunged_box))
+				continue;
+			quota_transaction_root_expunged(&ctx->roots[i], 1,
+							expunged_size);
+		}
+		quota_transaction_update_expunged(ctx);
+	}
 	return QUOTA_ALLOC_RESULT_OK;
 }
 
@@ -1327,4 +1357,28 @@ void quota_recalculate(struct quota_transaction_context *ctx,
 		       enum quota_recalculate recalculate)
 {
 	ctx->recalculate = recalculate;
+}
+
+void
+quota_recalc_register_callback(struct mail_user *user,
+			       quota_recalc_callback_t *callback)
+{
+	struct quota_user *quser = QUOTA_USER_CONTEXT(user);
+	struct quota_recalc_callback *cb;
+
+	if (quser == NULL)
+		return;
+
+	cb = array_append_space(&quser->quota->recalc_callbacks);
+	cb->user = user;
+	cb->callback = callback;
+}
+
+void
+quota_recalc_call_callbacks(struct quota *quota)
+{
+	const struct quota_recalc_callback *cb;
+	array_foreach(&quota->recalc_callbacks, cb) {
+		cb->callback(cb->user);
+	}
 }

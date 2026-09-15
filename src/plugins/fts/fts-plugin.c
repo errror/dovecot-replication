@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "mail-storage-hooks.h"
@@ -20,15 +20,21 @@ static struct mail_storage_hooks fts_mail_storage_hooks = {
 	.mail_allocated = fts_mail_allocated
 };
 
+static struct mail_storage_hooks fts_tika_mail_storage_hooks = {
+	.mail_user_created = fts_tika_mail_user_created
+};
+
 void fts_plugin_init(struct module *module)
 {
 	lang_library_init();
 	mail_storage_hooks_add(module, &fts_mail_storage_hooks);
+	mail_storage_hooks_add(module, &fts_tika_mail_storage_hooks);
 }
 
 void fts_plugin_deinit(void)
 {
 	lang_library_deinit();
 	fts_parsers_unload();
+	mail_storage_hooks_remove(&fts_tika_mail_storage_hooks);
 	mail_storage_hooks_remove(&fts_mail_storage_hooks);
 }

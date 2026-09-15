@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "hostpid.h"
@@ -49,7 +49,9 @@ const struct setting_keyvalue submission_service_settings_defaults[] = {
 	{ "unix_listener/srv.submission\\s%{pid}/type", "admin" },
 	{ "unix_listener/srv.submission\\s%{pid}/mode", "0600" },
 
-	{ "service_extra_groups", "$SET:default_internal_group" },
+	/* This needs to be here explicitly until the backwards compatibility
+	   is removed from settings-history-core.txt */
+	{ "service_extra_groups", "" },
 
 	{ NULL, NULL }
 };
@@ -60,7 +62,7 @@ const struct setting_keyvalue submission_service_settings_defaults[] = {
 
 static const struct setting_define submission_setting_defines[] = {
 	DEF(BOOL, verbose_proctitle),
-	DEF(STR, rawlog_dir),
+	DEF(PATH_DIR, rawlog_dir),
 
 	DEF(STR, hostname),
 
@@ -89,7 +91,7 @@ static const struct setting_define submission_setting_defines[] = {
 	DEF(ENUM, submission_relay_ssl),
 	DEF(BOOL, submission_relay_ssl_verify),
 
-	DEF(STR, submission_relay_rawlog_dir),
+	DEF(PATH_DIR, submission_relay_rawlog_dir),
 	DEF(TIME, submission_relay_max_idle_time),
 
 	DEF(TIME_MSECS, submission_relay_connect_timeout),
@@ -113,7 +115,7 @@ static const struct submission_settings submission_default_settings = {
 	.recipient_delimiter = "+",
 
 	.submission_max_mail_size = 40*1024*1024,
-	.submission_max_recipients = 0,
+	.submission_max_recipients = SET_UINT_UNLIMITED,
 	.submission_client_workarounds = ARRAY_INIT,
 	.submission_logout_format = "in=%{input} out=%{output}",
 	.submission_add_received_header = TRUE,
@@ -228,6 +230,10 @@ submission_settings_verify(void *_set, pool_t pool ATTR_UNUSED, const char **err
 #ifndef CONFIG_BINARY
 	if (set->submission_relay_max_idle_time == 0) {
 		*error_r = "submission_relay_max_idle_time must not be 0";
+		return FALSE;
+	}
+	if (set->submission_max_recipients == 0) {
+		*error_r = "submission_max_recipients must not be 0";
 		return FALSE;
 	}
 	if (*set->hostname == '\0')

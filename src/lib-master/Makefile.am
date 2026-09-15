@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 pkgsysconfdir = $(sysconfdir)/dovecot
 
 noinst_LTLIBRARIES = libmaster.la
@@ -39,6 +41,7 @@ headers = \
 	master-service-ssl.h \
 	service-settings.h \
 	stats-client.h \
+	storage-version.h \
 	syslog-util.h
 
 pkginc_libdir=$(pkgincludedir)
@@ -46,10 +49,7 @@ pkginc_lib_HEADERS = $(headers)
 
 test_programs = \
 	test-event-stats \
-	test-master-service \
 	test-master-service-settings
-
-noinst_PROGRAMS = $(test_programs)
 
 test_deps = \
 	libmaster.la \
@@ -57,28 +57,19 @@ test_deps = \
 	../lib-settings/libsettings.la \
 	../lib-dns/libdns.la \
 	../lib-var-expand/libvar_expand.la \
+	../lib-regex/libdregex.la \
 	../lib-test/libtest.la \
 	../lib-dns-client/libdns-client.la  \
 	../lib-dns/libdns.la \
 	../lib/liblib.la
 
 test_libs = \
-	$(test_deps) \
-	$(MODULE_LIBS)
+	$(test_deps)
 
 test_event_stats_SOURCES = test-event-stats.c
-test_event_stats_LDADD = $(test_libs)
+test_event_stats_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_event_stats_DEPENDENCIES = $(test_deps)
 
-test_master_service_SOURCES = test-master-service.c
-test_master_service_LDADD = $(test_libs)
-test_master_service_DEPENDENCIES = $(test_deps)
-
 test_master_service_settings_SOURCES = test-master-service-settings.c
-test_master_service_settings_LDADD = $(test_libs)
+test_master_service_settings_LDADD = $(test_libs) $(LIBDOVECOT_TEST_LIBS)
 test_master_service_settings_DEPENDENCIES = $(test_deps)
-
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done

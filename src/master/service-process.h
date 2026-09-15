@@ -19,6 +19,11 @@ struct service_process {
 	   smaller than the correct value. */
 	unsigned int total_count;
 
+	/* Process index number. This is set only for services with
+	   inet_listener_reuse_port=yes listeners. See
+	   service_listener.reuse_port_process_index for how this is used. */
+	unsigned int index;
+
 	/* Timestamp when the process was created */
 	time_t create_time;
 	/* Time when process started idling, or 0 if we're not idling. This is
@@ -40,13 +45,27 @@ struct service_process {
 	/* kill the process if it doesn't send initial status notification */
 	struct timeout *to_status;
 
+	/* restart_request_count was reached for a process whose service has
+	   client_limit > 1. The process is just handling its
+	   last connections until it dies. Retired processes are not counted
+	   towards the service's process_limit.
+
+	   The intention here is to allow configuring a (login) service with
+	   process_limit = process_min_avail and restart_request_count set to
+	   something else than unlimited. If the process_limit was strictly
+	   enforced, long lived connections would prevent new processes from
+	   being launched, eventually causing all processes to keep handling
+	   existing connections without allowing new ones. */
+	bool retired:1;
 	bool destroyed:1;
 };
 
 #define SERVICE_PROCESS_IS_INITIALIZED(process) \
 	((process)->to_status == NULL)
 
-struct service_process *service_process_create(struct service *service);
+struct service_process *
+service_process_create(struct service *service, int accepted_fd,
+		       const struct service_listener *accepted_listener);
 void service_process_destroy(struct service_process *process);
 
 void service_process_ref(struct service_process *process);

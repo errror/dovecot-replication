@@ -1,3 +1,5 @@
+include $(top_srcdir)/Makefile.test.include
+
 noinst_LTLIBRARIES = libdldap.la
 
 AM_CPPFLAGS = \
@@ -11,6 +13,7 @@ AM_CPPFLAGS = \
 
 libdldap_la_SOURCES = \
 	ldap-client.c \
+	ldap-escape.c \
 	ldap-connection.c \
 	ldap-connection-pool.c \
 	ldap-iterator.c \
@@ -36,18 +39,21 @@ headers = \
 noinst_HEADERS = \
 	ldap-connection-pool.h \
 	ldap-private.h \
+	ldap-sasl.h \
 	ldap-settings.h \
 	ldap-settings-parse.h
 
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
+test_programs = \
+	test-ldap-escape
+
 test_libs = \
 	../lib-test/libtest.la \
 	../lib-var-expand/libvar_expand.la \
 	../lib/liblib.la
 
-check-local:
-	for bin in $(test_programs); do \
-	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
-	done
+test_ldap_escape_SOURCES = test-ldap-escape.c
+test_ldap_escape_LDADD = libdldap.la $(test_libs) $(LIBDOVECOT_TEST_LIBS)
+test_ldap_escape_DEPENDENCIES = libdldap.la $(test_libs)

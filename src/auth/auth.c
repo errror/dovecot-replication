@@ -1,12 +1,12 @@
-/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "auth-common.h"
 #include "array.h"
 #include "settings.h"
-#include "mech.h"
 #include "userdb.h"
 #include "passdb.h"
 #include "auth.h"
+#include "auth-sasl.h"
 #include "dns-lookup.h"
 
 #define AUTH_DNS_IDLE_TIMEOUT_MSECS (1000*60)
@@ -83,7 +83,7 @@ auth_passdb_preinit(struct auth *auth, const struct auth_passdb_settings *_set,
 	event_add_str(event, "protocol", auth->protocol);
 	event_add_str(event, "passdb", _set->name);
 	settings_event_add_filter_name(event,
-		t_strconcat("passdb_", _set->driver, NULL));
+		auth_driver_filter("passdb", _set->driver));
 	settings_event_add_list_filter_name(event, "passdb", _set->name);
 	set = settings_get_or_fatal(event, &auth_passdb_setting_parser_info);
 
@@ -125,7 +125,8 @@ auth_passdb_preinit(struct auth *auth, const struct auth_passdb_settings *_set,
 	for (dest = passdbs; *dest != NULL; dest = &(*dest)->next) ;
 	*dest = auth_passdb;
 
-	auth_passdb->passdb = passdb_preinit(auth->pool, event, set);
+	auth_passdb->passdb = passdb_preinit(auth->pool, event, set,
+					     auth->protocol_set->cache_size > 0);
 	if (auth_passdb->passdb->default_cache_key != NULL && set->use_cache) {
 		auth_passdb->cache_key = auth_passdb->passdb->default_cache_key;
 	} else {
@@ -154,7 +155,7 @@ auth_userdb_preinit(struct auth *auth, const struct auth_userdb_settings *_set)
 	event_add_str(event, "protocol", auth->protocol);
 	event_add_str(event, "userdb", _set->name);
 	settings_event_add_filter_name(event,
-		t_strconcat("userdb_", _set->driver, NULL));
+		auth_driver_filter("userdb", _set->driver));
 	settings_event_add_list_filter_name(event, "userdb", _set->name);
 	if (_set == &userdb_dummy_set) {
 		/* If this is the dummy set do not try to lookup settings. */
@@ -186,7 +187,8 @@ auth_userdb_preinit(struct auth *auth, const struct auth_userdb_settings *_set)
 	for (dest = &auth->userdbs; *dest != NULL; dest = &(*dest)->next) ;
 	*dest = auth_userdb;
 
-	auth_userdb->userdb = userdb_preinit(auth->pool, event, set);
+	auth_userdb->userdb = userdb_preinit(auth->pool, event, set,
+					     auth->protocol_set->cache_size > 0);
 	if (auth_userdb->userdb->default_cache_key != NULL && set->use_cache) {
 		auth_userdb->cache_key = auth_userdb->userdb->default_cache_key;
 	} else {
@@ -197,14 +199,14 @@ auth_userdb_preinit(struct auth *auth, const struct auth_userdb_settings *_set)
 
 static void auth_userdb_deinit(struct auth_userdb *userdb)
 {
+	userdb_deinit(userdb->userdb);
 	if (userdb->set != &userdb_dummy_set)
 		settings_free(userdb->set);
 	settings_free(userdb->auth_set);
 	settings_free(userdb->unexpanded_post_set);
-	userdb_deinit(userdb->userdb);
 }
 
-static bool auth_passdb_list_have_verify_plain(const struct auth *auth)
+bool auth_passdb_list_have_verify_plain(const struct auth *auth)
 {
 	const struct auth_passdb *passdb;
 
@@ -215,7 +217,7 @@ static bool auth_passdb_list_have_verify_plain(const struct auth *auth)
 	return FALSE;
 }
 
-static bool auth_passdb_list_have_lookup_credentials(const struct auth *auth)
+bool auth_passdb_list_have_lookup_credentials(const struct auth *auth)
 {
 	const struct auth_passdb *passdb;
 
@@ -226,69 +228,8 @@ static bool auth_passdb_list_have_lookup_credentials(const struct auth *auth)
 	return FALSE;
 }
 
-static bool auth_passdb_list_have_set_credentials(const struct auth *auth)
-{
-	const struct auth_passdb *passdb;
-
-	for (passdb = auth->masterdbs; passdb != NULL; passdb = passdb->next) {
-		if (passdb->passdb->iface.set_credentials != NULL)
-			return TRUE;
-	}
-	for (passdb = auth->passdbs; passdb != NULL; passdb = passdb->next) {
-		if (passdb->passdb->iface.set_credentials != NULL)
-			return TRUE;
-	}
-	return FALSE;
-}
-
-static bool
-auth_mech_verify_passdb(const struct auth *auth, const struct mech_module_list *list)
-{
-	switch (list->module.passdb_need) {
-	case MECH_PASSDB_NEED_NOTHING:
-		break;
-	case MECH_PASSDB_NEED_VERIFY_PLAIN:
-		if (!auth_passdb_list_have_verify_plain(auth))
-			return FALSE;
-		break;
-	case MECH_PASSDB_NEED_VERIFY_RESPONSE:
-	case MECH_PASSDB_NEED_LOOKUP_CREDENTIALS:
-		if (!auth_passdb_list_have_lookup_credentials(auth))
-			return FALSE;
-		break;
-	case MECH_PASSDB_NEED_SET_CREDENTIALS:
-		if (!auth_passdb_list_have_lookup_credentials(auth))
-			return FALSE;
-		if (!auth_passdb_list_have_set_credentials(auth))
-			return FALSE;
-		break;
-	}
-	return TRUE;
-}
-
-static void auth_mech_list_verify_passdb(const struct auth *auth)
-{
-	const struct mech_module_list *list;
-
-	for (list = auth->reg->modules; list != NULL; list = list->next) {
-		if (!auth_mech_verify_passdb(auth, list))
-			break;
-	}
-
-	if (list != NULL) {
-		if (auth->passdbs == NULL) {
-			i_fatal("No passdbs specified in configuration file. "
-				"%s mechanism needs one",
-				list->module.mech_name);
-		}
-		i_fatal("%s mechanism can't be supported with given passdbs",
-			list->module.mech_name);
-	}
-}
-
 static struct auth * ATTR_NULL(2)
-auth_preinit(const struct auth_settings *set, const char *protocol,
-	     const struct mechanisms_register *reg)
+auth_preinit(const struct auth_settings *set, const char *protocol)
 {
 	const struct auth_passdb_settings *const *passdbs;
 	const struct auth_userdb_settings *const *userdbs;
@@ -301,7 +242,6 @@ auth_preinit(const struct auth_settings *set, const char *protocol,
 	auth->protocol = p_strdup(pool, protocol);
 	auth->protocol_set = set;
 	pool_ref(set->pool);
-	auth->reg = reg;
 
 	if (array_is_created(&set->parsed_passdbs))
 		passdbs = array_get(&set->parsed_passdbs, &db_count);
@@ -359,6 +299,9 @@ auth_preinit(const struct auth_settings *set, const char *protocol,
 		/* use a dummy userdb static. */
 		auth_userdb_preinit(auth, &userdb_dummy_set);
 	}
+
+	auth_sasl_instance_init(auth, set);
+
 	return auth;
 }
 
@@ -404,6 +347,13 @@ static void auth_deinit(struct auth *auth)
 		auth_userdb_deinit(userdb);
 
 	dns_client_deinit(&auth->dns_client);
+}
+
+static void auth_free(struct auth *auth)
+{
+	auth_sasl_instance_deinit(auth);
+	settings_free(auth->protocol_set);
+	pool_unref(&auth->pool);
 }
 
 static void
@@ -500,7 +450,6 @@ struct auth *auth_default_protocol(void)
 
 void auths_preinit(struct event *parent_event,
 		   const struct auth_settings *set,
-		   const struct mechanisms_register *reg,
 		   const char *const *protocols)
 {
 	const struct auth_settings *protocol_set;
@@ -514,7 +463,7 @@ void auths_preinit(struct event *parent_event,
 	event_add_category(auth_event, &event_category_auth);
 	i_array_init(&auths, 8);
 
-	auth = auth_preinit(set, NULL, reg);
+	auth = auth_preinit(set, NULL);
 	array_push_back(&auths, &auth);
 
 	for (i = 0; protocols[i] != NULL; i++) {
@@ -527,7 +476,7 @@ void auths_preinit(struct event *parent_event,
 			not_protocol = protocols[i];
 		}
 		protocol_set = auth_settings_get(protocols[i]);
-		auth = auth_preinit(protocol_set, protocols[i], reg);
+		auth = auth_preinit(protocol_set, protocols[i]);
 		array_push_back(&auths, &auth);
 		settings_free(protocol_set);
 	}
@@ -537,7 +486,7 @@ void auths_preinit(struct event *parent_event,
 
 	array_foreach_elem(&auths, auth) {
 		if (auth->protocol != NULL || check_default)
-			auth_mech_list_verify_passdb(auth);
+			auth_sasl_instance_verify(auth);
 	}
 }
 
@@ -567,9 +516,7 @@ void auths_free(void)
 {
 	struct auth *auth;
 
-	array_foreach_elem(&auths, auth) {
-		settings_free(auth->protocol_set);
-		pool_unref(&auth->pool);
-	}
+	array_foreach_elem(&auths, auth)
+		auth_free(auth);
 	array_free(&auths);
 }

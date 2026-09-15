@@ -1,9 +1,9 @@
-/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "istream.h"
 #include "nfs-workarounds.h"
-#include "index-mail.h"
+#include "maildir-mail.h"
 #include "maildir-storage.h"
 #include "maildir-filename.h"
 #include "maildir-uidlist.h"
@@ -13,6 +13,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+
+static void maildir_mail_fix_corruption(struct mail *_mail);
 
 struct maildir_open_context {
 	int fd;
@@ -199,6 +201,10 @@ maildir_mail_get_fname(struct maildir_mailbox *mbox, struct mail *mail,
 	/* file exists in index file, but not in dovecot-uidlist anymore. */
 	mail_set_expunged(mail);
 
+	/* the resync below is just a cleanup - make sure it doesn't overwrite
+	   the expunged-error, which the caller may be checking. */
+	mail_storage_last_error_push(mail->box->storage);
+
 	/* one reason this could happen is if we delayed opening
 	   dovecot-uidlist and we're trying to open a mail that got recently
 	   expunged. Let's test this theory first: */
@@ -213,6 +219,7 @@ maildir_mail_get_fname(struct maildir_mailbox *mbox, struct mail *mail,
 		   the same as in index. fix this by forcing a resync. */
 		(void)maildir_storage_sync_force(mbox, mail->uid);
 	}
+	mail_storage_last_error_pop(mail->box->storage);
 	return 0;
 }
 
@@ -587,7 +594,8 @@ maildir_mail_get_special(struct mail *_mail, enum mail_fetch_field field,
 	case MAIL_FETCH_REFCOUNT_ID:
 		if (maildir_mail_stat(_mail, &st) < 0)
 			return -1;
-		*value_r = p_strdup_printf(mail->mail.data_pool, "%llu",
+		*value_r = p_strdup_printf(mail->mail.data_pool, "%u:%u:%llu",
+					   major(st.st_dev), minor(st.st_dev),
 					   (unsigned long long)st.st_ino);
 		return 0;
 	default:
@@ -606,6 +614,7 @@ maildir_mail_get_stream(struct mail *_mail, bool get_body ATTR_UNUSED,
 	struct index_mail_data *data = &mail->data;
 	bool deleted;
 
+	maildir_mail_fix_corruption(_mail);
 	if (data->stream == NULL) {
 		data->stream = maildir_open_mail(mbox, _mail, &deleted);
 		if (data->stream == NULL) {
@@ -761,20 +770,40 @@ maildir_mail_remove_sizes_from_filename(struct mail *mail,
 	(void)maildir_file_do(mbox, mail->uid, do_fix_size, &ctx);
 }
 
+static void maildir_mail_fix_corruption(struct mail *_mail)
+{
+	struct maildir_mail *mail =
+		container_of(_mail, struct maildir_mail, imail.mail.mail);
+
+	if (mail->corrupted_field == 0)
+		return;
+
+	mail->corrupted_field = 0;
+	maildir_mail_remove_sizes_from_uidlist(_mail);
+	maildir_mail_remove_sizes_from_filename(_mail, mail->corrupted_field);
+}
+
 static void maildir_mail_set_cache_corrupted(struct mail *_mail,
 					     enum mail_fetch_field field,
 					     const char *reason)
 {
+	struct maildir_mail *mail =
+		container_of(_mail, struct maildir_mail, imail.mail.mail);
+
 	if (field == MAIL_FETCH_PHYSICAL_SIZE ||
-	    field == MAIL_FETCH_VIRTUAL_SIZE) {
-		maildir_mail_remove_sizes_from_uidlist(_mail);
-		maildir_mail_remove_sizes_from_filename(_mail, field);
-	}
+	    field == MAIL_FETCH_VIRTUAL_SIZE)
+		mail->corrupted_field = field;
 	index_mail_set_cache_corrupted(_mail, field, reason);
 }
 
+static void maildir_mail_close(struct mail *_mail)
+{
+	maildir_mail_fix_corruption(_mail);
+	index_mail_close(_mail);
+}
+
 struct mail_vfuncs maildir_mail_vfuncs = {
-	index_mail_close,
+	maildir_mail_close,
 	index_mail_free,
 	index_mail_set_seq,
 	index_mail_set_uid,

@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -343,10 +343,11 @@ static void test_message_address_list(void)
 	};
 
 	struct message_address_list list;
-	struct message_address *addr, *scanned_last_addr;
+	struct message_address *addr, *scanned_last_addr = NULL;
 	test_parse_address_full(test_input, FALSE, &list);
 	addr = list.head;
 	for (unsigned int i = 0; i < N_ELEMENTS(wanted_addrs); i++) {
+		test_assert(addr != NULL);
 		test_assert_idx(cmp_addr(addr, &wanted_addrs[i]), i);
 		scanned_last_addr = addr;
 		addr = addr->next;

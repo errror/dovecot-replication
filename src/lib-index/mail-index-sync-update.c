@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
+/* Copyright (c) Dovecot authors, see top-level COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -1002,11 +1002,10 @@ int mail_index_sync_map(struct mail_index_map **_map,
 	}
 	map = NULL;
 
-	/* FIXME: when transaction sync lock is removed, we'll need to handle
-	   the case when a transaction is committed while mailbox is being
-	   synced ([synced transactions][new transaction][ext transaction]).
-	   this means int_offset contains [synced] and ext_offset contains
-	   all */
+	/* mail_transaction_log_view_next() returns -1 on corruption.
+	   Since the log file content before the corruption was found can be
+	   useful and important, we don't fail this sync entirely. Instead,
+	   we'll just mark the rest of the log file as synced. */
 	while ((ret = mail_transaction_log_view_next(view->log_view, &thdr,
 						     &tdata)) > 0) {
 		mail_transaction_log_view_get_prev_pos(view->log_view,
@@ -1041,8 +1040,7 @@ int mail_index_sync_map(struct mail_index_map **_map,
 	   over following external transactions to avoid extra unneeded log
 	   reading. */
 	i_assert(map->hdr.log_file_seq == index->log->head->hdr.file_seq);
-	if (ret == 0 &&
-	    map->hdr.log_file_tail_offset < index->log->head->max_tail_offset) {
+	if (map->hdr.log_file_tail_offset < index->log->head->max_tail_offset) {
 		map->hdr.log_file_tail_offset =
 			index->log->head->max_tail_offset;
 	}

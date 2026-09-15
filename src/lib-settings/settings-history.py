@@ -76,9 +76,12 @@ def render_version(version: [int]) -> str:
 
 def process_version(ce_version: str, pro_version: str, pro: bool) -> (str, [int]):
     """Parse and validate version information."""
+    ce_parsed = parse_version(ce_version) if ce_version not in ("", "-") else None
+    pro_parsed = parse_version(pro_version) if pro_version not in ("", "-") else None
+
     version_text = pro_version if pro else ce_version
-    version = parse_version(version_text) if version_text not in ("", "-") else None
-    return (version_text, version)
+    version = pro_parsed if pro else ce_parsed
+    return version_text, version
 
 
 def check_version(prev_version: [int], cur_version: [int]):
@@ -103,6 +106,9 @@ def process(input_file: str, contents: str, pro: bool) -> (str, str):
     for line, data in enumerate(contents.splitlines()):
         line = line + 1
         values = data.split("\t")
+
+        if data.startswith("#") or data.isspace() or data == "":
+            continue
 
         if len(values) != 5:
             die(
@@ -174,17 +180,25 @@ def main():
         choices=[0, 1],
         help="Whether to generate settings migration data for Pro",
     )
+    parser.add_argument(
+        "--plugin",
+        type=str,
+        default="core",
+        help="Used to generate settings for the named plugin",
+    )
     args = parser.parse_args()
 
     input_file = getattr(args, "input-file")
     output_file = getattr(args, "output-file")
+    plugin_name = args.plugin
 
     with open(input_file, mode="r", encoding="utf-8") as f_in:
         contents = f_in.read()
         (renames, defaults) = process(input_file, contents, pro=bool(args.pro))
 
         with open(output_file, mode="w", encoding="utf-8") as f_out:
-            f_out.write(FILE_TEMPLATE % (renames, defaults))
+            template = FILE_TEMPLATE.replace("core", plugin_name)
+            f_out.write(template % (renames, defaults))
 
 
 if __name__ == "__main__":
