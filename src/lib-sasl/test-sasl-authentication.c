@@ -286,6 +286,11 @@ test_server_request_output(struct sasl_server_req_ctx *rctx,
 		test_out_reason_quiet("client input",
 				      result == DSASL_CLIENT_RESULT_OK, error);
 	}
+	if (output->status == SASL_SERVER_OUTPUT_SUCCESS && !test->failure &&
+	    !test_has_failed()) {
+		test_out_quiet("client is finished",
+			       dsasl_client_session_is_finished(tctx->session));
+	}
 }
 
 static int

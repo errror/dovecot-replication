@@ -29,6 +29,8 @@ struct dsasl_client_mech {
 	(*auth_output)(struct dsasl_client_mech_session *msession,
 		       const unsigned char **output_r, size_t *output_len_r,
 		       const char **error_r);
+	/* Optional. See dsasl_client_session_is_finished(). */
+	bool (*auth_is_finished)(struct dsasl_client_mech_session *msession);
 	int (*auth_get_result)(struct dsasl_client_mech_session *msession,
 			       const char *key, const char **value_r,
 			       const char **error_r);

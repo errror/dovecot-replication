@@ -669,6 +669,15 @@ dsasl_client_session_output(struct dsasl_client_session *session,
 					   error_r);
 }
 
+bool dsasl_client_session_is_finished(struct dsasl_client_session *session)
+{
+	struct dsasl_client_mech_session *msession = session->mech;
+
+	if (msession->mech->auth_is_finished == NULL)
+		return TRUE;
+	return msession->mech->auth_is_finished(msession);
+}
+
 int dsasl_client_session_get_result(struct dsasl_client_session *session,
 				    const char *key, const char **value_r,
 				    const char **error_r)

@@ -38,6 +38,7 @@ struct digest_md5_sasl_session {
 
 	bool challenge_has_realm;
 	bool challenge_has_our_realm;
+	bool server_verified;
 };
 
 static const struct hash_method *const hmethod = &hash_method_md5;
@@ -499,6 +500,7 @@ mech_digest_md5_auth_input(struct dsasl_client_mech_session *msession,
 		return DSASL_CLIENT_RESULT_AUTH_FAILED;
 	}
 	dsession->state = DIGEST_MD5_STATE_CLIENT_FINAL;
+	dsession->server_verified = TRUE;
 	return DSASL_CLIENT_RESULT_OK;
 }
 
@@ -540,6 +542,15 @@ mech_digest_md5_auth_output(struct dsasl_client_mech_session *msession,
 	return DSASL_CLIENT_RESULT_OK;
 }
 
+static bool
+mech_digest_md5_auth_is_finished(struct dsasl_client_mech_session *msession)
+{
+	struct digest_md5_sasl_session *dsession =
+		container_of(msession, struct digest_md5_sasl_session, session);
+
+	return dsession->server_verified;
+}
+
 const struct dsasl_client_mech dsasl_client_mech_digest_md5 = {
 	.name = SASL_MECH_NAME_DIGEST_MD5,
 
@@ -547,4 +558,5 @@ const struct dsasl_client_mech dsasl_client_mech_digest_md5 = {
 	.auth_check = mech_digest_md5_auth_check,
 	.auth_input = mech_digest_md5_auth_input,
 	.auth_output = mech_digest_md5_auth_output,
+	.auth_is_finished = mech_digest_md5_auth_is_finished,
 };

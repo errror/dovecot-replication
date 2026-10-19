@@ -746,6 +746,165 @@ static void test_sasl_client_mech_select(void)
 	dsasl_client_unref(&client);
 }
 
+static void test_sasl_client_is_finished(void)
+{
+	static const char *const sasl_set_fmt[] = {
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	static const char *const mechs[] = {
+		"PLAIN", "EXTERNAL", "OAUTHBEARER", "XOAUTH2",
+	};
+	const unsigned char *output;
+	struct dsasl_client *client;
+	struct dsasl_client_session *session;
+	const char *error;
+	size_t olen;
+
+	test_begin("sasl client is finished");
+	client = dsasl_client_create(NULL);
+
+	/* the client output ends these */
+	for (unsigned int i = 0; i < N_ELEMENTS(mechs); i++) {
+		const char *settings[] = {
+			sasl_set_fmt[0], sasl_set_fmt[1],
+			t_strconcat("client_auth_mechanism=", mechs[i], NULL),
+			NULL
+		};
+
+		session = test_init_sasl_session(client, settings, &error);
+		i_assert(session != NULL);
+		test_assert_idx(!dsasl_client_session_is_finished(session), i);
+		test_assert_idx(dsasl_client_session_output(
+			session, &output, &olen, &error) ==
+			DSASL_CLIENT_RESULT_OK, i);
+		test_assert_idx(dsasl_client_session_is_finished(session), i);
+		dsasl_client_session_destroy(&session);
+	}
+
+	/* the challenge has to come first */
+	static const char *const cram_set[] = {
+		"client_auth_mechanism=CRAM-MD5",
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	const unsigned char challenge[] = "<1234@example.com>";
+
+	session = test_init_sasl_session(client, cram_set, &error);
+	i_assert(session != NULL);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_input(session, challenge,
+					       sizeof(challenge) - 1, &error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(dsasl_client_session_is_finished(session));
+	dsasl_client_session_destroy(&session);
+
+	dsasl_client_unref(&client);
+	test_end();
+}
+
+static void test_sasl_client_is_finished_unverified(void)
+{
+	static const char *const login_set[] = {
+		"client_auth_mechanism=LOGIN",
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	static const char *const scram_set[] = {
+		"client_auth_mechanism=SCRAM-SHA-1",
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	static const char *const digest_set[] = {
+		"client_auth_mechanism=DIGEST-MD5",
+		"client_auth_authid=testuser",
+		"client_auth_password=testpassword",
+		NULL
+	};
+	static const struct dsasl_client_parameters digest_params = {
+		.protocol = "imap",
+		.host = "mail.example.com",
+	};
+	const unsigned char digest_challenge[] =
+		"nonce=\"abcdef\",qop=\"auth\",charset=utf-8,algorithm=md5-sess";
+	const unsigned char digest_final[] =
+		"rspauth=00000000000000000000000000000000";
+	const unsigned char scram_final[] = "v=AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+	const unsigned char *output;
+	struct dsasl_client *client;
+	struct dsasl_client_session *session;
+	const char *error;
+	size_t olen;
+
+	test_begin("sasl client is finished without server proof");
+	client = dsasl_client_create(NULL);
+
+	/* LOGIN needs both prompts */
+	session = test_init_sasl_session(client, login_set, &error);
+	i_assert(session != NULL);
+	test_assert(dsasl_client_session_input(session, (const void *)"User",
+					       4, &error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_input(session, (const void *)"Pass",
+					       4, &error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(dsasl_client_session_is_finished(session));
+	dsasl_client_session_destroy(&session);
+
+	/* SCRAM needs the server's signature */
+	session = test_init_sasl_session(client, scram_set, &error);
+	i_assert(session != NULL);
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+						&error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	const char *client_first = t_strndup(output, olen);
+	const char *nonce = strstr(client_first, ",r=");
+	i_assert(nonce != NULL);
+	const char *server_first = t_strdup_printf(
+		"r=%sSERVER,s=c2FsdHNhbHQ=,i=4096", nonce + 3);
+	test_assert(dsasl_client_session_input(
+		session, (const void *)server_first, strlen(server_first),
+		&error) == DSASL_CLIENT_RESULT_OK);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+						&error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_input(session, scram_final,
+					       sizeof(scram_final) - 1,
+					       &error) ==
+		    DSASL_CLIENT_RESULT_ERR_PROTOCOL);
+	test_assert(!dsasl_client_session_is_finished(session));
+	dsasl_client_session_destroy(&session);
+
+	/* DIGEST-MD5 needs a valid rspauth */
+	session = test_init_sasl_session_params(client, &digest_params,
+						digest_set, &error);
+	i_assert(session != NULL);
+	test_assert(dsasl_client_session_input(session, digest_challenge,
+					       sizeof(digest_challenge) - 1,
+					       &error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(dsasl_client_session_output(session, &output, &olen,
+						&error) ==
+		    DSASL_CLIENT_RESULT_OK);
+	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_input(session, digest_final,
+					       sizeof(digest_final) - 1,
+					       &error) ==
+		    DSASL_CLIENT_RESULT_AUTH_FAILED);
+	test_assert(!dsasl_client_session_is_finished(session));
+	dsasl_client_session_destroy(&session);
+
+	dsasl_client_unref(&client);
+	test_end();
+}
+
 int main(int argc ATTR_UNUSED, char *argv[])
 {
 	int c;
@@ -760,6 +919,8 @@ int main(int argc ATTR_UNUSED, char *argv[])
 		test_sasl_client_oauthbearer,
 		test_sasl_client_xoauth2,
 		test_sasl_client_mech_select,
+		test_sasl_client_is_finished,
+		test_sasl_client_is_finished_unverified,
 		NULL
 	};
 

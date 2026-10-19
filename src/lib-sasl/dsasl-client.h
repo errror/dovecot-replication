@@ -91,6 +91,17 @@ dsasl_client_session_output(struct dsasl_client_session *session,
 			    const unsigned char **output_r, size_t *output_len_r,
 			    const char **error_r);
 
+/* Returns TRUE if the exchange is complete from the client's point of view:
+   no further challenge from the server is expected and the data that proves
+   the identity of the server, if the mechanism has any, has been verified. A
+   protocol that tells the end of the authentication on its own may trust a
+   success of the server only if this returns TRUE, since otherwise the server
+   may have skipped a part of the exchange. The server may still send data
+   afterwards, e.g. the error of OAUTHBEARER, and the client output may still
+   be pending. Mechanisms that don't implement this are assumed to be
+   finished. */
+bool dsasl_client_session_is_finished(struct dsasl_client_session *session);
+
 /* Call for getting extra result information.
   -1 = error, 0 = not found, 1 = ok */
 int dsasl_client_session_get_result(struct dsasl_client_session *session,
