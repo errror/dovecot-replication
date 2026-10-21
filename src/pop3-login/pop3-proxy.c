@@ -312,6 +312,8 @@ int pop3_proxy_parse_line(struct client *client, const char *line)
 		}
 		if (!str_begins_with(line, "+OK"))
 			break;
+		if (login_proxy_sasl_verify_success(client) < 0)
+			return -1;
 
 		/* Login successful. Send this line to client. */
 		line = t_strconcat(line, "\r\n", NULL);
