@@ -965,6 +965,13 @@ imapc_connection_authenticate_cb(const struct imapc_command_reply *reply,
 	const char *error;
 
 	if ((int)reply->state != IMAPC_COMMAND_STATE_AUTHENTICATE_CONTINUE) {
+		if (reply->state == IMAPC_COMMAND_STATE_OK &&
+		    dsasl_client_session_verify_success(conn->sasl_session,
+							&error) < 0) {
+			imapc_auth_failed(conn, reply, error);
+			imapc_connection_disconnect(conn);
+			return;
+		}
 		dsasl_client_session_destroy(&conn->sasl_session);
 		imapc_connection_auth_finish(conn, reply);
 		return;
