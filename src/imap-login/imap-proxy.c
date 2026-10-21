@@ -443,6 +443,8 @@ int imap_proxy_parse_line(struct client *client, const char *line)
 		o_stream_nsend(output, str_data(str), str_len(str));
 		return 1;
 	} else if (imap_reply_begins(line, "L OK", &suffix)) {
+		if (login_proxy_sasl_verify_success(client) < 0)
+			return -1;
 		/* Login successful. Send this line to client. */
 		imap_client->proxy_sent_state &= ENUM_NEGATE(IMAP_PROXY_SENT_STATE_LOGIN);
 		imap_client->proxy_rcvd_state = IMAP_PROXY_RCVD_STATE_LOGIN;
