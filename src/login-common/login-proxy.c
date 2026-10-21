@@ -967,6 +967,21 @@ int login_proxy_sasl_step(struct client *client, string_t *str)
 	return 0;
 }
 
+int login_proxy_sasl_verify_success(struct client *client)
+{
+	const char *error;
+
+	if (client->proxy_sasl_session == NULL ||
+	    dsasl_client_session_verify_success(client->proxy_sasl_session,
+						&error) == 0)
+		return 0;
+
+	login_proxy_failed(client->login_proxy,
+			   login_proxy_get_event(client->login_proxy),
+			   LOGIN_PROXY_FAILURE_TYPE_PROTOCOL, error);
+	return -1;
+}
+
 bool login_proxy_is_ourself(const struct client *client, const char *host,
 			    const struct ip_addr *hostip,
 			    in_port_t port, const char *destuser)

@@ -106,6 +106,12 @@ bool login_proxy_failed(struct login_proxy *proxy, struct event *event,
 
 /* Handle SASL input in str, and write the SASL output to str. */
 int login_proxy_sasl_step(struct client *client, string_t *str);
+/* Call when the backend reports a successful SASL authentication. Fails the
+   proxy and returns -1 if the success can't be trusted, e.g. because the SASL
+   mechanism hasn't finished, i.e. the backend skipped a part of the
+   authentication. Returns 0 if the success can be trusted or the proxy isn't
+   using SASL. */
+int login_proxy_sasl_verify_success(struct client *client);
 
 /* Return TRUE if host/port/destuser combination points to same as current
    connection. */
