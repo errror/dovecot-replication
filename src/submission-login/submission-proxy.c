@@ -731,6 +731,8 @@ int submission_proxy_parse_line(struct client *client, const char *line)
 			return 0;
 		if ((status / 100) != 2)
 			break;
+		if (login_proxy_sasl_verify_success(client) < 0)
+			return -1;
 
 		smtp_server_connection_input_lock(cmd->conn);
 
