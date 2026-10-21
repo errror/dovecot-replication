@@ -721,7 +721,7 @@ static int
 pop3c_client_prelogin_input_line(struct pop3c_client *client, const char *line)
 {
 	bool success = line[0] == '+';
-	const char *reply, *capa_params;
+	const char *reply, *capa_params, *error;
 
 	switch (client->state) {
 	case POP3C_CLIENT_STATE_CONNECTING:
@@ -774,6 +774,10 @@ pop3c_client_prelogin_input_line(struct pop3c_client *client, const char *line)
 				return -1;
 			break;
 		}
+		if (success &&
+		    dsasl_client_session_verify_success(client->sasl_session,
+							&error) < 0)
+			return pop3c_client_auth_failed(client, error);
 		dsasl_client_session_destroy(&client->sasl_session);
 		i_free(client->sasl_ir);
 		client->state = POP3C_CLIENT_STATE_PASS;
