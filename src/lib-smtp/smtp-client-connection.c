@@ -875,6 +875,15 @@ smtp_client_connection_auth_cb(const struct smtp_reply *reply,
 		return;
 	}
 
+	if (dsasl_client_session_verify_success(conn->sasl_session,
+						&error) < 0) {
+		error = t_strdup_printf("Authentication failed: %s", error);
+		smtp_client_connection_fail(
+			conn, SMTP_CLIENT_COMMAND_ERROR_AUTH_FAILED,
+			error, "Authentication failed");
+		return;
+	}
+
 	smtp_client_connection_clear_password(conn);
 	smtp_client_connection_auth_deinit(conn);
 

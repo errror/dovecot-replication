@@ -3215,11 +3215,14 @@ test_authentication_input_line(struct server_connection *conn,
 		if (server_index > 0) {
 			o_stream_nsend_str(
 				conn->conn.output,
-				"250-testserver\r\n"
-				"250-PIPELINING\r\n"
-				"250-ENHANCEDSTATUSCODES\r\n"
-				"250-AUTH PLAIN\r\n"
-				"250 DSN\r\n");
+				t_strdup_printf(
+					"250-testserver\r\n"
+					"250-PIPELINING\r\n"
+					"250-ENHANCEDSTATUSCODES\r\n"
+					"250-AUTH %s\r\n"
+					"250 DSN\r\n",
+					(server_index == 6 ?
+					 "CRAM-MD5" : "PLAIN")));
 			conn->state = SERVER_CONNECTION_STATE_MAIL_FROM;
 			return 1;
 		}
@@ -3234,6 +3237,15 @@ test_authentication_input_line(struct server_connection *conn,
 			i_sleep_intr_secs(10);
 			server_connection_deinit(&conn);
 			return -1;
+		case 6:
+			/* CRAM-MD5 needs the challenge of the server first */
+			if (str_begins_with(line, "AUTH CRAM-MD5")) {
+				o_stream_nsend_str(
+					conn->conn.output, "235 2.7.0 "
+					"Authentication successful\r\n");
+				return 1;
+			}
+			break;
 		case 3: case 5:
 			if (str_begins_with(line, "AUTH ")) {
 				o_stream_nsend_str(conn->conn.output,
@@ -3297,6 +3309,7 @@ test_client_authentication_login_cb(const struct smtp_reply *reply,
 
 	switch (pctx->index) {
 	case 0:
+	case 6:
 		test_assert(reply->status ==
 			    SMTP_CLIENT_COMMAND_ERROR_AUTH_FAILED);
 		break;
@@ -3321,6 +3334,7 @@ test_client_authentication_mail_from_cb(
 
 	switch (pctx->index) {
 	case 0:
+	case 6:
 		test_assert(reply->status ==
 			    SMTP_CLIENT_COMMAND_ERROR_AUTH_FAILED);
 		break;
@@ -3345,6 +3359,7 @@ test_client_authentication_rcpt_to_cb(
 
 	switch (pctx->index) {
 	case 0:
+	case 6:
 		test_assert(reply->status ==
 			    SMTP_CLIENT_COMMAND_ERROR_AUTH_FAILED);
 		break;
@@ -3371,6 +3386,7 @@ test_client_authentication_rcpt_data_cb(
 	switch (pctx->index) {
 	case 0:
 	case 1:
+	case 6:
 		test_assert(FALSE);
 		break;
 	case 2:	case 3:	case 4:	case 5:
@@ -3391,6 +3407,7 @@ test_client_authentication_data_cb(
 
 	switch (pctx->index) {
 	case 0:
+	case 6:
 		test_assert(reply->status ==
 			    SMTP_CLIENT_COMMAND_ERROR_AUTH_FAILED);
 		break;
@@ -3492,6 +3509,10 @@ test_client_authentication_submit(struct _authentication *ctx,
 			"0123456789abcdef0123456789abcdef"
 			"012345";
 		break;
+	case 6: /* Server succeeds without the CRAM-MD5 exchange */
+		smtp_set.sasl_mechanisms = "CRAM-MD5";
+		smtp_set.password = "crybaby";
+		break;
 	default:
 		smtp_set.password = "crybaby";
 		break;
@@ -3536,10 +3557,10 @@ test_client_authentication(const struct smtp_client_settings *client_set)
 	struct _authentication *ctx;
 	unsigned int i;
 
-	test_expect_errors(2);
+	test_expect_errors(3);
 
 	ctx = i_new(struct _authentication, 1);
-	ctx->count = 6;
+	ctx->count = 7;
 
 	smtp_client = smtp_client_init(client_set);
 
@@ -3560,7 +3581,7 @@ static void test_authentication(void)
 	test_begin("authentication");
 	test_run_client_server(&smtp_client_set,
 			       test_client_authentication,
-			       test_server_authentication, 6, NULL);
+			       test_server_authentication, 7, NULL);
 	test_end();
 }
 
