@@ -426,6 +426,8 @@ int auth_scram_client_input(struct auth_scram_client *client,
 	case AUTH_SCRAM_CLIENT_STATE_SERVER_FINAL:
 		ret = auth_scram_parse_server_final(client, input, input_len,
 						    error_r);
+		if (ret == 0)
+			client->server_final_verified = TRUE;
 		break;
 	case AUTH_SCRAM_CLIENT_STATE_CLIENT_FINISH:
 		*error_r = "Server didn't finish authentication";
@@ -442,6 +444,11 @@ int auth_scram_client_input(struct auth_scram_client *client,
 bool auth_scram_client_state_client_first(struct auth_scram_client *client)
 {
 	return (client->state <= AUTH_SCRAM_CLIENT_STATE_CLIENT_FIRST);
+}
+
+bool auth_scram_client_is_finished(struct auth_scram_client *client)
+{
+	return client->server_final_verified;
 }
 
 void auth_scram_client_output(struct auth_scram_client *client,

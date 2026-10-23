@@ -329,6 +329,7 @@ test_auth_success_one(const struct hash_method *hmethod, const char *authid,
 
 		server_end = auth_scram_server_output(&bctx->asserver,
 						      &data, &data_size);
+		test_assert(!auth_scram_client_is_finished(&bctx->asclient));
 		ret = test_auth_client_input(bctx, data, data_size, &error);
 		test_out_reason(t_strdup_printf("client input success (C=%u)",
 						bctx->cycle),
@@ -340,6 +341,7 @@ test_auth_success_one(const struct hash_method *hmethod, const char *authid,
 			break;
 		bctx->cycle++;
 	}
+	test_assert(auth_scram_client_is_finished(&bctx->asclient));
 
 	auth_scram_server_deinit(&bctx->asserver);
 	auth_scram_client_deinit(&bctx->asclient);
@@ -497,6 +499,7 @@ test_auth_server_error_one(const struct hash_method *hmethod,
 			break;
 		bctx->cycle++;
 	}
+	test_assert(!auth_scram_client_is_finished(&bctx->asclient));
 
 	auth_scram_server_deinit(&bctx->asserver);
 	auth_scram_client_deinit(&bctx->asclient);
