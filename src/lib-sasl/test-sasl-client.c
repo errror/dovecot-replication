@@ -795,10 +795,15 @@ static void test_sasl_client_is_finished(void)
 	session = test_init_sasl_session(client, cram_set, &error);
 	i_assert(session != NULL);
 	test_assert(!dsasl_client_session_is_finished(session));
+	test_assert(dsasl_client_session_verify_success(session, &error) < 0);
+	test_assert_strcmp(error, "Server accepted authentication before the SASL authentication exchange finished");
 	test_assert(dsasl_client_session_input(session, challenge,
 					       sizeof(challenge) - 1, &error) ==
 		    DSASL_CLIENT_RESULT_OK);
 	test_assert(dsasl_client_session_is_finished(session));
+	error = NULL;
+	test_assert(dsasl_client_session_verify_success(session, &error) == 0);
+	test_assert(error == NULL);
 	dsasl_client_session_destroy(&session);
 
 	dsasl_client_unref(&client);

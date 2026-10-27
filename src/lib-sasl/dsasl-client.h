@@ -101,6 +101,11 @@ dsasl_client_session_output(struct dsasl_client_session *session,
    be pending. Mechanisms that don't implement this are assumed to be
    finished. */
 bool dsasl_client_session_is_finished(struct dsasl_client_session *session);
+/* Call when the server reports a successful authentication. Returns 0 if the
+   success can be trusted. Returns -1 and sets error_r if it can't, e.g.
+   because dsasl_client_session_is_finished() returns FALSE. */
+int dsasl_client_session_verify_success(struct dsasl_client_session *session,
+					const char **error_r);
 
 /* Call for getting extra result information.
   -1 = error, 0 = not found, 1 = ok */

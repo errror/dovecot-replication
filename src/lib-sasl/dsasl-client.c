@@ -678,6 +678,16 @@ bool dsasl_client_session_is_finished(struct dsasl_client_session *session)
 	return msession->mech->auth_is_finished(msession);
 }
 
+int dsasl_client_session_verify_success(struct dsasl_client_session *session,
+					const char **error_r)
+{
+	if (!dsasl_client_session_is_finished(session)) {
+		*error_r = "Server accepted authentication before the SASL authentication exchange finished";
+		return -1;
+	}
+	return 0;
+}
+
 int dsasl_client_session_get_result(struct dsasl_client_session *session,
 				    const char *key, const char **value_r,
 				    const char **error_r)
