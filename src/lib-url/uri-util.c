@@ -254,19 +254,15 @@ bool uri_data_decode(struct uri_parser *parser, const char *data,
 	string_t *decoded;
 	int ret;
 
-	if (pend == NULL) {
-		/* NULL means unlimited; solely rely on '\0' */
-		pend = (const unsigned char *)SIZE_MAX;
-	}
-
-	if (p >= pend || *p == '\0') {
+	/* NULL pend means unlimited; solely rely on '\0' */
+	if ((pend != NULL && p >= pend) || *p == '\0') {
 		if (decoded_r != NULL)
 			*decoded_r = "";
 		return TRUE;
 	}
 
 	decoded = uri_parser_get_tmpbuf(parser, 256);
-	while (p < pend && *p != '\0') {
+	while ((pend == NULL || p < pend) && *p != '\0') {
 		unsigned char ch;
 
 		ret = uri_parse_pct_encoded_data(parser, &p, NULL, &ch);
