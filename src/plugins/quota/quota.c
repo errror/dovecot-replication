@@ -503,6 +503,12 @@ quota_root_iter_init(struct mailbox *box)
 
 bool quota_root_is_visible(struct quota_root *root, struct mailbox *box)
 {
+	struct mail_namespace *ns = box->list->ns;
+	struct mail_user *box_user = ns->owner != NULL ? ns->owner : ns->user;
+
+	/* e.g. the source mailbox of a MOVE into another user's shared mailbox */
+	if (root->quota->user != box_user)
+		return FALSE;
 	if (root->quota->user == box->storage->user) {
 		if (array_lsearch_ptr(&root->namespaces, box->list->ns) == NULL)
 			return FALSE;
